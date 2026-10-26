@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../compiler-core/slang-language-server-protocol.h"
-#include "../core/slang-basic.h"
-#include "../core/slang-com-object.h"
+#include "compiler-core/slang-language-server-protocol.h"
+#include "core/slang-basic.h"
+#include "core/slang-com-object.h"
 #include "slang-com-helper.h"
 #include "slang-com-ptr.h"
 #include "slang-compiler.h"
@@ -164,6 +164,7 @@ class Workspace : public ComObject, public ISlangFileSystem
 private:
     RefPtr<WorkspaceVersion> currentVersion;
     RefPtr<WorkspaceVersion> currentCompletionVersion;
+    uint64_t completionVersionSerial = 0;
     RefPtr<WorkspaceVersion> createWorkspaceVersion();
 
 public:
@@ -171,8 +172,15 @@ public:
     List<String> additionalSearchPaths;
     OrderedHashSet<String> workspaceSearchPaths;
     List<OwnedPreprocessorMacroDefinition> predefinedMacros;
-    bool searchInWorkspace = true;
+    static constexpr bool kDefaultSearchInWorkspace = true;
+    bool searchInWorkspace = kDefaultSearchInWorkspace;
     WorkspaceFlavor workspaceFlavor = WorkspaceFlavor::Standard;
+
+    // Language version assumed for files with no `#language` directive, from the
+    // `slang.predefinedLanguageVersion` setting. UNKNOWN means "unset": nothing is injected and the
+    // compiler default stands. A `#language` directive still wins, since the preprocessor applies
+    // it unconditionally.
+    SlangLanguageVersion predefinedLanguageVersion = SLANG_LANGUAGE_VERSION_UNKNOWN;
 
     slang::IGlobalSession* slangGlobalSession;
     Dictionary<String, RefPtr<DocumentVersion>> openedDocuments;
@@ -187,11 +195,17 @@ public:
     bool updatePredefinedMacros(List<String> predefinedMacros);
     bool updateSearchPaths(List<String> searchPaths);
     bool updateSearchInWorkspace(bool value);
+    bool updatePredefinedLanguageVersion(SlangLanguageVersion version);
+    bool updateWorkspaceFlavor(WorkspaceFlavor flavor);
 
     void init(List<URI> rootDirURI, slang::IGlobalSession* globalSession);
     void invalidate();
     WorkspaceVersion* getCurrentVersion();
     WorkspaceVersion* getCurrentCompletionVersion() { return currentCompletionVersion.Ptr(); }
+    // Identifies the completion version returned by `getCurrentCompletionVersion`. It changes every
+    // time `createVersionForCompletion` is called, so a completion item can record which version
+    // its candidate index refers to.
+    uint64_t getCompletionVersionSerial() const { return completionVersionSerial; }
     WorkspaceVersion* createVersionForCompletion();
 
 public:

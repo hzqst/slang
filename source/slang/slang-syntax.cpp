@@ -1,10 +1,10 @@
 #include "slang-syntax.h"
 
 #include "slang-ast-print.h"
+#include "slang-check.h"
 #include "slang-compiler.h"
 #include "slang-visitor.h"
 
-#include <assert.h>
 #include <typeinfo>
 
 namespace Slang
@@ -47,12 +47,154 @@ void SyntaxClassBase::destructInstanceImpl(void* instance) const
 
 /* static */ const TypeExp TypeExp::empty;
 
+bool tryGetConstantIntVal(Val* val, IntegerLiteralValue& outValue)
+{
+    auto intVal = as<IntVal>(val);
+    if (auto constantIntVal = intVal ? as<ConstantIntVal>(intVal->resolve()) : nullptr)
+    {
+        outValue = constantIntVal->getValue();
+        return true;
+    }
+    return false;
+}
+
+bool tryFindProvableDuplicateOrderIndices(
+    ConcreteIntValPack* orderPack,
+    Index& outFirstPosition,
+    Index& outSecondPosition,
+    IntegerLiteralValue& outConcreteIndex,
+    bool& outHasConcreteIndex)
+{
+    for (Index i = 0; i < orderPack->getCount(); ++i)
+    {
+        for (Index j = 0; j < i; ++j)
+        {
+            if (!orderPack->getElement(i)->equals(orderPack->getElement(j)))
+                continue;
+
+            outFirstPosition = j;
+            outSecondPosition = i;
+            outHasConcreteIndex = tryGetConstantIntVal(orderPack->getElement(i), outConcreteIndex);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool areProvablyDifferentShapeElements(Val* left, Val* right)
+{
+    IntegerLiteralValue leftValue = 0;
+    IntegerLiteralValue rightValue = 0;
+    return tryGetConstantIntVal(left, leftValue) && tryGetConstantIntVal(right, rightValue) &&
+           leftValue != rightValue;
+}
+
+bool hasAnyPotentialConcatAxis(ConcreteIntValPack* leftPack, ConcreteIntValPack* rightPack)
+{
+    SLANG_ASSERT(leftPack->getCount() == rightPack->getCount());
+    for (Index axis = 0; axis < leftPack->getCount(); ++axis)
+    {
+        bool isPossibleAxis = true;
+        for (Index i = 0; i < leftPack->getCount(); ++i)
+        {
+            if (i != axis && areProvablyDifferentShapeElements(
+                                 leftPack->getElement(i),
+                                 rightPack->getElement(i)))
+            {
+                isPossibleAxis = false;
+                break;
+            }
+        }
+        if (isPossibleAxis)
+            return true;
+    }
+    return false;
+}
+
+const char* getPackQueryName(PackQueryExpr* expr)
+{
+    if (as<FirstExpr>(expr))
+        return "__first";
+    if (as<LastExpr>(expr))
+        return "__last";
+    if (as<TrimFirstExpr>(expr))
+        return "__trimFirst";
+    if (as<TrimLastExpr>(expr))
+        return "__trimLast";
+    SLANG_UNEXPECTED("unknown PackQueryExpr subtype");
+    UNREACHABLE_RETURN("");
+}
+
+const char* getShapePackTransformName(ShapePackTransformExpr* expr)
+{
+    if (as<ShapeConcatExpr>(expr))
+        return "__shapeConcat";
+    if (as<ShapePermuteExpr>(expr))
+        return "__shapePermute";
+    if (as<ShapeSwapExpr>(expr))
+        return "__shapeSwap";
+    if (as<ShapeReduceExpr>(expr))
+        return "__shapeReduce";
+    SLANG_UNEXPECTED("unknown ShapePackTransformExpr subtype");
+    UNREACHABLE_RETURN("");
+}
+
+VariadicPackCardinality getKnownPackCardinality(Val* packOperand)
+{
+    return getPackCardinalityFromStructure(
+        packOperand,
+        [](Val* operand) { return getKnownPackCardinality(operand); });
+}
+
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!! DiagnosticSink impls !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 void printDiagnosticArg(StringBuilder& sb, Decl* decl)
 {
     if (!decl)
         return;
+    // Unwrap GenericDecl to check for constructors inside.
+    auto innerDecl = maybeGetInner(decl);
+    if (as<ConstructorDecl>(innerDecl))
+    {
+        // Print constructors as "TypeName.init" instead of the internal "$init" name.
+        // Walk up through parent chain, skipping GenericDecl wrappers, to find the
+        // containing type declaration.
+        for (auto parent = decl->parentDecl; parent; parent = parent->parentDecl)
+        {
+            if (as<GenericDecl>(parent))
+                continue;
+            if (parent->getName() && parent->getName()->text.getLength())
+            {
+                sb << getText(parent->getName()) << ".";
+            }
+            else if (auto extDecl = as<ExtensionDecl>(parent))
+            {
+                // ExtensionDecl has no name; recover the type name from targetType.
+                if (auto declRefType = as<DeclRefType>(extDecl->targetType.type))
+                {
+                    auto typeDecl = declRefType->getDeclRef().getDecl();
+                    if (typeDecl && typeDecl->getName() && typeDecl->getName()->text.getLength())
+                    {
+                        sb << getText(typeDecl->getName()) << ".";
+                    }
+                }
+            }
+            break;
+        }
+        sb << "init";
+        return;
+    }
+    // We need to print a name the user can recognize. Legacy `cbuffer` parsing and HLSL
+    // compatibility desugaring assign internal names to shader parameters, so we use the
+    // original name recorded in `ParameterGroupReflectionName` when it is available.
+    if (auto parameter = as<VarDecl>(decl))
+    {
+        if (auto reflectionName = parameter->findModifier<ParameterGroupReflectionName>())
+        {
+            sb << getText(reflectionName->nameAndLoc.name);
+            return;
+        }
+    }
     if (decl->getName() && decl->getName()->text.getLength())
         sb << getText(decl->getName());
     else
@@ -95,6 +237,9 @@ void printDiagnosticArg(StringBuilder& sb, ASTNodeType nodeType)
         break;
     case ASTNodeType::ClassDecl:
         sb << "class";
+        break;
+    case ASTNodeType::HLSLClassDecl:
+        sb << "HLSL-style class";
         break;
     case ASTNodeType::GLSLInterfaceBlockDecl:
         sb << "GLSL interface block";
@@ -140,18 +285,6 @@ void printDiagnosticArg(StringBuilder& sb, ASTNodeType nodeType)
         break;
     case ASTNodeType::FuncDecl:
         sb << "function";
-        break;
-    case ASTNodeType::DerivativeRequirementDecl:
-        sb << "DerivativeRequirementDecl";
-        break;
-    case ASTNodeType::ForwardDerivativeRequirementDecl:
-        sb << "ForwardDerivativeRequirementDecl";
-        break;
-    case ASTNodeType::BackwardDerivativeRequirementDecl:
-        sb << "BackwardDerivativeRequirementDecl";
-        break;
-    case ASTNodeType::DerivativeRequirementReferenceDecl:
-        sb << "DerivativeRequirementReferenceDecl";
         break;
     case ASTNodeType::SubscriptDecl:
         sb << "__subscript";
@@ -212,6 +345,15 @@ void printDiagnosticArg(StringBuilder& sb, ASTNodeType nodeType)
         break;
     case ASTNodeType::GenericTypeConstraintDecl:
         sb << "GenericTypeConstraintDecl";
+        break;
+    case ASTNodeType::NonEmptyPackConstraintDecl:
+        sb << "NonEmptyPackConstraintDecl";
+        break;
+    case ASTNodeType::GenericVariadicPackCountConstraintDecl:
+        sb << "GenericVariadicPackCountConstraintDecl";
+        break;
+    case ASTNodeType::HasDiffTypeInfoConstraintDecl:
+        sb << "__hasDiffTypeInfo";
         break;
     case ASTNodeType::SimpleTypeDecl:
         sb << "SimpleTypeDecl";
@@ -582,140 +724,52 @@ RequirementWitness RequirementWitness::specialize(
     }
 }
 
-RequirementWitness tryLookUpRequirementWitness(
-    ASTBuilder* astBuilder,
-    SubtypeWitness* subtypeWitness,
-    Decl* requirementKey)
-{
-    if (auto declaredSubtypeWitness = as<DeclaredSubtypeWitness>(subtypeWitness))
-    {
-        if (auto inheritanceDeclRef = declaredSubtypeWitness->getDeclRef().as<InheritanceDecl>())
-        {
-            // A conformance that was declared as part of an inheritance clause
-            // will have built up a dictionary of the satisfying declarations
-            // for each of its requirements.
-            RequirementWitness requirementWitness;
-            auto witnessTable = inheritanceDeclRef.getDecl()->witnessTable;
-            if (witnessTable && witnessTable->getRequirementDictionary().tryGetValue(
-                                    requirementKey,
-                                    requirementWitness))
-            {
-                // The `inheritanceDeclRef` has substitutions applied to it that
-                // *aren't* present in the `requirementWitness`, because it was
-                // derived by the front-end when looking at the `InheritanceDecl` alone.
-                //
-                // We need to apply these substitutions here for the result to make sense.
-                //
-                // E.g., if we have a case like:
-                //
-                //      interface ISidekick { associatedtype Hero; void follow(Hero hero); }
-                //      struct Sidekick<H> : ISidekick { typedef H Hero; void follow(H hero) {} };
-                //
-                //      void followHero<S : ISidekick>(S s, S.Hero h)
-                //      {
-                //          s.follow(h);
-                //      }
-                //
-                //      Batman batman;
-                //      Sidekick<Batman> robin;
-                //      followHero<Sidekick<Batman>>(robin, batman);
-                //
-                // The second argument to `followHero` is `batman`, which has type `Batman`.
-                // The parameter declaration lists the type `S.Hero`, which is a reference
-                // to an associated type. The front  end will expand this into something
-                // like `S.{S:ISidekick}.Hero` - that is, we'll end up with a declaration
-                // reference to `ISidekick.Hero` with a this-type substitution that references
-                // the `{S:ISidekick}` declaration as a witness.
-                //
-                // The front-end will expand the generic application `followHero<Sidekick<Batman>>`
-                // to `followHero<Sidekick<Batman>, {Sidekick<H>:ISidekick}[H->Batman]>`
-                // (that is, the hidden second parameter will reference the inheritance
-                // clause on `Sidekick<H>`, with a substitution to map `H` to `Batman`.
-                //
-                // This step should map the `{S:ISidekick}` declaration over to the
-                // concrete `{Sidekick<H>:ISidekick}[H->Batman]` inheritance declaration.
-                // At that point `tryLookupRequirementWitness` might be called, because
-                // we want to look up the witness for the key `ISidekick.Hero` in the
-                // inheritance decl-ref that is `{Sidekick<H>:ISidekick}[H->Batman]`.
-                //
-                // That lookup will yield us a reference to the typedef `Sidekick<H>.Hero`,
-                // *without* any substitution for `H` (or rather, with a default one that
-                // maps `H` to `H`.
-                //
-                // So, in order to get the *right* end result, we need to apply
-                // the substitutions from the inheritance decl-ref to the witness.
-                //
-                requirementWitness =
-                    requirementWitness.specialize(astBuilder, SubstitutionSet(inheritanceDeclRef));
-
-                return requirementWitness;
-            }
-        }
-    }
-    else if (auto transitiveTypeWitness = as<TransitiveSubtypeWitness>(subtypeWitness))
-    {
-        if (auto declaredSubtypeWitnessMidToSup =
-                as<DeclaredSubtypeWitness>(transitiveTypeWitness->getMidToSup()))
-        {
-            auto midKey = declaredSubtypeWitnessMidToSup->getDeclRef();
-            auto midWitness = tryLookUpRequirementWitness(
-                astBuilder,
-                as<SubtypeWitness>(transitiveTypeWitness->getSubToMid()),
-                midKey.getDecl());
-            if (midWitness.getFlavor() == RequirementWitness::Flavor::witnessTable)
-            {
-                auto table = midWitness.getWitnessTable();
-                RequirementWitness result;
-                if (table->getRequirementDictionary().tryGetValue(requirementKey, result))
-                {
-                    result = result.specialize(astBuilder, SubstitutionSet(midKey));
-                }
-                return result;
-            }
-        }
-    }
-    else if (
-        auto extractFromConjunctionTypeWitness =
-            as<ExtractFromConjunctionSubtypeWitness>(subtypeWitness))
-    {
-        if (auto conjunctionTypeWitness = as<ConjunctionSubtypeWitness>(
-                extractFromConjunctionTypeWitness->getConjunctionWitness()))
-        {
-            auto componentWitness = as<SubtypeWitness>(conjunctionTypeWitness->getComponentWitness(
-                extractFromConjunctionTypeWitness->getIndexInConjunction()));
-
-            return tryLookUpRequirementWitness(astBuilder, componentWitness, requirementKey);
-        }
-    }
-
-    // If we are looking for `ThisType`, just return subtype.
-    if (as<ThisTypeDecl>(requirementKey))
-    {
-        RequirementWitness result;
-        result.m_flavor = RequirementWitness::Flavor::val;
-        result.m_val = subtypeWitness->getSub();
-        return result;
-    }
-    // If we are looking for `ThisTypeConstraint`, just return the witness itself.
-    if (as<ThisTypeConstraintDecl>(requirementKey))
-    {
-        RequirementWitness result;
-        result.m_flavor = RequirementWitness::Flavor::val;
-        result.m_val = subtypeWitness;
-        return result;
-    }
-    // TODO: should handle the transitive case here too
-
-    return RequirementWitness();
-}
-
 //
 // WitnessTable
 //
 
-void WitnessTable::add(Decl* decl, RequirementWitness const& witness)
+InterfaceRequirementKey::InterfaceRequirementKey(Decl* requirementDecl)
+    : InterfaceRequirementKey(requirementDecl, nullptr)
 {
-    m_requirementDictionary.add(decl, witness);
+}
+
+InterfaceRequirementKey InterfaceRequirementKey::createWithGenericWrapperCount(
+    Decl* requirementDecl,
+    UCount& outGenericWrapperCount)
+{
+    return InterfaceRequirementKey(requirementDecl, &outGenericWrapperCount);
+}
+
+InterfaceRequirementKey::InterfaceRequirementKey(
+    Decl* requirementDecl,
+    UCount* outGenericWrapperCount)
+{
+    SLANG_RELEASE_ASSERT(requirementDecl);
+    UCount genericWrapperCount = 0;
+    while (auto genericDecl = as<GenericDecl>(requirementDecl))
+    {
+        genericWrapperCount++;
+        requirementDecl = genericDecl->inner;
+    }
+    if (outGenericWrapperCount)
+        *outGenericWrapperCount = genericWrapperCount;
+    m_decl = requirementDecl;
+}
+
+void WitnessTable::add(Decl* requirementDecl, RequirementWitness const& witness)
+{
+    add(InterfaceRequirementKey(requirementDecl), witness);
+}
+
+void WitnessTable::add(InterfaceRequirementKey key, RequirementWitness const& witness)
+{
+    m_requirementDictionary.add(key.getDecl(), witness);
+}
+
+void WitnessTable::removeRequirement(InterfaceRequirementKey key)
+{
+    m_requirementDictionary.remove(key.getDecl());
+    m_requirementCheckStates.remove(key.getDecl());
 }
 
 // TODO: need to figure out how to unify this with the logic
@@ -761,16 +815,17 @@ Type* DeclRefType::create(ASTBuilder* astBuilder, DeclRef<Decl> declRef)
     }
     else if (as<ThisTypeDecl>(declRef.getDecl()))
     {
-        if (as<DirectDeclRef>(declRef.declRefBase))
-        {
-            declRef = createDefaultSubstitutionsIfNeeded(astBuilder, nullptr, declRef);
-
-            return astBuilder->getOrCreate<ThisType>(declRef.declRefBase);
-        }
-        else if (auto lookupDeclRef = as<LookupDeclRef>(declRef.declRefBase))
+        // A reference to a `ThisTypeDecl` must always be represented as a `ThisType`,
+        // never as a plain `DeclRefType`. Otherwise the same logical `This` type can
+        // exist as two distinct `Type*`s (e.g. a `ThisType` built from a `DirectDeclRef`
+        // vs. a `DeclRefType` built from a `MemberDeclRef` for a substituted interface),
+        // breaking type-identity comparison. See issue #11465.
+        if (auto lookupDeclRef = as<LookupDeclRef>(declRef.declRefBase))
         {
             return lookupDeclRef->getWitness()->getSub();
         }
+        declRef = createDefaultSubstitutionsIfNeeded(astBuilder, nullptr, declRef);
+        return astBuilder->getOrCreate<ThisType>(declRef.declRefBase);
     }
     else if (auto typedefDecl = as<TypeDefDecl>(declRef.getDecl()))
     {
@@ -908,6 +963,91 @@ NamedExpressionType* getNamedType(ASTBuilder* astBuilder, DeclRef<TypeDefDecl> c
     return astBuilder->getOrCreate<NamedExpressionType>(specializedDeclRef);
 }
 
+std::optional<ParamInfo> findEffectiveThisParamInfo(ASTBuilder* astBuilder, DeclRef<Decl> declRef)
+{
+    SLANG_RELEASE_ASSERT(astBuilder);
+    SLANG_RELEASE_ASSERT(declRef);
+
+    auto decl = declRef.getDecl();
+    SLANG_RELEASE_ASSERT(decl->isChecked(DeclCheckState::SignatureChecked));
+
+    auto attribute = decl->findModifier<ThisParamInfoAttribute>();
+    if (auto lookupDeclRef = as<LookupDeclRef>(declRef.declRefBase))
+    {
+        if (auto callableDeclRef = isDeclRefTypeOf<CallableDecl>(lookupDeclRef->getLookupSource()))
+        {
+            // Consider `apply_bwd`, an interface requirement looked up through a function-as-type.
+            // Its declaration's receiver is the interface `This`, but its callable ABI follows the
+            // function used as the lookup source: a free function has no effective `this`
+            // parameter, while a method has the same one as its primal declaration. Delegate to
+            // that callable's checked information so this query preserves both possibilities. A
+            // receiverless requirement has no attribute and remains receiverless regardless of
+            // the callable used as its lookup source.
+            SLANG_RELEASE_ASSERT(
+                callableDeclRef.getDecl()->isChecked(DeclCheckState::SignatureChecked));
+            if (attribute)
+                return findEffectiveThisParamInfo(astBuilder, DeclRef<Decl>(callableDeclRef));
+        }
+    }
+
+    if (!attribute)
+        return std::nullopt;
+
+    ParamInfo result = attribute->info;
+    SLANG_RELEASE_ASSERT(result.type);
+    result.type = declRef.substitute(astBuilder, result.type);
+    return result;
+}
+
+ParamInfo getEffectiveThisParamInfo(ASTBuilder* astBuilder, DeclRef<Decl> declRef)
+{
+    auto result = findEffectiveThisParamInfo(astBuilder, declRef);
+    SLANG_RELEASE_ASSERT(result.has_value());
+    return *result;
+}
+
+bool isThisExprWritable(DeclRef<CallableDecl> callableDeclRef, ParamInfo const& thisParamInfo)
+{
+    if (doesParamPassingModeIndicateWritableStorage(thisParamInfo.mode))
+        return true;
+
+    return callableDeclRef.is<SetterDecl>() &&
+           isDeclRefTypeOf<ClassDecl>(unwrapModifiedType(thisParamInfo.type));
+}
+
+bool doesTypeHaveNoDiffModifier(Type* type)
+{
+    if (auto modifiedType = as<ModifiedType>(type))
+    {
+        if (modifiedType->findModifier<NoDiffModifierVal>())
+            return true;
+        return doesTypeHaveNoDiffModifier(modifiedType->getBase());
+    }
+
+    return false;
+}
+
+List<DeclRef<ParamDecl>> getParametersForCallableSignature(
+    ASTBuilder* astBuilder,
+    DeclRef<CallableDecl> declRef)
+{
+    List<DeclRef<ParamDecl>> result;
+
+    if (declRef.as<AccessorDecl>())
+    {
+        if (auto callableParent = declRef.getParent().as<CallableDecl>())
+        {
+            for (auto paramDeclRef : getParameters(astBuilder, callableParent))
+                result.add(paramDeclRef);
+        }
+    }
+
+    for (auto paramDeclRef : getParameters(astBuilder, declRef))
+        result.add(paramDeclRef);
+
+    return result;
+}
+
 FuncType* getFuncType(ASTBuilder* astBuilder, DeclRef<CallableDecl> const& declRef)
 {
     List<Type*> paramTypes;
@@ -919,33 +1059,16 @@ FuncType* getFuncType(ASTBuilder* astBuilder, DeclRef<CallableDecl> const& declR
     auto errorType = getErrorCodeType(astBuilder, declRef);
     auto visitParamDecl = [&](DeclRef<ParamDecl> paramDeclRef)
     {
-        auto paramValueType = getParamValueType(astBuilder, paramDeclRef);
-        if (!paramValueType)
-        {
-            paramValueType = astBuilder->getErrorType();
-        }
-
-        auto paramDecl = paramDeclRef.getDecl();
-        auto paramMode = getParamPassingMode(paramDecl);
-        auto paramType = getParamTypeWithModeWrapper(astBuilder, paramValueType, paramMode);
-
-        paramTypes.add(paramType);
+        auto paramInfo = getParamInfo(astBuilder, paramDeclRef);
+        if (!paramInfo.type)
+            paramInfo.type = astBuilder->getErrorType();
+        paramTypes.add(getParamTypeWithModeWrapper(astBuilder, paramInfo));
     };
-    auto parent = declRef.getParent();
-    if (as<SubscriptDecl>(parent) || as<PropertyDecl>(parent))
-    {
-        for (auto paramDeclRef : getParameters(astBuilder, parent.as<CallableDecl>()))
-        {
-            visitParamDecl(paramDeclRef);
-        }
-    }
-    for (auto paramDeclRef : getParameters(astBuilder, declRef))
-    {
+    for (auto paramDeclRef : getParametersForCallableSignature(astBuilder, declRef))
         visitParamDecl(paramDeclRef);
-    }
 
-    FuncType* funcType = astBuilder->getFuncType(paramTypes.getArrayView(), resultType, errorType);
-    return funcType;
+    auto funcType = astBuilder->getFuncType(paramTypes.getArrayView(), resultType, errorType);
+    return as<FuncType>(funcType->substitute(astBuilder, SubstitutionSet(declRef))->resolve());
 }
 
 GenericDeclRefType* getGenericDeclRefType(
@@ -1085,6 +1208,34 @@ ModuleDecl* getModuleDecl(Scope* scope)
     return nullptr;
 }
 
+EnumDecl* isUnscopedEnum(Decl* decl)
+{
+    EnumDecl* enumDecl = as<EnumDecl>(decl);
+    if (!enumDecl)
+        return nullptr;
+    for (auto mod : enumDecl->modifiers)
+    {
+        if (as<UnscopedEnumAttribute>(mod))
+        {
+            return enumDecl;
+        }
+        else if (auto uncheckedAttribute = as<UncheckedAttribute>(mod))
+        {
+            // TODO: This unchecked, string-based attribute match exists only so that this
+            // predicate can be used during parsing, before attributes are checked. It is
+            // both ugly and fragile, and we should aspire to remove the need for it -- e.g.
+            // by not requiring an enum's unscoped-ness to be known at parse time -- so that
+            // "is this enum unscoped" can rely solely on the checked `UnscopedEnumAttribute`
+            // handled above.
+            if (getText(uncheckedAttribute->keywordName) == "UnscopedEnum")
+            {
+                return enumDecl;
+            }
+        }
+    }
+    return nullptr;
+}
+
 ContainerDecl* getParentDecl(Decl* decl)
 {
     auto parentDecl = decl->parentDecl;
@@ -1111,6 +1262,18 @@ AggTypeDeclBase* getParentAggTypeDeclBase(Decl* decl)
     while (decl)
     {
         if (auto found = as<AggTypeDeclBase>(decl))
+            return found;
+        decl = decl->parentDecl;
+    }
+    return nullptr;
+}
+
+ExtensionDecl* getParentExtensionDecl(Decl* decl)
+{
+    decl = decl->parentDecl;
+    while (decl)
+    {
+        if (auto found = as<ExtensionDecl>(decl))
             return found;
         decl = decl->parentDecl;
     }
@@ -1227,6 +1390,45 @@ char const* getTryClauseTypeName(TryClauseType c)
         return "Assert";
     default:
         return "Unknown";
+    }
+}
+
+ModifiedType* getTypeWithModifier(Type* baseType, Val* typeModifier)
+{
+    // If the type is not a modified type already, just create one.
+    // If the type already has modifiers:
+    //   if the modifier already exists on the type, just return the regular type.
+    //   otherwise, pull them into a list, add the new modifier, and create a new modified type.
+    //
+    auto astBuilder = getCurrentASTBuilder();
+
+    if (auto modifiedType = as<ModifiedType>(baseType))
+    {
+        // Check if the modifier already exists
+        for (Index i = 0; i < modifiedType->getModifierCount(); i++)
+        {
+            if (modifiedType->getModifier(i) == typeModifier)
+            {
+                // Modifier already exists, return the type as is
+                return modifiedType;
+            }
+        }
+
+        // Collect all existing modifiers and add the new one
+        List<Val*> modifiers;
+        for (Index i = 0; i < modifiedType->getModifierCount(); i++)
+        {
+            modifiers.add(modifiedType->getModifier(i));
+        }
+        modifiers.add(typeModifier);
+
+        // Create a new modified type with all modifiers
+        return as<ModifiedType>(astBuilder->getModifiedType(modifiedType->getBase(), modifiers));
+    }
+    else
+    {
+        // Type is not a modified type, create one with the single modifier
+        return as<ModifiedType>(astBuilder->getModifiedType(baseType, 1, &typeModifier));
     }
 }
 

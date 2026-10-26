@@ -1,9 +1,10 @@
 // slang-emit-c-like.cpp
 #include "slang-emit-c-like.h"
 
-#include "../compiler-core/slang-name.h"
-#include "../core/slang-stable-hash.h"
-#include "../core/slang-writer.h"
+#include "compiler-core/slang-name.h"
+#include "core/slang-char-util.h"
+#include "core/slang-stable-hash.h"
+#include "core/slang-writer.h"
 #include "slang-emit-source-writer.h"
 #include "slang-intrinsic-expand.h"
 #include "slang-ir-bind-existentials.h"
@@ -20,14 +21,12 @@
 #include "slang-legalize-types.h"
 #include "slang-lower-to-ir.h"
 #include "slang-mangle.h"
-#include "slang-mangled-lexer.h"
 #include "slang-rich-diagnostics.h"
 #include "slang-syntax.h"
 #include "slang-type-layout.h"
 #include "slang-visitor.h"
 #include "slang/slang-ir.h"
 
-#include <assert.h>
 
 namespace Slang
 {
@@ -457,6 +456,13 @@ void CLikeSourceEmitter::_emitType(IRType* type, DeclaratorInfo* declarator)
                     declarator);
             }
         }
+        break;
+
+    case kIROp_UntypedResourceHandleType:
+    case kIROp_UntypedSamplerHandleType:
+        // `lowerUntypedResourceHandleToUInt` rewrites every untyped descriptor-heap handle to
+        // `uint` before emit, so one reaching here is an internal error (a leak from that pass).
+        SLANG_UNEXPECTED("untyped descriptor-heap handle type should have been lowered to uint");
         break;
 
     case kIROp_ArrayType:
@@ -1319,6 +1325,13 @@ void CLikeSourceEmitter::emitSimpleValueImpl(IRInst* inst)
             {
                 switch (type->getBaseType())
                 {
+                case BaseType::Bool:
+                    // `lowerEnumType` canonicalizes every `bool`-tagged enumerator constant to
+                    // `kIROp_BoolLit`, so a `bool`-typed `IRIntLit` must never reach emit here
+                    // (it would print via the `int8_t` arm below). See shader-slang/slang#12298.
+                    SLANG_UNEXPECTED("bool-typed IRIntLit should have been lowered to IRBoolLit");
+                    break;
+
                 default:
 
                 case BaseType::Int8:
@@ -1436,7 +1449,50 @@ void CLikeSourceEmitter::emitSimpleValueImpl(IRInst* inst)
     }
 }
 
-bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
+// Return true when `inst` is a module-scope aggregate literal (`MakeArray`/`MakeStruct`/
+// `MakeArrayFromElement`) that is only ever used inside another such aggregate. Under that
+// condition the inst is only ever emitted inside an outer aggregate's brace initializer list — a
+// context where an initializer-list value is valid — so it is safe to fold inline, unlike a
+// function-body aggregate whose value may appear in a general expression context. Folding matters
+// because the alternative — emitting the inst as its own named module-scope declaration — makes the
+// outer aggregate's initializer reference it by name, which is an illegal cross-declaration
+// reference in a static initializer on some targets (a dynamic `__device__` initializer NVRTC
+// rejects on CUDA, an inter-`var<private>` reference on WGSL).
+static bool isInnerGlobalAggregate(IRInst* inst)
+{
+    switch (inst->getOp())
+    {
+    case kIROp_MakeArray:
+    case kIROp_MakeStruct:
+    case kIROp_MakeArrayFromElement:
+        break;
+    default:
+        return false;
+    }
+
+    if (!inst->getParent() || inst->getParent()->getOp() != kIROp_ModuleInst)
+        return false;
+
+    // A use-less module-scope aggregate has no constituent context to fold into, so keep it as a
+    // declaration rather than folding it away.
+    if (!inst->firstUse)
+        return false;
+    for (auto use = inst->firstUse; use; use = use->nextUse)
+    {
+        switch (use->getUser()->getOp())
+        {
+        case kIROp_MakeArray:
+        case kIROp_MakeStruct:
+        case kIROp_MakeArrayFromElement:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+CLikeSourceEmitter::FoldPolicy CLikeSourceEmitter::getFoldPolicy(IRInst* inst)
 {
     // Certain opcodes should never/always be folded in
     switch (inst->getOp())
@@ -1454,7 +1510,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_Func:
     case kIROp_Alloca:
     case kIROp_Store:
-        return false;
+        return FoldPolicy::Never;
 
     // Never fold these, because their result cannot be computed
     // as a sub-expression (they must be emitted as a declaration
@@ -1464,7 +1520,11 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_MetalCastToDepthTexture:
     case kIROp_LoadResourceDescriptorFromHeap:
     case kIROp_LoadSamplerDescriptorFromHeap:
-        return false;
+    case kIROp_CoopMatMulAdd:
+    case kIROp_CoopVecMatMulAdd:
+    case kIROp_CoopVecOuterProductAccumulate:
+    case kIROp_CoopVecReduceSumAccumulate:
+        return FoldPolicy::Never;
 
     // Always fold these in, because they are trivial
     //
@@ -1473,7 +1533,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_BoolLit:
     case kIROp_CapabilityConjunction:
     case kIROp_CapabilityDisjunction:
-        return true;
+        return FoldPolicy::Always;
 
     // Always fold these in, because their results
     // cannot be represented in the type system of
@@ -1488,13 +1548,13 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_Specialize:
     case kIROp_LookupWitnessMethod:
     case kIROp_GetValueFromBoundInterface:
-        return true;
+        return FoldPolicy::Always;
 
     case kIROp_GetVulkanRayTracingPayloadLocation:
-        return true;
+        return FoldPolicy::Always;
 
     case kIROp_NonUniformResourceIndex:
-        return true;
+        return FoldPolicy::Always;
     }
 
     // Layouts and attributes are only present to annotate other
@@ -1502,9 +1562,9 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     // source code.
     //
     if (as<IRLayout>(inst))
-        return true;
+        return FoldPolicy::Always;
     if (as<IRAttr>(inst))
-        return true;
+        return FoldPolicy::Always;
 
     switch (inst->getOp())
     {
@@ -1521,7 +1581,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_MakeArrayFromElement:
     case kIROp_MakeCoopVector:
 
-        return false;
+        return isInnerGlobalAggregate(inst) ? FoldPolicy::Always : FoldPolicy::Never;
     }
 
     // Instructions with specific result *types* will usually
@@ -1539,7 +1599,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     // by default.
     //
     if (as<IRType>(inst) || as<IRTypeKind>(type))
-        return true;
+        return FoldPolicy::Always;
 
     // Unwrap any layers of array-ness from the type, so that
     // we can look at the underlying data type, in case we
@@ -1550,11 +1610,11 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     }
 
     // Don't allow temporaries of pointer types to be created,
-    // if target langauge doesn't support pointers.
+    // if target language doesn't support pointers.
     if (as<IRPtrTypeBase>(type))
     {
         if (!doesTargetSupportPtrTypes())
-            return true;
+            return FoldPolicy::Always;
     }
 
     // First we check for uniform parameter groups,
@@ -1571,7 +1631,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
         // TODO: we need to be careful here, because
         // HLSL shader model 6 allows these as explicit
         // types.
-        return true;
+        return FoldPolicy::Always;
     }
     //
     // The stream-output and patch types need to be handled
@@ -1581,11 +1641,11 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     //
     else if (as<IRHLSLStreamOutputType>(type))
     {
-        return true;
+        return FoldPolicy::Always;
     }
     else if (as<IRHLSLPatchType>(type))
     {
-        return true;
+        return FoldPolicy::Always;
     }
 
     // GLSL doesn't allow texture/resource types to
@@ -1595,27 +1655,27 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     {
         if (as<IRResourceTypeBase>(type))
         {
-            return true;
+            return FoldPolicy::Always;
         }
         else if (as<IRHLSLStructuredBufferTypeBase>(type))
         {
-            return true;
+            return FoldPolicy::Always;
         }
         else if (as<IRUntypedBufferResourceType>(type))
         {
-            return true;
+            return FoldPolicy::Always;
         }
         else if (as<IRSamplerStateTypeBase>(type))
         {
-            return true;
+            return FoldPolicy::Always;
         }
         else if (as<IRMeshOutputType>(type))
         {
-            return true;
+            return FoldPolicy::Always;
         }
         if (as<IRHitObjectType>(type))
         {
-            return true;
+            return FoldPolicy::Always;
         }
     }
 
@@ -1625,7 +1685,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     if (as<IRModuleInst>(inst->getParent()))
     {
         if (!inst->mightHaveSideEffects())
-            return true;
+            return FoldPolicy::Always;
     }
 
     if (auto load = as<IRLoad>(inst))
@@ -1635,7 +1695,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
         if (load->getPtr()->getOp() == kIROp_GlobalParam)
         {
             if (ptrType->getOp() == kIROp_BorrowInParamType)
-                return true;
+                return FoldPolicy::Always;
             if (auto ptrTypeBase = as<IRPtrTypeBase>(ptrType))
             {
                 auto addrSpace = ptrTypeBase->getAddressSpace();
@@ -1644,7 +1704,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
                 case Slang::AddressSpace::Uniform:
                 case Slang::AddressSpace::Input:
                 case Slang::AddressSpace::BuiltinInput:
-                    return true;
+                    return FoldPolicy::Always;
                 default:
                     break;
                 }
@@ -1659,13 +1719,25 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
         if (getResolvedInstForDecorations(callee)
                 ->findDecoration<IRAlwaysFoldIntoUseSiteDecoration>())
         {
-            return true;
+            return FoldPolicy::Always;
         }
     }
 
-    // Having dealt with all of the cases where we *must* fold things
-    // above, we can now deal with the more general cases where we
-    // *should not* fold things.
+    return FoldPolicy::WhenSafe;
+}
+
+bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
+{
+    switch (getFoldPolicy(inst))
+    {
+    case FoldPolicy::Never:
+        return false;
+    case FoldPolicy::Always:
+        return true;
+    case FoldPolicy::WhenSafe:
+        break;
+    }
+
     // Don't fold something with no users:
     if (!inst->hasUses())
         return false;
@@ -1796,45 +1868,106 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
             return false;
     }
 
-    // We'd like to figure out if it is safe to fold our instruction into `user`
+    return isSafeToFoldIntoUseSites(inst);
+}
 
-    // First, let's make sure they are in the same block/parent:
-    if (inst->getParent() != user->getParent())
-        return false;
+bool CLikeSourceEmitter::isSafeToFoldIntoUseSites(IRInst* inst)
+{
+    if (!m_foldSafetyCache)
+        return isSafeToFoldIntoUseSitesUncached(inst);
+    if (auto cached = m_foldSafetyCache->tryGetValue(inst))
+        return *cached;
+    bool result = isSafeToFoldIntoUseSitesUncached(inst);
+    m_foldSafetyCache->add(inst, result);
+    return result;
+}
 
+bool CLikeSourceEmitter::isSafeToFoldIntoUseSitesUncached(IRInst* inst)
+{
+    // The scan below follows the order of instructions within one block, so every user of
+    // `inst` has to be in that block.
+    UInt remainingUseCount = 0;
+    for (auto use = inst->firstUse; use; use = use->nextUse)
+    {
+        if (use->getUser()->getParent() != inst->getParent())
+            return false;
+        remainingUseCount++;
+    }
+    // Only an always-folded user reached through the recursion below can have no uses, and
+    // nothing is emitted for it.
+    if (remainingUseCount == 0)
+        return true;
 
     // Now let's look at all the instructions between this instruction
-    // and the user. If any of them might have side effects, then lets
+    // and its users. If any of them might have side effects, then lets
     // bail out now.
-    for (auto ii = inst->getNextInst(); ii != user; ii = ii->getNextInst())
+    for (auto ii = inst->getNextInst();; ii = ii->getNextInst())
     {
         if (!ii)
         {
-            // We somehow reached the end of the block without finding
-            // the user, which doesn't make sense if uses dominate
-            // defs. Let's just play it safe and bail out.
+            // Every user of `inst` follows it in this block and we count both operand and
+            // type uses, so valid IR never gets here. We bail out to be safe.
             return false;
+        }
+
+        UInt useCountOfInst = ii->getFullType() == inst ? 1 : 0;
+        for (UInt i = 0; i < ii->getOperandCount(); i++)
+        {
+            if (ii->getOperand(i) == inst)
+                useCountOfInst++;
+        }
+        if (useCountOfInst != 0)
+        {
+            // As a safeguard, we do not fold an instruction into an unconditional branch,
+            // whose operands include the arguments for the parameters of its target block,
+            // or into an always-folded instruction whose text ends up in such a branch.
+            // A more refined version of this check is left for later.
+            //
+            if (as<IRUnconditionalBranch>(ii))
+                return false;
+
+            // When `ii` is always folded, its text is not emitted at `ii`. It is emitted inside
+            // each user of `ii`, so `inst` is evaluated there, not at `ii`. Consider this
+            // example:
+            //
+            //     uint f = s.a[s.top];
+            //     s.top -= 1;
+            //     return f / 16u;
+            //
+            // After `simplifyForEmit` defers the load of `s.a[...]` to its use, the IR is:
+            //
+            //     %i = load(%top)               // `inst`: the candidate we want to fold
+            //     %p = getElementPtr(%a, %i)    // `ii`: the first user of `inst`
+            //     store(%top, ...)              // `s.top -= 1`
+            //     %f = load(%p)                 // the user of `ii`
+            //
+            // The scan from `%i` reaches `%p` before it reaches the `store`, so looking only at
+            // `inst` and `ii` finds no side effect between them. But `getElementPtr` is always
+            // folded, so `%p` is not emitted at its own position. It is emitted inside `%f`,
+            // which comes after the `store`. If we fold `%i` into `%p`, the emitted code is
+            // `s.a[s.top]` evaluated after `s.top -= 1`, and it reads the decremented value.
+            //
+            // To catch this, we ask whether `ii` is itself safe to fold into its own users.
+            // For `%p`, that scan runs from `%p` to `%f`, meets the `store`, and returns false.
+            // Then `%i` is not folded and keeps its own variable. The recursive call applies
+            // every condition of this function to `ii`, including that its users are in the
+            // same block and are not unconditional branches.
+            //
+            // If `ii` is not always folded, no further check is needed. It is folded only if
+            // it passes this same test itself, because an override of
+            // `shouldFoldInstIntoUseSites` may only decline a fold. In both cases, nothing
+            // with side effects lies between `ii` and the point where it is emitted.
+            if (getFoldPolicy(ii) == FoldPolicy::Always && !isSafeToFoldIntoUseSites(ii))
+                return false;
+
+            remainingUseCount -= useCountOfInst;
+            if (remainingUseCount == 0)
+                return true;
         }
 
         if (ii->mightHaveSideEffects())
             return false;
     }
-
-    // As a safeguard, we should not allow an instruction that references
-    // a block parameter to be folded into a unconcditonal branch
-    // (which includes arguments for the parameters of the target block).
-    //
-    // For simplicity, we will just disallow folding of intructions
-    // into an unconditonal branch completely, and leave a more refined
-    // version of this check for later.
-    //
-    if (as<IRUnconditionalBranch>(user))
-        return false;
-
-    // Okay, if we reach this point then the user comes later in
-    // the same block, and there are no instructions with side
-    // effects in between, so it seems safe to fold things in.
-    return true;
 }
 
 void CLikeSourceEmitter::emitDereferenceOperand(IRInst* inst, EmitOpInfo const& outerPrec)
@@ -1873,7 +2006,7 @@ void CLikeSourceEmitter::emitDereferenceOperand(IRInst* inst, EmitOpInfo const& 
                 IRVectorType* vectorType = nullptr;
                 if (auto ptrType = as<IRPtrTypeBase>(inst->getOperand(0)->getDataType()))
                 {
-                    vectorType = as<IRVectorType>(ptrType->getValueType());
+                    vectorType = as<IRVectorType>(unwrapAttributedType(ptrType->getValueType()));
                 }
                 if (vectorType)
                 {
@@ -2566,6 +2699,14 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_CastDescriptorHandleToUInt64:
         emitOperand(inst->getOperand(0), outerPrec);
         break;
+    case kIROp_CastUIntToUntypedResourceHandle:
+    case kIROp_CastUntypedResourceHandleToUInt:
+    case kIROp_CastUIntToUntypedSamplerHandle:
+    case kIROp_CastUntypedSamplerHandleToUInt:
+        // The untyped descriptor-heap handle wrap/unwrap casts are an internal representation that
+        // `lowerUntypedResourceHandleToUInt` forwards to their `uint` operand and removes before
+        // emit. Seeing one here means that pass did not run (or ran too late), so this is a bug.
+        SLANG_UNEXPECTED("untyped descriptor-heap handle cast should have been lowered to uint");
     // Binary ops
     case kIROp_Add:
     case kIROp_Sub:
@@ -3056,7 +3197,9 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_GetStringHash:
         {
             auto getStringHashInst = as<IRGetStringHash>(inst);
-            auto stringLit = getStringHashInst->getStringLit();
+            // `getStringLit()` casts operand 0 without checking, so it cannot be used to decide
+            // whether the operand really is a literal; that is what the `else` below is for.
+            auto stringLit = as<IRStringLit>(getStringHashInst->getOperand(0));
 
             if (stringLit)
             {
@@ -3120,10 +3263,11 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
 
 void CLikeSourceEmitter::emitInst(IRInst* inst)
 {
-    try
+    SLANG_EXCEPTION_TRY
     {
         _emitInst(inst);
     }
+#if SLANG_HAS_EXCEPTIONS
     // Don't emit any context message for an explicit `AbortCompilationException`
     // because it should only happen when an error is already emitted.
     catch (const AbortCompilationException&)
@@ -3135,6 +3279,7 @@ void CLikeSourceEmitter::emitInst(IRInst* inst)
         noteInternalErrorLoc(inst->sourceLoc);
         throw;
     }
+#endif
 }
 
 void CLikeSourceEmitter::_emitInst(IRInst* inst)
@@ -3216,7 +3361,9 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_DebugNoScope:
     case kIROp_DebugInlinedVariable:
     case kIROp_DebugFunction:
+    case kIROp_DebugLexicalBlock:
     case kIROp_DebugBuildIdentifier:
+    case kIROp_DebugCompilationUnit:
         break;
 
     case kIROp_Unmodified:
@@ -3241,6 +3388,10 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_MetalAtomicCast:
     case kIROp_MetalCastToDepthTexture:
     case kIROp_SetOptiXPayloadRegister:
+    case kIROp_CoopMatMulAdd:
+    case kIROp_CoopVecMatMulAdd:
+    case kIROp_CoopVecOuterProductAccumulate:
+    case kIROp_CoopVecReduceSumAccumulate:
         emitInstStmt(inst);
         break;
 
@@ -3559,7 +3710,29 @@ void CLikeSourceEmitter::emitSwitchCaseSelectorsImpl(
     }
 }
 
-void CLikeSourceEmitter::emitRegion(Region* inRegion)
+// Walk the top-level region chain of a switch `case` body to its final region, and return
+// that region if it is a `break` that exits `switchRegion` itself. This is the redundant
+// break a non-fall-through target places at the tail of every case — because such a case
+// never falls through, reaching the end of the body already exits the switch. Any other
+// terminal (a `return`/`discard` folded into a `SimpleRegion`, a `continue`, or a `break`
+// targeting an enclosing loop) returns null, as does a nested/early break, since only the
+// top-level `nextRegion` chain is followed here.
+static Region* findSwitchCaseTerminatingBreak(Region* caseBody, SwitchRegion* switchRegion)
+{
+    // `break`/`continue` are leaf regions; every other flavor derives from `SeqRegion` and
+    // links to what follows it through `nextRegion`, so follow that chain to its end.
+    Region* region = caseBody;
+    while (region && region->getFlavor() != Region::Flavor::Break &&
+           region->getFlavor() != Region::Flavor::Continue)
+    {
+        region = static_cast<SeqRegion*>(region)->nextRegion.Ptr();
+    }
+    if (!region || region->getFlavor() != Region::Flavor::Break)
+        return nullptr;
+    return (static_cast<BreakRegion*>(region)->outerRegion == switchRegion) ? region : nullptr;
+}
+
+void CLikeSourceEmitter::emitRegion(Region* inRegion, Region* breakRegionToOmit)
 {
     // We will use a loop so that we can process sequential (simple)
     // regions iteratively rather than recursively.
@@ -3627,7 +3800,10 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
         // don't need to consider multi-level break/continue (which we
         // don't for now).
         case Region::Flavor::Break:
-            m_writer->emit("break;\n");
+            // Skip the specific switch-terminating break a break-free target asked us to
+            // omit; emit every other break normally.
+            if (region != breakRegionToOmit)
+                m_writer->emit("break;\n");
             break;
         case Region::Flavor::Continue:
             m_writer->emit("continue;\n");
@@ -3691,7 +3867,8 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
                     emitLoopControlDecorationImpl(loopControlDecoration);
                 }
 
-                m_writer->emit("for(;;)\n{\n");
+                m_writer->emit(getUnconditionalLoopHeader());
+                m_writer->emit("\n{\n");
                 m_writer->indent();
                 emitRegion(loopRegion->body);
                 m_writer->dedent();
@@ -3714,6 +3891,14 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
                 m_writer->emit(")\n{\n");
 
                 auto defaultCase = switchRegion->defaultCase;
+
+                // When a target's switch cases never fall through, the `break` Slang places
+                // at the tail of each case only exists to exit the switch — which already
+                // happens on reaching the case's end. Most such targets still need it emitted
+                // (FXC for HLSL SM 5.x rejects a case without a terminating break), but WGSL
+                // prefers break-free output and older `naga` validators reject `break` outside
+                // a loop, so WGSL opts out via shouldEmitSwitchCaseTerminatingBreak().
+                bool emitTerminatingBreak = shouldEmitSwitchCaseTerminatingBreak();
                 for (auto currentCase : switchRegion->cases)
                 {
                     bool isDefault = (currentCase.Ptr() == defaultCase);
@@ -3721,7 +3906,11 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
                     m_writer->indent();
                     m_writer->emit("{\n");
                     m_writer->indent();
-                    emitRegion(currentCase->body);
+                    Region* breakToOmit =
+                        emitTerminatingBreak
+                            ? nullptr
+                            : findSwitchCaseTerminatingBreak(currentCase->body, switchRegion);
+                    emitRegion(currentCase->body, breakToOmit);
                     m_writer->dedent();
                     m_writer->emit("}\n");
                     m_writer->dedent();
@@ -3788,6 +3977,14 @@ void CLikeSourceEmitter::emitFunctionBody(IRGlobalValueWithCode* code)
 
     // Now emit high-level code from that structured region tree.
     //
+    // We cache the results of `isSafeToFoldIntoUseSites` only from this point on. They depend
+    // on the positions and uses of the instructions in the body, which `fixValueScoping` has
+    // just changed, and emission itself only adds module-level types and constants.
+    //
+    SLANG_ASSERT(!m_foldSafetyCache);
+    Dictionary<IRInst*, bool> foldSafetyCache;
+    m_foldSafetyCache = &foldSafetyCache;
+    SLANG_DEFER(m_foldSafetyCache = nullptr);
     emitRegionTree(regionTree);
 }
 
@@ -3805,9 +4002,12 @@ void CLikeSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
             layout->usesResourceKind(LayoutResourceKind::VaryingOutput))
         {
             emitInterpolationModifiers(param, paramType, layout);
-            emitMeshShaderModifiers(param);
         }
     }
+
+    // Emit mesh-output qualifiers unconditionally: they key off the parameter's
+    // decoration, not its varying-IO layout (which an SV-only output never registers).
+    emitMeshShaderModifiers(param);
 
     emitParamType(paramType, paramName);
     emitSemantics(param);
@@ -3891,8 +4091,8 @@ void CLikeSourceEmitter::emitParamTypeImpl(IRType* type, String const& name)
     }
     else if (auto refType = as<IRRefParamType>(type))
     {
-        // Note: There is no HLSL/GLSL equivalent for by-reference parameters,
-        // so we don't actually expect to encounter these in user code.
+        // HLSL cannot express a by-reference parameter; `inout` is the closest form, though it
+        // copies the value in and out and so loses any aliasing.
         m_writer->emit("inout ");
         type = refType->getValueType();
     }
@@ -4643,8 +4843,12 @@ void CLikeSourceEmitter::emitVarModifiers(IRVarLayout* layout, IRInst* varDecl, 
         layout->usesResourceKind(LayoutResourceKind::VaryingOutput))
     {
         emitInterpolationModifiers(varDecl, varType, layout);
-        emitMeshShaderModifiers(varDecl);
     }
+
+    // Mesh output decorations do not always come with a varying-output layout kind
+    // (for example, OutputVertices can lower to a plain array layout), so gate on the
+    // decoration itself instead of the layout classification.
+    emitMeshShaderModifiers(varDecl);
 
     // Output target specific qualifiers
     emitLayoutQualifiersImpl(layout);
@@ -5216,16 +5420,24 @@ void CLikeSourceEmitter::ensureGlobalInst(
         return;
     case kIROp_ThisType:
         return;
+    case kIROp_BuiltinRequirementKey:
+        // A built-in interface requirement key is metadata (like an interface
+        // requirement entry); it never corresponds to emitted code. Unlike an
+        // ordinary `StructKey`, this key is hoistable and so may survive as an
+        // (unreferenced) global inst after specialization, so skip it explicitly.
+        return;
     case kIROp_DebugInlinedAt:
     case kIROp_DebugScope:
     case kIROp_DebugNoScope:
     case kIROp_DebugFunction:
+    case kIROp_DebugLexicalBlock:
     case kIROp_DebugVar:
     case kIROp_DebugLine:
     case kIROp_DebugSource:
     case kIROp_DebugValue:
     case kIROp_DebugInlinedVariable:
     case kIROp_DebugBuildIdentifier:
+    case kIROp_DebugCompilationUnit:
         return;
     default:
         break;

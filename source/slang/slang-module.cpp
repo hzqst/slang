@@ -24,7 +24,7 @@ Module::Module(Linkage* linkage, ASTBuilder* astBuilder)
     {
         m_astBuilder = linkage->getASTBuilder();
     }
-    getOptionSet() = linkage->m_optionSet;
+    getOptionSet() = linkage->m_optionSet.copyWithoutLevelLocalOptions();
     addModuleDependency(this);
 }
 
@@ -54,7 +54,19 @@ SHA1::Digest Module::computeDigest()
         DigestBuilder<SHA1> digestBuilder;
         auto version = String(getBuildTagString());
         digestBuilder.append(version);
-        getOptionSet().buildHash(digestBuilder);
+
+        // The digest is checked against `Linkage::isBinaryModuleUpToDate`, which hashes the
+        // session's options including its `DownstreamArgs`. Those stay part of the digest because
+        // a precompiled module embeds downstream compiler output, but the module's own options do
+        // not hold them, so we hash the session's entries followed by the module's own.
+        CompilerOptionSet digestOptions;
+        if (auto sessionDownstreamArgs =
+                getLinkage()->m_optionSet.options.tryGetValue(CompilerOptionName::DownstreamArgs))
+            digestOptions.appendLevelLocal(
+                CompilerOptionName::DownstreamArgs,
+                *sessionDownstreamArgs);
+        digestOptions.overrideWith(getOptionSet());
+        digestOptions.buildHash(digestBuilder);
 
         auto fileDependencies = getFileDependencies();
 
@@ -160,7 +172,7 @@ static bool _canExportDeclSymbol(ASTNodeType type)
 
 static bool _canRecurseExportSymbol(Decl* decl)
 {
-    if (as<FunctionDeclBase>(decl) || as<ScopeDecl>(decl))
+    if (as<ScopeDecl>(decl))
     {
         return false;
     }
@@ -171,6 +183,8 @@ void Module::_processFindDeclsExportSymbolsRec(Decl* decl)
 {
     if (_canExportDeclSymbol(decl->astNodeType))
     {
+        SLANG_AST_BUILDER_RAII(m_astBuilder);
+
         // It's a reference to a declaration in another module, so first get the symbol name.
         String mangledName = getMangledName(getCurrentASTBuilder(), decl);
 
@@ -264,6 +278,8 @@ UnownedStringSlice Module::getExportedDeclMangledName(Index index)
 
 SLANG_NO_THROW SlangResult SLANG_MCALL Module::serialize(ISlangBlob** outSerializedBlob)
 {
+    SLANG_AST_BUILDER_RAII(m_astBuilder);
+
     SerialContainerUtil::WriteOptions writeOptions;
     OwnedMemoryStream memoryStream(FileAccess::Write);
     SLANG_RETURN_ON_FAIL(SerialContainerUtil::write(this, writeOptions, &memoryStream));
@@ -276,6 +292,8 @@ SLANG_NO_THROW SlangResult SLANG_MCALL Module::serialize(ISlangBlob** outSeriali
 
 SLANG_NO_THROW SlangResult SLANG_MCALL Module::writeToFile(char const* fileName)
 {
+    SLANG_AST_BUILDER_RAII(m_astBuilder);
+
     SerialContainerUtil::WriteOptions writeOptions;
     FileStream fileStream;
     SLANG_RETURN_ON_FAIL(fileStream.init(fileName, FileMode::Create));

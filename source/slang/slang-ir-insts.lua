@@ -113,6 +113,18 @@ local insts = {
 					hoistable = true,
 				},
 			},
+			{
+				-- A vector with element alignment and no padding (12 bytes for a
+				-- 3-vector of 32-bit floats), used as the storage type for vectors
+				-- in Metal device buffers, which use natural (scalar-aligned,
+				-- tightly packed) layout. Emitted as MSL `packed_T<N>` (e.g.
+				-- `packed_float3`).
+				MetalPackedVec = {
+					struct_name = "MetalPackedVectorType",
+					operands = { { "elementType", "IRType" }, { "elementCount" } },
+					hoistable = true,
+				},
+			},
 			{ Conjunction = { struct_name = "ConjunctionType", hoistable = true } },
 			{
 				Attributed = {
@@ -131,6 +143,8 @@ local insts = {
 			},
 			-- Represents an `Optional<T>`.
 			{ Optional = { struct_name = "OptionalType", operands = { { "valueType", "IRType" } }, hoistable = true } },
+			-- Represents a `Conditional<T, hasValue>`.
+			{ Conditional = { struct_name = "ConditionalType", operands = { { "valueType", "IRType" }, { "hasValue", "IRInst" } }, hoistable = true } },
 			-- Represents an enum type
 			{ Enum = { struct_name = "EnumType", operands = { { "tagType", "IRType" } }, parent = true } },
 			{
@@ -143,12 +157,6 @@ local insts = {
 						},
 					},
 					{
-						DiffPairUserCode = {
-							struct_name = "DifferentialPairUserCodeType",
-							operands = { { "valueType", "IRType" }, { "witnessTable" } },
-						},
-					},
-					{
 						DiffRefPair = {
 							struct_name = "DifferentialPtrPairType",
 							operands = { { "valueType", "IRType" }, { "witnessTable" } },
@@ -157,12 +165,53 @@ local insts = {
 				},
 			},
 			{
-				BwdDiffIntermediateCtxType = {
-					struct_name = "BackwardDiffIntermediateContextType",
-					operands = { { "func" } },
+				TranslatedTypeBase = 
+				{
 					hoistable = true,
+					{
+						BackwardDiffIntermediateContextType = {
+							struct_name = "BackwardDiffIntermediateContextType",
+							operands = { { "func" } }
+						}
+					},
+					{
+						TrivialBackwardDiffIntermediateContextType = {
+							struct_name = "TrivialBackwardDiffIntermediateContextType",
+							operands = { { "func" } }
+						}
+					},
+					{
+						BackwardContextFromLegacyBwdDiffFunc = {
+							operands = { { "func" }, {"legacyBwdDiffFunc"} }
+						}
+					},
+					{
+						BackwardDiffMinimalContextType = {
+							struct_name = "BackwardDiffMinimalContextType",
+							operands = { { "func" } }
+						}
+					},
+					{
+						TrivialBackwardDiffMinimalContextType = {
+							struct_name = "TrivialBackwardDiffMinimalContextType",
+							operands = { { "func" } }
+						}
+					},
+					{
+						BackwardMinimalContextFromLegacyBwdDiffFunc = {
+							struct_name = "BackwardMinimalContextFromLegacyBwdDiffFunc",
+							operands = { { "func" }, {"legacyBwdDiffFunc"} }
+				  		}
+					},
 				},
 			},
+
+			{ ForwardDiffFuncType = { hoistable = true } },
+			{ BackwardDiffFuncType = { hoistable = true } },
+			{ ApplyForBwdFuncType = { hoistable = true } },
+			{ BwdCallableFuncType = { hoistable = true } },
+			{ RematFuncType = { hoistable = true } },
+
 			{
 				TensorView = {
 					struct_name = "TensorViewType",
@@ -179,6 +228,56 @@ local insts = {
 				},
 			},
 			{ Atomic = { struct_name = "AtomicType", operands = { { "elementType", "IRType" } }, hoistable = true } },
+			{
+				WorkGraphRecordTypeBase = {
+					hoistable = true,
+					{
+						DispatchNodeInputRecord = {
+							struct_name = "DispatchNodeInputRecordType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{
+						ThreadNodeInputRecord = {
+							struct_name = "ThreadNodeInputRecordType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{
+						GroupNodeInputRecords = {
+							struct_name = "GroupNodeInputRecordsType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{ EmptyNodeInput = { struct_name = "EmptyNodeInputType" } },
+					{
+						ThreadNodeOutputRecords = {
+							struct_name = "ThreadNodeOutputRecordsType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{
+						GroupNodeOutputRecords = {
+							struct_name = "GroupNodeOutputRecordsType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{
+						NodeOutput = {
+							struct_name = "NodeOutputType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{
+						NodeOutputArray = {
+							struct_name = "NodeOutputArrayType",
+							operands = { { "elementType", "IRType" } },
+						},
+					},
+					{ EmptyNodeOutput = { struct_name = "EmptyNodeOutputType" } },
+					{ EmptyNodeOutputArray = { struct_name = "EmptyNodeOutputArrayType" } },
+				},
+			},
 			{
 				BindExistentialsTypeBase = {
 					hoistable = true,
@@ -284,6 +383,23 @@ local insts = {
 						},
 					},
 					{
+						SPIRVUntypedPtr = {
+							-- A pointer that keeps its logical pointee type and layout in the IR
+							-- (like `PtrType`) but is emitted as an untyped SPIR-V pointer
+							-- (`OpTypeUntypedPointerKHR`), with field/element addresses lowered to
+							-- `OpUntypedAccessChainKHR`. Used for a `ConstantBuffer<T>` fetched from a
+							-- descriptor heap so its uniform-buffer descriptor kind is preserved while
+							-- nested arrays are addressed logically (no pointer-type `ArrayStride`).
+							struct_name = "SPIRVUntypedPtrType",
+							operands = {
+								{ "valueType", "IRType" },
+								{ "accessQualifierOperand", "IRIntLit", optional = true },
+								{ "addressSpaceOperand", "IRIntLit", optional = true },
+								{ "dataLayout", "IRType", optional = true },
+							},
+						},
+					},
+					{
 						OutParamTypeBase = {
 							{ OutParam = { struct_name = "OutParamType", operands = { { "valueType", "IRType" } } } },
 							{
@@ -317,6 +433,25 @@ local insts = {
 					-- A DescriptorHandle<T> type represents a bindless handle to an opaue resource type.
 					struct_name = "DescriptorHandleType",
 					operands = { { "resourceType", "IRType" } },
+					hoistable = true,
+				},
+			},
+			{
+				UntypedResourceHandle = {
+					-- An opaque, untyped handle produced by `ResourceDescriptorHeap[i]`. It is nullary:
+					-- the heap index lives in the value, not the type. `lowerUntypedResourceHandleToUInt`
+					-- rewrites it to its underlying `uint` heap index before emit, so it never reaches
+					-- emit/layout (which treat a survivor as an internal error).
+					struct_name = "UntypedResourceHandleType",
+					hoistable = true,
+				},
+			},
+			{
+				UntypedSamplerHandle = {
+					-- An opaque, untyped handle produced by `SamplerDescriptorHeap[j]`. Nullary, like
+					-- `UntypedResourceHandle`; lowered to `uint` by the same
+					-- `lowerUntypedResourceHandleToUInt` pass and likewise never reaches emit/layout.
+					struct_name = "UntypedSamplerHandleType",
 					hoistable = true,
 				},
 			},
@@ -655,6 +790,18 @@ local insts = {
 					hoistable = true,
 				},
 			},
+			-- A sentinel type used as the last operand of a TupleType to provide a custom
+			-- name for the generated struct when the tuple is lowered.
+			{
+				TupleName = {
+					struct_name = "TupleNameType",
+					operands = { { "name", "IRStringLit" } },
+					hoistable = true,
+				},
+			},
+			-- Represents the type of a generic value pack parameter.
+			-- e.g. `let each D : int` lowers to a param of type ValuePackType(int).
+			{ ValuePackType = { operands = { { "elementType", "IRType" } }, hoistable = true } },
 			{ ExpandTypeOrVal = { operands = { { "type" } }, hoistable = true } },
 			{
 				spirvLiteralType = {
@@ -765,6 +912,23 @@ local insts = {
 	-- for linkage).
 	--
 	{ key = { struct_name = "StructKey", global = true } },
+	-- A requirement key for a recognized built-in interface requirement (e.g. an
+	-- `IDifferentiable` requirement identified by `BuiltinRequirementKind`).
+	-- Unlike an ordinary struct key -- which is a distinct `global` symbol per
+	-- field/requirement decl, unified across modules by its `key_<mangled>`
+	-- linkage name -- a built-in requirement key is `hoistable`, so it is
+	-- deduplicated *by construction* from its `kind` operand. This guarantees the
+	-- same logical built-in requirement always resolves to a single key inst,
+	-- even when referenced from several decls (the canonical interface constraint
+	-- and a constraint synthesized while building a type's `Differential`) or
+	-- across the precompiled-core-module boundary.
+	{
+		builtinRequirementKey = {
+			struct_name = "BuiltinRequirementKey",
+			operands = { { "kindOperand", "IRIntLit" } },
+			hoistable = true,
+		},
+	},
 	{ global_generic_param = { global = true } },
 	{ witness_table = { hoistable = true } },
 	{ indexedFieldKey = { operands = { { "baseType" }, { "index" } }, hoistable = true } },
@@ -841,7 +1005,7 @@ local insts = {
 		--
 		-- Corresponds to the LLVM `poison` instruction.
 		--
-		{ Poison = {} },
+		{ Poison = { hoistable = true } },
 	}},
 
 	-- A `defaultConstruct` operation creates an initialized
@@ -852,12 +1016,6 @@ local insts = {
 		MakeDifferentialPairBase = {
 			{
 				MakeDiffPair = { struct_name = "MakeDifferentialPair", operands = { { "primal" }, { "differential" } } },
-			},
-			{
-				MakeDiffPairUserCode = {
-					struct_name = "MakeDifferentialPairUserCode",
-					operands = { { "primal" }, { "differential" } },
-				},
 			},
 			{
 				MakeDiffRefPair = {
@@ -871,12 +1029,6 @@ local insts = {
 		DifferentialPairGetDifferentialBase = {
 			{ GetDifferential = { struct_name = "DifferentialPairGetDifferential", operands = { { "pair" } } } },
 			{
-				GetDifferentialUserCode = {
-					struct_name = "DifferentialPairGetDifferentialUserCode",
-					operands = { { "pair" } },
-				},
-			},
-			{
 				GetDifferentialPtr = {
 					struct_name = "DifferentialPtrPairGetDifferential",
 					min_operands = 1,
@@ -889,17 +1041,17 @@ local insts = {
 			{
 				GetPrimal = { struct_name = "DifferentialPairGetPrimal", operands = { { "pair" } } },
 			},
-			{
-				GetPrimalUserCode = {
-					struct_name = "DifferentialPairGetPrimalUserCode",
-					min_operands = 1,
-				},
-			},
 			{ GetPrimalRef = { struct_name = "DifferentialPtrPairGetPrimal", operands = { { "ptrPair" } } } },
 		},
 	},
 	{ specialize = { operands = { { "base" }, { "arg" } }, hoistable = true } },
 	{ lookupWitness = { struct_name = "LookupWitnessMethod", min_operands = 2, hoistable = true } },
+	{
+		PackBranch = {
+			operands = { { "pack" }, { "emptyValue" }, { "nonEmptyValue" } },
+			hoistable = true,
+		},
+	},
 	{ GetSequentialID = { operands = { { "RTTIOperand" } }, hoistable = true } },
 	{
 		bind_global_generic_param = {
@@ -930,7 +1082,7 @@ local insts = {
 	{ makeStruct = {} },
 	{ makeTuple = {} },
 	{ makeTargetTuple = { struct_name = "MakeTargetTuple" } },
-	{ makeValuePack = {} },
+	{ makeValuePack = { hoistable=true } },
 	{ makeCombinedTextureSampler = { operands = { {"texture"}, {"sampler"} } } },
 	{ getTargetTupleElement = {} },
 	{
@@ -966,6 +1118,13 @@ local insts = {
 			hoistable = true,
 		},
 	},
+	-- Holds witness tables for differential type info (this type witness, return type witness, param witnesses).
+	-- This is lowered to MakeTuple after specialization.
+	{
+		DiffTypeInfo = {
+			hoistable = true,
+		},
+	},
 	{ Expand = { operands = { { "value" } } } },
 	{
 		Each = {
@@ -982,6 +1141,8 @@ local insts = {
 	{ optionalHasValue = { operands = { { "optionalOperand" } } } },
 	{ makeOptionalValue = { operands = { { "value" } } } },
 	{ makeOptionalNone = {} },
+	{ getConditionalValue = { operands = { { "conditionalOperand" } } } },
+	{ makeConditionalValue = { operands = { { "value" } } } },
 	{ CombinedTextureSamplerGetTexture = { operands = { { "sampler" } } } },
 	{ CombinedTextureSamplerGetSampler = { operands = { { "sampler" } } } },
 	{ call = { operands = { { "callee" } } } },
@@ -1050,6 +1211,50 @@ local insts = {
 			{ atomicDec = { operands = { { "ptr" } } } },
 		},
 	},
+	-- Emitted at AST lowering when line coverage is on. The instruction
+	-- has no operands; its source position is carried on the standard
+	-- per-instruction `sourceLoc` field, which is always preserved and
+	-- never stripped by `stripDebugInfo`. The coverage-instrument IR pass
+	-- later rewrites coverage markers into an atomic add on the IR-
+	-- synthesized `__slang_coverage` buffer, or a plain store under
+	-- `-trace-coverage-boolean`. Line markers that provably execute
+	-- together -- same basic block, nothing between them that can abandon
+	-- the invocation -- are coalesced onto a single counter, and only the
+	-- last marker of such a region emits the runtime update; the rest are
+	-- removed without emitting one. The lowering is therefore not
+	-- one-to-one, though each marker still produces its own source
+	-- entry. Host-side tooling reads source
+	-- coverage entries and projects them to LCOV records.
+	-- Inherent side-effect semantics keep the optimizer from deleting or
+	-- hoisting these ops.
+	{ IncrementCoverageCounter = {} },
+	-- Function-entry coverage marker. The marker's sourceLoc points at
+	-- the function declaration/body start. Display and mangled names are
+	-- carried as operands so later IR passes do not need AST access.
+	{
+		IncrementFunctionCoverageCounter =
+		{
+			operands =
+			{
+				{ "functionName", "IRStringLit" },
+				{ "functionMangledName", "IRStringLit" },
+			}
+		}
+	},
+	-- Branch-arm coverage marker. SourceLoc points at the branch
+	-- condition. Site/arm ids are local to the emitted metadata object;
+	-- semantic arm kind lets LCOV export distinguish true/false/case.
+	{
+		IncrementBranchCoverageCounter =
+		{
+			operands =
+			{
+				{ "branchSiteID", "IRIntLit" },
+				{ "branchArmID", "IRIntLit" },
+				{ "branchArmKind", "IRIntLit" },
+			}
+		}
+	},
 	-- Produced and removed during backward auto-diff pass as a temporary placeholder representing the
 	-- currently accumulated derivative to pass to some dOut argument in a nested call.
 	{ LoadReverseGradient = { operands = { { "value" } } } },
@@ -1062,8 +1267,6 @@ local insts = {
 	-- Produced and removed during backward auto-diff pass. This inst is generated by the splitting step
 	-- to represent a reference to an inout parameter for use in the back-prop part of the computation.
 	{ DiffParamRef = { operands = { { "referencedParam" } } } },
-	-- Check that the value is a differential null value.
-	{ IsDifferentialNull = { operands = { { "base" } } } },
 	{
 		get_field = {
 			struct_name = "FieldExtract",
@@ -1076,6 +1279,9 @@ local insts = {
 	-- Pointer offset: computes pBase + offset_in_elements
 	{ getOffsetPtr = { operands = { { "base" }, { "offset" } } } },
 	{ getAddr = { struct_name = "GetAddress", operands = { { "ptr" } } } },
+	-- An address obtained via __getAddress. Lowered away after validation
+	-- into the underlying address operand.
+	{ assumeAddress = { operands = { { "addr" } } } },
 	{ castDynamicResource = { operands = { { "resource" } } } },
 	-- Get an unowned NativeString from a String.
 	{ getNativeStr = { operands = { { "stringValue" } } } },
@@ -1099,6 +1305,19 @@ local insts = {
 	},
 	-- Store into an Image.
 	{ imageStore = { operands = { { "image" }, { "coord" }, { "value" } } } },
+	-- Gather four texels from a sampled image at a coordinate, offset by a texel offset.
+	-- The offset may be a compile-time constant or a runtime value; the SPIR-V backend
+	-- inspects the offset operand and selects the `ConstOffset` image operand (no capability)
+	-- for a constant offset, or `Offset` + `ImageGatherExtended` for a runtime offset.
+	{
+		imageGatherOffset = {
+			operands = { { "sampledImage" }, { "location" }, { "component" }, { "offset" } },
+		},
+	},
+	-- Form a pointer to a texel of an image for atomic operations.
+	{ ImageTexelPointer = { operands = { { "image" }, { "coord" }, { "sample" } } } },
+	-- Load from a SubpassInput.
+	{ SubpassLoad = { operands = { { "subpassInput" }, { "sample", optional = true } } } },
 	-- Load (almost) arbitrary-type data from a byte-address buffer
 	-- %dst = byteAddressBufferLoad(%buffer, %offset, %alignment)
 	-- where
@@ -1155,7 +1374,9 @@ local insts = {
 	-- Resource qualifiers for dynamically varying index
 	{ nonUniformResourceIndex = { operands = { { "index" } } } },
 	{ getNaturalStride = { operands = { { "type" } } } },
+	{ getNaturalAlignment = { operands = { { "type" } } } },
 	{ meshOutputRef = { operands = { { "base" }, { "index" } } } },
+	{ nodeOutputRecordGetElementPtr = { operands = { { "base" }, { "index" } } } },
 	{ meshOutputSet = { operands = { { "base" }, { "index" }, { "elementValue" } } } },
 	-- only two parameters as they are effectively static
 	-- TODO: make them reference the _slang_mesh object directly
@@ -1210,7 +1431,26 @@ local insts = {
 	--
 	--   for(ii : 0 ... M-1 )
 	--     dst[ii] = src[idx[ii]];
+	
 	{ swizzledStore = { operands = { { "dest" }, { "source" } }, min_operands = 2 } },
+	-- Store to a matrix with a swizzle
+	--
+	-- matrixSwizzleStore %dst %src %row0 %col0 %row1 %col1 ...
+	--
+	-- where:
+	-- - `dst` is a pointer to a matrix<T,R,C>
+	-- - `src` is a scalar T or vector<T,M>
+	-- - pairs of (row_i, col_i) are literal integers identifying matrix elements
+	--
+	-- The semantics of the op is:
+	--
+	--   for(ii : 0 ... M-1 )
+	--     dst[row_ii][col_ii] = src[ii];  (or src if scalar)
+	{ matrixSwizzleStore = { operands = { { "dest" }, { "source" } }, min_operands = 2 } },
+	-- Transposed operation of MakeVectorFromScalar
+	{ SumVectorElements = { min_operands = 1 } },
+	-- Transposed operation of MakeMatrixFromScalar
+	{ SumMatrixElements = { min_operands = 1 } },
 	{
 		TerminatorInst = {
 			{ return_val = { struct_name = "Return", operands = { { "val" } } } },
@@ -1305,6 +1545,7 @@ local insts = {
 	{ RequireComputeDerivative = {} },
 	{ StaticAssert = { operands = { { "condition" }, { "message" } } } },
 	{ Printf = { operands = { { "format" } } } },
+	{ Abort = { operands = { { "format" } } } },
 	-- Quad control execution modes.
 	{ RequireMaximallyReconverges = {} },
 	{ RequireQuadDerivatives = {} },
@@ -1376,6 +1617,17 @@ local insts = {
 	},
 	{ loopExitValue = { min_operands = 1 } },
 	{
+		ReportCheckpointStore = {
+			-- Marker instruction that reports a checkpoint store to the user.
+			-- Operands: (storedType, originalFunc, storeRef)
+			-- storedType is the IRType of the value being checkpointed.
+			-- originalFunc is the function that the checkpoint is associated with.
+			-- storeRef is a weak reference to the store or address instruction.
+			--   If the store is optimized out, this operand will become poison.
+			operands = { { "storedType" }, { "originalFunc" }, { "storeRef" } },
+		},
+	},
+	{
 		getStringHash = {
 			operands = { { "stringLit", "IRStringLit" } },
 		},
@@ -1409,6 +1661,13 @@ local insts = {
 	-- Operand 0: register index (int literal)
 	-- Operand 1: value to write (uint32)
 	{ setOptiXPayloadRegister = { min_operands = 2 } },
+	-- Write side of a portable `ReportHit(tHit, hitKind, attributes)` call for OptiX.
+	-- Operand 0: tHit (float). Operand 1: hitKind (uint). The remaining operands are the
+	-- aggregate's scalar attribute leaves, produced by the CUDA varying-param legalization
+	-- pass, which flattens `attributes` field-wise (one operand per OptiX attribute register)
+	-- mirroring the read side (`emitOptiXAttributeFetch`). The CUDA emitter renders this as a
+	-- single `optixReportIntersection(tHit, hitKind, a0..aN)`.
+	{ reportOptiXIntersection = { min_operands = 2 } },
 	{ GetVulkanRayTracingPayloadLocation = { min_operands = 1 } },
 	{ GetLegalizedSPIRVGlobalParamAddr = { min_operands = 1 } },
 	{
@@ -1441,6 +1700,48 @@ local insts = {
 	{ TorchGetCudaStream = {} },
 	{ TorchTensorGetView = {} },
 	{ CoopMatMapElementIFunc = { min_operands = 2 } },
+	{ CoopMatMulAdd = { operands = { { "matA" }, { "matB" }, { "matC" }, { "saturatingAccumulation" } } } },
+	{
+		CoopVecMatMulAdd = {
+			operands = {
+				{ "input" },
+				{ "inputInterpretation" },
+				{ "inputInterpretationPackingFactor" },
+				{ "matrixPtr" },
+				{ "matrixOffset" },
+				{ "matrixInterpretation" },
+				{ "k" },
+				{ "memoryLayout" },
+				{ "transpose" },
+				{ "matrixStride" },
+				{ "biasPtr", optional = true },
+				{ "biasOffset", optional = true },
+				{ "biasInterpretation", optional = true },
+			},
+		},
+	},
+	{
+		CoopVecOuterProductAccumulate = {
+			operands = {
+				{ "matrixPtr" },
+				{ "matrixOffset" },
+				{ "a" },
+				{ "b" },
+				{ "memoryLayout" },
+				{ "matrixInterpretation" },
+				{ "matrixStride" },
+			},
+		},
+	},
+	{
+		CoopVecReduceSumAccumulate = {
+			operands = {
+				{ "bufferPtr" },
+				{ "offset" },
+				{ "value" },
+			},
+		},
+	},
 	{ allocateOpaqueHandle = {} },
 	{
 		BindingQuery = {
@@ -1586,6 +1887,20 @@ local insts = {
 			-- to it.
 			{ vulkanHitObjectAttributes = { struct_name = "VulkanHitObjectAttributesDecoration" } },
 			{ GlobalVariableShadowingGlobalParameterDecoration = { min_operands = 2 } },
+			-- Lowering adds this marker when the AST declaration is either a file- or namespace-scope
+			-- mutable `static` variable or a mutable uniform-parameter shadow. The marker records
+			-- membership in that combined category, not which kind the declaration has or what storage
+			-- rate it uses. Static data members also use `IRGlobalVar`, but are outside the category.
+			{ fileOrNamespaceScopeMutableVar = { struct_name = "FileOrNamespaceScopeMutableVarDecoration" } },
+			-- The pre-link module-wide uninitialized-global check found a possible write and
+			-- therefore could not prove that every read is uninitialized. We preserve that result
+			-- because entry-point linking may remove the writer before a later analysis revisits the
+			-- global.
+			{
+				uninitializedGlobalCheckFoundPossibleWrite = {
+					struct_name = "UninitializedGlobalCheckFoundPossibleWriteDecoration",
+				},
+			},
 			{
 				requireSPIRVVersion = {
 					struct_name = "RequireSPIRVVersionDecoration",
@@ -1633,6 +1948,16 @@ local insts = {
 			{ vulkanCallablePayload = { struct_name = "VulkanCallablePayloadDecoration" } },
 			{ vulkanCallablePayloadIn = { struct_name = "VulkanCallablePayloadInDecoration" } },
 			{ earlyDepthStencil = { struct_name = "EarlyDepthStencilDecoration" } },
+			{ postDepthCoverage = { struct_name = "PostDepthCoverageDecoration" } },
+			-- Marks a fragment entry point whose `gl_FragDepth` output is constrained to
+			-- only ever increase / decrease the fixed-function depth (HLSL
+			-- SV_DepthGreaterEqual / SV_DepthLessEqual). Carried on the entry point so the
+			-- GLSL emitter can redeclare `layout(depth_greater)` / `layout(depth_less) out
+			-- float gl_FragDepth;`, which glslang maps to the DepthGreater / DepthLess
+			-- SPIR-V execution mode.
+			{ glslFragDepthGreater = { struct_name = "GLSLFragDepthGreaterDecoration" } },
+			{ glslFragDepthLess = { struct_name = "GLSLFragDepthLessDecoration" } },
+			{ shader64BitIndexing = { struct_name = "Shader64BitIndexingDecoration" } },
 			{ precise = { struct_name = "PreciseDecoration" } },
 			{ public = { struct_name = "PublicDecoration" } },
 			{ hlslExport = { struct_name = "HLSLExportDecoration" } },
@@ -1641,6 +1966,7 @@ local insts = {
 			{
 				patchConstantFunc = { struct_name = "PatchConstantFuncDecoration", operands = { { "func", "IRInst" } } },
 			},
+			{ glslPatch = { struct_name = "GLSLPatchDecoration" } },
 			{
 				maxTessFactor = {
 					struct_name = "MaxTessFactorDecoration",
@@ -1695,13 +2021,72 @@ local insts = {
 				},
 			},
 			{
+				nodeLaunch = {
+					struct_name = "NodeLaunchDecoration",
+					operands = { { "mode", "IRStringLit" } },
+				},
+			},
+			{
+				nodeMaxDispatchGrid = {
+					struct_name = "NodeMaxDispatchGridDecoration",
+					operands = { { "x", "IRIntLit" }, { "y", "IRIntLit" }, { "z", "IRIntLit" } },
+				},
+			},
+			{
+				nodeDispatchGrid = {
+					struct_name = "NodeDispatchGridDecoration",
+					operands = { { "x", "IRIntLit" }, { "y", "IRIntLit" }, { "z", "IRIntLit" } },
+				},
+			},
+			{
+				maxRecords = {
+					struct_name = "MaxRecordsDecoration",
+					operands = { { "count", "IRIntLit" } },
+				},
+			},
+			{
+				nodeID = {
+					struct_name = "NodeIDDecoration",
+					operands = { { "name", "IRStringLit" }, { "arrayIndex", "IRIntLit" } },
+				},
+			},
+			{
+				nodeIsProgramEntry = {
+					struct_name = "NodeIsProgramEntryDecoration",
+				},
+			},
+			{
+				nodeArraySize = {
+					struct_name = "NodeArraySizeDecoration",
+					operands = { { "count", "IRIntLit" } },
+				},
+			},
+			{
+				allowSparseNodes = {
+					struct_name = "AllowSparseNodesDecoration",
+				},
+			},
+			{
+				-- Keep these decoration names reserved for stable IR serialization; new
+				-- workgraph records use dedicated Type.WorkGraphRecordTypeBase ops.
+				workGraphRecordType = {
+					struct_name = "WorkGraphRecordTypeDecoration",
+				},
+			},
+			{
+				workGraphRecordElementType = {
+					struct_name = "WorkGraphRecordElementTypeDecoration",
+					operands = { { "elementType", "IRType" } },
+				},
+			},
+			{
 				availableInDownstreamIR = { struct_name = "AvailableInDownstreamIRDecoration", min_operands = 1 },
 			},
 			{
+				-- Added to an entry point's input parameter, and copied onto the entry-point function
 				GeometryInputPrimitiveTypeDecoration = {
 					{
 						pointPrimitiveType = {
-							-- Added to IRParam parameters to an entry point
 							struct_name = "PointInputPrimitiveTypeDecoration",
 						},
 					},
@@ -1778,6 +2163,16 @@ local insts = {
 				},
 			},
 			{
+				synthesizedParameterGroup = {
+					-- Marks a parameter-group element struct that was synthesized by the
+					-- compiler (e.g. by collecting entry-point `uniform`/resource parameters)
+					-- rather than written by the user. Diagnostics that only make sense for
+					-- source-authored groups (such as "special type leaks from parameter
+					-- group") are suppressed for these.
+					struct_name = "SynthesizedParameterGroupDecoration",
+				},
+			},
+			{
 				dependsOn = {
 					-- A `[dependsOn(x)]` decoration indicates that the parent instruction depends on `x`
 					-- even if it does not otherwise reference it.
@@ -1816,6 +2211,15 @@ local insts = {
 				ForceInline = {
 					-- A `[ForceInline]` decoration indicates the callee should be inlined by the Slang compiler.
 					struct_name = "ForceInlineDecoration",
+				},
+			},
+			{
+				AllowPreTranslationInlining = {
+					-- This decoration indicates the callee should be inlined after translation passes,
+					-- Typically, this is because the callee has non-trivial values associated with it that need to be preserved 
+					-- for translation.
+					--
+					struct_name = "AllowPreTranslationInliningDecoration",
 				},
 			},
 			{
@@ -1920,6 +2324,16 @@ local insts = {
 				},
 			},
 			{
+				BuiltinRequirementDecoration = {
+					-- Marks an interface requirement key with the `BuiltinRequirementKind`
+					-- (stored as its integer value) of the built-in requirement it
+					-- represents. This lets consumers (e.g. autodiff) identify a built-in
+					-- requirement entry by its role rather than by its position in the
+					-- interface's requirement list, which is not semantically meaningful.
+					operands = { { "kindOperand", "IRIntLit" } },
+				},
+			},
+			{
 				RTTI_typeSize = {
 					-- Decorations for RTTI objects
 					struct_name = "RTTITypeSizeDecoration",
@@ -1930,6 +2344,7 @@ local insts = {
 				AnyValueSize = { struct_name = "AnyValueSizeDecoration", operands = { { "sizeOperand", "IRIntLit" } } },
 			},
 			{ SpecializeDecoration = {} },
+			{ SpecializationDepthDecoration = { operands = { { "specializationDepthOperand", "IRIntLit" } } } },
 			{ SequentialIDDecoration = { operands = { { "sequentialIdOperand", "IRIntLit" } } } },
 			{ DynamicDispatchWitnessDecoration = {} },
 			{ StaticRequirementDecoration = {} },
@@ -1972,11 +2387,11 @@ local insts = {
 			},
 			{ noRefInline = { struct_name = "NoRefInlineDecoration" } },
 			{
-				DerivativeGroupQuad = {
-					struct_name = "DerivativeGroupQuadDecoration",
+				DerivativeGroupDecoration = {
+					{ DerivativeGroupQuad = { struct_name = "DerivativeGroupQuadDecoration" } },
+					{ DerivativeGroupLinear = { struct_name = "DerivativeGroupLinearDecoration" } },
 				},
 			},
-			{ DerivativeGroupLinear = { struct_name = "DerivativeGroupLinearDecoration" } },
 			{
 				MaximallyReconverges = {
 					struct_name = "MaximallyReconvergesDecoration",
@@ -2105,12 +2520,6 @@ local insts = {
 				},
 			},
 			{
-				forwardDifferentiable = {
-					-- Decorated function is marked for the forward-mode differentiation pass.
-					struct_name = "ForwardDifferentiableDecoration",
-				},
-			},
-			{
 				AutoDiffOriginalValueDecoration = {
 					-- Decorates a auto-diff transcribed value with the original value that the inst is transcribed from.
 					operands = { { "originalValue" } },
@@ -2119,61 +2528,6 @@ local insts = {
 			{
 				AutoDiffBuiltinDecoration = {
 					-- Decorates a type as auto-diff builtin type.
-				},
-			},
-			{
-				fwdDerivative = {
-					-- Used by the auto-diff pass to hold a reference to the
-					-- generated derivative function.
-					struct_name = "ForwardDerivativeDecoration",
-					operands = { { "forwardDerivativeFunc" } },
-				},
-			},
-			{
-				backwardDifferentiable = {
-					-- Used by the auto-diff pass to hold a reference to the
-					-- generated derivative function.
-					struct_name = "BackwardDifferentiableDecoration",
-					min_operands = 1,
-				},
-			},
-			{
-				primalSubstFunc = {
-					-- Used by the auto-diff pass to hold a reference to the
-					-- primal substitute function.
-					struct_name = "PrimalSubstituteDecoration",
-					operands = { { "primalSubstituteFunc" } },
-				},
-			},
-			{
-				backwardDiffPrimalReference = {
-					-- Decorations to associate an original function with compiler generated backward derivative functions.
-					struct_name = "BackwardDerivativePrimalDecoration",
-					operands = { { "backwardDerivativePrimalFunc" } },
-				},
-			},
-			{
-				backwardDiffPropagateReference = {
-					struct_name = "BackwardDerivativePropagateDecoration",
-					operands = { { "backwardDerivativePropagateFunc" } },
-				},
-			},
-			{
-				backwardDiffIntermediateTypeReference = {
-					struct_name = "BackwardDerivativeIntermediateTypeDecoration",
-					operands = { { "backwardDerivativeIntermediateType" } },
-				},
-			},
-			{
-				backwardDiffReference = {
-					struct_name = "BackwardDerivativeDecoration",
-					operands = { { "backwardDerivativeFunc" } },
-				},
-			},
-			{
-				userDefinedBackwardDiffReference = {
-					struct_name = "UserDefinedBackwardDerivativeDecoration",
-					operands = { { "backwardDerivativeFunc" } },
 				},
 			},
 			{ BackwardDerivativePrimalContextDecoration = { operands = { { "backwardDerivativePrimalContextVar" } } } },
@@ -2185,6 +2539,12 @@ local insts = {
 			},
 			{ loopCounterDecoration = {} },
 			{ loopCounterUpdateDecoration = {} },
+			{ ParamsContextDecoration = { operands = {"value"} } },
+			{
+				AutodiffParameterContextTypeDecoration = {
+					-- Marks a context whose fields are captured primal parameters.
+				},
+			},
 			{
 				AutodiffInstDecoration = {
 					-- Auto-diff inst decorations
@@ -2222,7 +2582,7 @@ local insts = {
 					-- Used by the auto-diff pass to mark insts whose result is stored
 					-- in an intermediary struct for reuse in backward propagation phase.
 					struct_name = "PrimalValueStructKeyDecoration",
-					operands = { { "structKey", "IRStructKey" } },
+					operands = { { "firstKey", "IRStructKey" }, { "secondKey", "IRStructKey" } },
 				},
 			},
 			{
@@ -2240,15 +2600,13 @@ local insts = {
 				},
 			},
 			{
+				ReturnValueContextFieldDecoration = { },
+			},
+			{
 				derivativeMemberDecoration = {
 					-- Used by the auto-diff pass to hold a reference to a
 					-- differential member of a type in its associated differential type.
 					operands = { { "derivativeMemberStructKey" } },
-				},
-			},
-			{
-				treatAsDifferentiableDecoration = {
-					-- Treat a function as differentiable function
 				},
 			},
 			{
@@ -2287,12 +2645,6 @@ local insts = {
 							-- Hint that the result from a call to the decorated function should be recomputed in backward prop function.
 						},
 					},
-					{
-						CheckpointIntermediateDecoration = {
-							-- Hint that a struct is used for reverse mode checkpointing
-							operands = { { "sourceFunction" } },
-						},
-					},
 				},
 			},
 			{
@@ -2328,9 +2680,9 @@ local insts = {
 			},
 			{
 				DebugLocation = {
-					-- Decorates an inst with a debug source location (IRDebugSource, IRIntLit(line), IRIntLit(col)).
+					-- Source, line, column, and an optional declaration scope for variables/parameters.
 					struct_name = "DebugLocationDecoration",
-					operands = { { "source" }, { "line" }, { "col" } },
+					operands = { { "source" }, { "line" }, { "col" }, { "scope", optional = true } },
 				},
 			},
 			{
@@ -2372,13 +2724,17 @@ local insts = {
 			},
 			{
 				experimentalModule = {
-					-- Marks a module as an experimental module
+					-- Marks a module as experimental in serialized IR.
+					--
+					-- Retained as derived metadata because the AST-gate refactor left
+					-- `IRModule::k_maxSupportedModuleVersion` unchanged, so compatible
+					-- pre-refactor readers still inspect this marker to emit E00104.
 					struct_name = "ExperimentalModuleDecoration"
 				},
 			},
 			{
 				DisallowSpecializationWithExistentialsDecoration = { },
-			}
+			},
 		},
 	},
 	-- Decoration
@@ -2456,10 +2812,26 @@ local insts = {
 	-- already concrete types.
 	{ CastDescriptorHandleToResource = { operands = { { "handle" } } } },
 	{ CastResourceToDescriptorHandle = { operands = { { "resource" } } } },
+	-- Wrap/unwrap a `uint` heap index in an untyped descriptor-heap handle. This is an internal
+	-- representation only: the `lowerUntypedResourceHandleToUInt` pass forwards each cast to its
+	-- `uint` operand and removes it before emit, so these ops never reach a target emitter.
+	{ CastUIntToUntypedResourceHandle = { operands = { { "index" } } } },
+	{ CastUntypedResourceHandleToUInt = { operands = { { "handle" } } } },
+	{ CastUIntToUntypedSamplerHandle = { operands = { { "index" } } } },
+	{ CastUntypedSamplerHandleToUInt = { operands = { { "handle" } } } },
 	{ TreatAsDynamicUniform = { operands = { { "value" } } } },
-	{ sizeOf = { operands = { { "type" } } } },
-	{ alignOf = { operands = { { "baseOp" } } } },
+	{ sizeOf = { operands = { { "type" }, { "dataLayout", "IRType", optional = true } }, hoistable = true } },
+	{ alignOf = { operands = { { "baseOp" }, { "dataLayout", "IRType", optional = true } }, hoistable = true } },
 	{ countOf = { operands = { { "type" } } } },
+	{ ExtractFirstFromPack = { operands = { { "pack" }, { "witness" } }, hoistable = true } },
+	{ ExtractLastFromPack = { operands = { { "pack" }, { "witness" } }, hoistable = true } },
+	{ TrimFirstOfPack = { operands = { { "pack" }, { "witness" } }, hoistable = true } },
+	{ TrimLastOfPack = { operands = { { "pack" }, { "witness" } }, hoistable = true } },
+	{ ShapeConcat = { operands = { { "leftPack" }, { "rightPack" }, { "axis" } }, hoistable = true } },
+	{ ShapePermute = { operands = { { "pack" }, { "order" } }, hoistable = true } },
+	{ ShapeSwap = { operands = { { "pack" }, { "dim0" }, { "dim1" } }, hoistable = true } },
+	{ ShapeReduce = { operands = { { "pack" }, { "axis" } }, hoistable = true } },
+	{ NonEmptyPackWitness = { operands = { { "pack" } }, hoistable = true } },
 	{ GetArrayLength = { operands = { { "array" } } } },
 	{
 		IsType = {
@@ -2476,18 +2848,48 @@ local insts = {
 	{ IsUnsignedInt = { operands = { { "value" } } } },
 	{ IsSignedInt = { operands = { { "value" } } } },
 	{ IsVector = { operands = { { "value" } } } },
+	{ IsBindlessTextureNVEncodable = { operands = { { "value" } } } },
 	{ GetDynamicResourceHeap = { hoistable = true } },
-	{ ForwardDifferentiate = { operands = { { "baseFn" } } } },
-	-- Produces the primal computation of backward derivatives, will return an intermediate context for
-	-- backward derivative func.
-	{ BackwardDifferentiatePrimal = { operands = { { "baseFn" } } } },
-	-- Produces the actual backward derivative propagate function, using the intermediate context returned by the
-	-- primal func produced from `BackwardDifferentiatePrimal`.
-	{ BackwardDifferentiatePropagate = { operands = { { "baseFn" } } } },
-	-- Represents the conceptual backward derivative function. Only produced by lower-to-ir and will be
-	-- replaced with `BackwardDifferentiatePrimal` and `BackwardDifferentiatePropagate`.
-	{ BackwardDifferentiate = { operands = { { "baseFn" } } } },
-	{ PrimalSubstitute = { operands = { { "baseFn" } } } },
+	{ TranslateBase = {
+		hoistable = true,
+
+		-- TODO: Document these.
+		{ TrivialForwardDifferentiate = { min_operands = 1 } },
+
+		{ BackwardDifferentiatePrimal = { min_operands = 1 } },
+		{ BackwardRemat = { min_operands = 1 } },
+		{ BackwardDifferentiatePropagate = { min_operands = 1 } },
+
+		{ TrivialBackwardDifferentiate = { min_operands = 1 } },
+
+		{ TrivialBackwardDifferentiatePrimal = { min_operands = 1 } },
+		{ TrivialBackwardRemat = { min_operands = 1 } },
+		{ TrivialBackwardDifferentiatePropagate = { min_operands = 1 } },
+
+		{ FunctionCopy = { min_operands = 1 } },
+
+		{ BackwardDifferentiate = { min_operands = 3 } },
+		{ ForwardDifferentiate = { min_operands = 1, operands = { { "baseFn" } } } },
+
+		{ LegacyBackwardDifferentiate = { min_operands = 3 } },
+		
+		{ BackwardPrimalFromLegacyBwdDiffFunc = { min_operands = 2 } },
+		{ BackwardRematFromLegacyBwdDiffFunc = { min_operands = 2 } },
+		{ BackwardPropagateFromLegacyBwdDiffFunc = { min_operands = 2 } },
+
+		{ BackwardFromLegacyBwdDiffFunc = { min_operands = 2 } },
+		{ ForwardDifferentiatePropagate = { min_operands = 1 } },
+
+		-- For higher-order derivatives.
+		{ SynthesizedForwardDerivativeWitnessTable = { min_operands = 1 } },
+		{ SynthesizedBackwardDerivativeWitnessTable = { min_operands = 1 } },
+		{ MakeIDifferentiableWitness = { min_operands = 1 } },
+		{ SynthesizedBackwardDerivativeWitnessTableFromLegacyBwdDiffFunc = { min_operands = 2 } },
+
+		-- For user-provided apply (__func_extension __apply(fn)).
+		-- Identity remat for when MinimalContext == BwdCallable.
+		{ IdentityRemat = { min_operands = 1 } },
+	} },
 	{ DispatchKernel = { operands = { { "baseFn" }, { "threadGroupSize" }, { "dispatchSize" } } } },
 	{
 		CudaKernelLaunch = {
@@ -2585,6 +2987,9 @@ local insts = {
 					{ offset = { struct_name = "VarOffsetAttr", min_operands = 2 } },
 				},
 			},
+			-- Alignment is stored alignment-first (operand 0), unit second and optional,
+			-- so it does not fit the kind-first `LayoutResourceInfoAttr` shape.
+			{ TypeAlignment = { struct_name = "TypeAlignmentAttr", min_operands = 1 } },
 			{ FuncThrowType = { struct_name = "FuncThrowTypeAttr", operands = { { "errorType", "IRType" } } } },
 		},
 	},
@@ -2592,15 +2997,12 @@ local insts = {
 	{
 		LiveRangeMarker = { { liveRangeStart = { min_operands = 2 } }, { liveRangeEnd = {} } },
 	},
-	-- IRSpecialization
-	{ SpecializationDictionaryItem = {} },
-	{ GenericSpecializationDictionary = { parent = true } },
-	{ ExistentialFuncSpecializationDictionary = { parent = true } },
-	{ ExistentialTypeSpecializationDictionary = { parent = true } },
 	-- Differentiable Type Dictionary
 	{ DifferentiableTypeDictionaryItem = { operands = { { "concreteType" }, { "witness" } } } },
 	-- Differentiable Type Annotation (for run-time types)
 	{ DifferentiableTypeAnnotation = { operands = { { "baseType" }, { "witness" } }, hoistable = true } },
+	{ WitnessTableAnnotation = { min_operands = 2, hoistable = true } }, -- TODO: remove this..
+	{ Annotation = { min_operands = 2, hoistable = true } },
 	{ BeginFragmentShaderInterlock = {} },
 	{
 		EndFragmentShaderInterlock = { struct_name = "EndFragmentShaderInterlock" },
@@ -2612,7 +3014,11 @@ local insts = {
 			min_operands = 5,
 		},
 	},
-	{ DebugVar = { operands = { { "name" }, { "type" }, { "scope" }, { "location" } } } },
+	{
+		DebugVar = {
+			min_operands = 5,
+		},
+	},
 	{
 		DebugValue = {
 			min_operands = 2,
@@ -2624,16 +3030,27 @@ local insts = {
 			min_operands = 5,
 		},
 	},
+	{
+		DebugLexicalBlock = {
+			operands = { { "source" }, { "line" }, { "col" }, { "parentScope" } },
+		},
+	},
 	{ DebugInlinedVariable = { min_operands = 2 } },
 	{
 		DebugScope = {
-			min_operands = 2,
+			min_operands = 1,
 		},
 	},
-	{ DebugNoScope = { min_operands = 1 } },
+	{ DebugNoScope = { min_operands = 0 } },
 	{
 		DebugBuildIdentifier = {
 			min_operands = 2,
+		},
+	},
+	{
+		DebugCompilationUnit = {
+			operands = { { "source" } },
+			hoistable = true,
 		},
 	},
 	-- Embedded Precompiled Libraries
@@ -2787,6 +3204,11 @@ local insts = {
 	},
 	{ CastInterfaceToTaggedUnionPtr = {
 		-- Cast an interface-typed pointer to a tagged-union pointer with a known set.
+		-- Operands: (ptr, witnessTableSet, typeSet)
+		-- The witness table set and type set are carried here so that information
+		-- from the original TaggedUnionType is available during lowering,
+		-- even after the TaggedUnionType itself has been replaced.
+		operands = { { "ptr" }, { "witnessTableSet" }, { "typeSet" } }
 	} }, 
 	{ GetTagForSuperSet = {
 		-- Translate a tag from a set to its equivalent in a super-set
@@ -2839,7 +3261,10 @@ local insts = {
 		--         discriminate which witness table to use, and the rest of the parameters.
 		--
 		hoistable = true,
-		operands = {{"witnessTableSet", "IRWitnessTableSet"}, {"lookupKey", "IRStructKey"}}
+		-- `lookupKey` is an `IRInst` (not `IRStructKey`) because a built-in interface
+		-- requirement reached through dynamic dispatch uses the hoistable
+		-- `IRBuiltinRequirementKey`, which is not an `IRStructKey`.
+		operands = {{"witnessTableSet", "IRWitnessTableSet"}, {"lookupKey", "IRInst"}}
 	} },
 	{ GetSpecializedDispatcher = {
 		-- Get a specialized dispatcher function for a given witness table set + key, where
@@ -2984,6 +3409,82 @@ local insts = {
 		--
 		hoistable = true
 	} },
+	{ WeakUse = { hoistable = true } },
+	{ FuncTypeOf = { hoistable = true }},
+	{ SpecializeExistentialsInFunc = {
+		-- Represents a reference to a function with specific existential parameter bindings.
+		--
+		-- Used by the type-flow specialization pass to represent different
+		-- specialized versions of the same function, each with different
+		-- existential parameter type bindings.
+		--
+		-- Operands: (func, binding0, binding1, ...)
+		-- The first operand is the base function (IRFunc or IRSpecialize).
+		-- Subsequent operands are the parameter binding infos, one per
+		-- function parameter. A VoidLit binding means "any" (unconstrained).
+		-- A non-void binding is the type-flow info for that parameter.
+		--
+		hoistable = true,
+		operands = { {"func"} }
+	} },
+	{ SpecializeExistentialsInType = {
+		-- Represents an existential specialization key for type specialization caching.
+		--
+		-- Used as a compiler-dictionary key for specialized BindExistentialsType results.
+		-- Operands: (baseType, binding0, binding1, ...)
+		--
+		hoistable = true,
+		operands = { {"baseType"} }
+	} },
+	{ CompilerDictionaryEntry = { hoistable = true, parent = true }},
+	{ CompilerDictionaryValue = { operands = { {"value"} } } },
+	{ CompilerDictionary = { parent = true } },
+	{ CompilerDictionaryScope = { parent = true } },
+	{ LateRequireCapability = {
+		-- A capability requirement that is checked after linking, specialization, and IR-level dead
+		-- code elimination passes.
+		--
+		-- Parameters: IRCapabilitySet
+		operands = { { "capabilitySet", "IRCapabilitySet" } },
+	} },
+
+	-- Constexpr arithmetic ops. These are hoistable variants of the regular
+	-- arithmetic ops, used for lowering compile-time integer expressions
+	-- (IntVal subclasses like PolynomialIntVal) so that they get deduplicated.
+	{ constexprAdd = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprSub = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprMul = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprNeg = { operands = { { "value" } }, hoistable = true } },
+	{ constexprDiv = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprIRem = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprShl = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprShr = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprBitAnd = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprBitOr = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprBitXor = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprBitNot = { operands = { { "value" } }, hoistable = true } },
+	{ constexprNot = { operands = { { "value" } }, hoistable = true } },
+	{ constexprEql = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprNeq = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprGreater = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprLess = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprGeq = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprLeq = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprAnd = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprOr = { operands = { { "left" }, { "right" } }, hoistable = true } },
+	{ constexprSelect = { operands = { { "condition" }, { "ifTrue" }, { "ifFalse" } }, hoistable = true } },
+	-- Constexpr cast ops. Hoistable variants of casting ops used for IntVal lowering.
+	{ constexprIntCast = { operands = { { "value" } }, hoistable = true } },
+	{ constexprCastIntToFloat = { operands = { { "value" } }, hoistable = true } },
+	{ constexprCastFloatToInt = { operands = { { "value" } }, hoistable = true } },
+	{ constexprFloatCast = { operands = { { "value" } }, hoistable = true } },
+	{ constexprCastIntToEnum = { operands = { { "value" } }, hoistable = true } },
+	{ constexprCastEnumToInt = { operands = { { "value" } }, hoistable = true } },
+	{ constexprEnumCast = { operands = { { "value" } }, hoistable = true } },
+	-- Work-graph Barrier flag intrinsics: convert a compile-time BarrierMemoryTypeFlags/BarrierSemanticFlags
+	-- integer value to the corresponding target named-constant expression (e.g. "(UAV_MEMORY)").
+	{ getEnumBarrierMemoryTypeFlags = { operands = { { "flags" } }, hoistable = true } },
+	{ getEnumBarrierSemanticFlags = { operands = { { "flags" } }, hoistable = true } }
 }
 
 -- A function to calculate some useful properties and put it in the table,

@@ -2,7 +2,7 @@
 #ifndef SLANG_EMIT_C_LIKE_H
 #define SLANG_EMIT_C_LIKE_H
 
-#include "../core/slang-basic.h"
+#include "core/slang-basic.h"
 #include "slang-compiler.h"
 #include "slang-emit-base.h"
 #include "slang-emit-precedence.h"
@@ -347,7 +347,26 @@ public:
 
     void emitSimpleValue(IRInst* inst) { emitSimpleValueImpl(inst); }
 
+    enum class FoldPolicy
+    {
+        Never,
+        Always,
+        WhenSafe,
+    };
+
+    /// Return whether `inst` is never folded, always folded (e.g. an address on a target without
+    /// pointers), or folded only when it is safe. The answer depends on `inst` and, for some
+    /// instructions, on the kinds of its users, but never on where those users are.
+    virtual FoldPolicy getFoldPolicy(IRInst* inst);
+
+    /// Return true if `inst` is folded into the expressions of its users instead of being
+    /// emitted as a declaration of its own. This is the final fold decision, and
+    /// `isSafeToFoldIntoUseSites` is one of the checks it makes.
     virtual bool shouldFoldInstIntoUseSites(IRInst* inst);
+
+    /// Return true if the text of `inst` can be emitted where its users are emitted without
+    /// moving it past a possible side effect, into another block, or into a branch.
+    bool isSafeToFoldIntoUseSites(IRInst* inst);
 
     void emitOperand(IRInst* inst, EmitOpInfo const& outerPrec)
     {
@@ -402,7 +421,13 @@ public:
     void emitLayoutSemantics(IRInst* inst, char const* uniformSemanticSpelling);
 
     /// Emit high-level language statements from a structured region.
-    void emitRegion(Region* inRegion);
+    ///
+    /// If `breakRegionToOmit` is non-null, that specific `break` region is skipped rather
+    /// than emitted. This is used to drop the redundant switch-terminating break for targets
+    /// that want break-free case bodies (see shouldEmitSwitchCaseTerminatingBreak). Because
+    /// `break` regions are leaves (no `nextRegion`), only the single trailing break of the
+    /// chain can match, so nested/early breaks are unaffected.
+    void emitRegion(Region* inRegion, Region* breakRegionToOmit = nullptr);
 
     /// Emit high-level language statements from a structured region tree.
     void emitRegionTree(RegionTree* regionTree);
@@ -652,6 +677,11 @@ protected:
     {
         SLANG_UNUSED(decl);
     }
+
+    /// Returns the target-language tokens emitted before the opening brace of an
+    /// unconditional loop, without trailing whitespace.
+    virtual char const* getUnconditionalLoopHeader() { return "for(;;)"; }
+
     virtual void emitIfDecorationsImpl(IRIfElse* ifInst) { SLANG_UNUSED(ifInst); }
     virtual void emitSwitchDecorationsImpl(IRSwitch* switchInst) { SLANG_UNUSED(switchInst); }
     virtual void emitSwitchCaseSelectorsImpl(const SwitchRegion::Case* currentCase, bool isDefault);
@@ -660,6 +690,19 @@ protected:
     /// Targets like HLSL (FXC) and WGSL don't support fall-through.
     /// This is used by the restructure pass to decide whether to preserve fall-through.
     virtual bool supportsSwitchFallThrough() { return true; }
+
+    /// Should the `break` that terminates a switch `case` — the one that merely exits the
+    /// switch rather than breaking early — be emitted explicitly?
+    ///
+    /// Slang places such a break at the tail of every case. For most targets it must stay:
+    /// either fall-through is legal (so the break is semantically required), or the downstream
+    /// compiler requires it (FXC for HLSL SM 5.x errors on a case that lacks a terminating
+    /// break). WGSL is the exception — its cases never fall through, so the trailing break is
+    /// redundant, and older `naga` validators reject `break` outside a loop. WGSL therefore
+    /// overrides this to omit only that terminating break; genuine early breaks inside a case
+    /// are still emitted. Note this is distinct from supportsSwitchFallThrough(): HLSL/FXC also
+    /// lacks fall-through yet still needs the break, so this cannot be derived from that.
+    virtual bool shouldEmitSwitchCaseTerminatingBreak() { return true; }
 
     virtual void emitFuncDecorationImpl(IRDecoration* decoration) { SLANG_UNUSED(decoration); }
     virtual void emitLivenessImpl(IRInst* inst);
@@ -784,6 +827,10 @@ protected:
     OrderedHashSet<IRStringLit*> m_requiredPreludes;
 
     Dictionary<const char*, IRStringLit*> m_builtinPreludes;
+
+    Dictionary<IRInst*, bool>* m_foldSafetyCache = nullptr;
+
+    bool isSafeToFoldIntoUseSitesUncached(IRInst* inst);
 
     // Rename entry point if target doesn't allow the name (e.g., 'main')
     virtual String maybeMakeEntryPointNameValid(String name, DiagnosticSink* sink);

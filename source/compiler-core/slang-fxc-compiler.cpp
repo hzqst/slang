@@ -3,14 +3,14 @@
 
 #if SLANG_ENABLE_DXBC_SUPPORT
 
-#include "../core/slang-blob.h"
-#include "../core/slang-char-util.h"
-#include "../core/slang-common.h"
-#include "../core/slang-io.h"
-#include "../core/slang-semantic-version.h"
-#include "../core/slang-shared-library.h"
-#include "../core/slang-string-slice-pool.h"
-#include "../core/slang-string-util.h"
+#include "core/slang-blob.h"
+#include "core/slang-char-util.h"
+#include "core/slang-common.h"
+#include "core/slang-io.h"
+#include "core/slang-semantic-version.h"
+#include "core/slang-shared-library.h"
+#include "core/slang-string-slice-pool.h"
+#include "core/slang-string-util.h"
 #include "slang-artifact-associated-impl.h"
 #include "slang-artifact-desc-util.h"
 #include "slang-artifact-diagnostic-util.h"
@@ -121,6 +121,10 @@ public:
     virtual SLANG_NO_THROW SlangResult SLANG_MCALL
     convert(IArtifact* from, const ArtifactDesc& to, IArtifact** outArtifact) SLANG_OVERRIDE;
     virtual SLANG_NO_THROW bool SLANG_MCALL isFileBased() SLANG_OVERRIDE { return false; }
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL getPath(slang::IBlob** outPath) SLANG_OVERRIDE
+    {
+        return getPathFromSymbol((void*)m_compile, outPath);
+    }
 
     /// Must be called before use
     SlangResult init(ISlangSharedLibrary* library);
@@ -301,9 +305,18 @@ SlangResult FXCDownstreamCompiler::compile(const CompileOptions& inOptions, IArt
         break;
 
     // FXC has limited debug control options - it only supports a binary on/off for debug info
-    // This covers DebugInfoType::Minimal, DebugInfoType::Standard, and DebugInfoType::Maximal
+    // This covers DebugInfoType::Minimal, DebugInfoType::Standard
     default:
         flags |= D3DCOMPILE_DEBUG;
+        // If optimization is disabled, FXC will generate much more usable debug information with
+        // D3DCOMPILE_SKIP_OPTIMIZATION than simply D3DCOMPILE_OPTIMIZATION_LEVEL0. So if
+        // debugInfoType is DebugInfoType::Maximal and optimization is OptimizationLevel::None,
+        // disable optimizations completely.
+        if (options.debugInfoType == DebugInfoType::Maximal &&
+            options.optimizationLevel == OptimizationLevel::None)
+        {
+            flags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+        }
         break;
     }
 

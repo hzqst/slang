@@ -33,6 +33,17 @@ class ConstModifier : public Modifier
     FIDDLE(...)
 };
 
+/// A `const` modifier written after a function parameter list.
+///
+/// Specifies `ParamPassingMode::In` for the receiver parameter.
+/// Prefix `const` uses `ConstModifier`.
+/// Attribute spellings of receiver modes use `ReceiverParamModeSpecifierAttribute`.
+FIDDLE()
+class CppStyleTrailingReceiverParamConstModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
 FIDDLE()
 class BuiltinModifier : public Modifier
 {
@@ -162,6 +173,11 @@ class GLSLPrecisionModifier : public Modifier
     FIDDLE(...)
 };
 
+/// Legacy marker retained so module ASTs serialized by older Slang versions can be deserialized.
+///
+/// `FIDDLE` must continue registering this node type for those artifacts, but the current
+/// front-end intentionally neither creates nor interprets it. New code reads the effective
+/// language exclusively from `TranslationUnitRequest::sourceLanguage`.
 FIDDLE()
 class GLSLModuleModifier : public Modifier
 {
@@ -180,6 +196,23 @@ FIDDLE()
 class SynthesizedModifier : public Modifier
 {
     FIDDLE(...)
+    FIDDLE() uint32_t op = kIROp_Nop;
+    FIDDLE() List<Val*> operands;
+};
+
+/// Records the effective parameter-passing mode that a synthesized declaration must preserve.
+///
+/// Requirement-witness synthesis creates new declarations after applying substitutions to their
+/// value types. Recomputing a mode from those substituted types can change the ABI promised by the
+/// original declaration. This internal modifier makes the required mode declaration-owned on the
+/// synthesized `ParamDecl`, or on a synthesized callable for its effective `this` parameter.
+/// Signature checking consumes it before attaching any checked semantic attributes. It has no
+/// source-language spelling.
+FIDDLE()
+class SynthesizedParamPassingModeModifier : public Modifier
+{
+    FIDDLE(...)
+    FIDDLE() ParamPassingMode mode = ParamPassingMode::In;
 };
 
 // Marks that the definition of a func decl is synthesized static invoke func for
@@ -200,6 +233,25 @@ class ExplicitlyDeclaredCapabilityModifier : public Modifier
 // Marks a synthesized variable as local temporary variable.
 FIDDLE()
 class LocalTempVarModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
+// Marks a `VarDecl` whose existential type has been opened directly
+// (i.e. `maybeMoveTemp` reused the variable instead of creating a temporary).
+// If the variable is later reassigned, the opened existential type identity
+// would become stale, so the assignment must be diagnosed.
+FIDDLE()
+class ExistentialOpenedOnVarModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
+// Marks a `VarDecl` that has been reassigned after its initial declaration.
+// A variable with this modifier will not be reused directly in `maybeMoveTemp`;
+// instead, a fresh temporary will be created for each existential opening.
+FIDDLE()
+class VarReassignedModifier : public Modifier
 {
     FIDDLE(...)
 };
@@ -349,6 +401,22 @@ class RefModifier : public Modifier
 // `borrow` modifier for borrow parameter passing
 FIDDLE()
 class BorrowModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
+// The `__ref_readonly` modifier: pass by reference, and the callee may only read
+// through the reference.
+FIDDLE()
+class RefReadOnlyModifier : public Modifier
+{
+    FIDDLE(...)
+};
+
+// The `__ref_writeonly` modifier: pass by reference, and the callee may only write
+// through the reference.
+FIDDLE()
+class RefWriteOnlyModifier : public Modifier
 {
     FIDDLE(...)
 };
@@ -601,61 +669,6 @@ class IntrinsicTypeModifier : public Modifier
     // (e.g., for a texture type this passes in shape/mutability info)
     FIDDLE() List<uint32_t> irOperands;
 };
-
-// Modifiers that affect the storage layout for matrices
-FIDDLE(abstract)
-class MatrixLayoutModifier : public Modifier
-{
-    FIDDLE(...)
-};
-
-
-// Modifiers that specify row- and column-major layout, respectively
-FIDDLE(abstract)
-class RowMajorLayoutModifier : public MatrixLayoutModifier
-{
-    FIDDLE(...)
-};
-
-FIDDLE(abstract)
-class ColumnMajorLayoutModifier : public MatrixLayoutModifier
-{
-    FIDDLE(...)
-};
-
-// The HLSL flavor of those modifiers
-FIDDLE()
-class HLSLRowMajorLayoutModifier : public RowMajorLayoutModifier
-{
-    FIDDLE(...)
-};
-
-FIDDLE()
-class HLSLColumnMajorLayoutModifier : public ColumnMajorLayoutModifier
-{
-    FIDDLE(...)
-};
-
-
-// The GLSL flavor of those modifiers
-//
-// Note(tfoley): The GLSL versions of these modifiers are "backwards"
-// in the sense that when a GLSL programmer requests row-major layout,
-// we actually interpret that as requesting column-major. This makes
-// sense because we interpret matrix conventions backwards from how
-// GLSL specifies them.
-FIDDLE()
-class GLSLRowMajorLayoutModifier : public ColumnMajorLayoutModifier
-{
-    FIDDLE(...)
-};
-
-FIDDLE()
-class GLSLColumnMajorLayoutModifier : public RowMajorLayoutModifier
-{
-    FIDDLE(...)
-};
-
 
 // More HLSL Keyword
 
@@ -1001,8 +1014,20 @@ class CallAttribute : public Attribute
 };
 // `[call]`
 
+// Marks an enum declaration as unscoped. Added by the parser either from the
+// user-written `[UnscopedEnum]` attribute, or implicitly when a non-generic
+// plain `enum` is compiled with `-unscoped-enum`. Generic enums do not carry
+// this attribute even when `-unscoped-enum` is in effect.
 FIDDLE()
 class UnscopedEnumAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+// Marker for enum class declarations, used to detect conflicting explicit
+// unscoped/scoped enum declarations. This modifier has no further semantics.
+FIDDLE()
+class EnumClassModifier : public Modifier
 {
     FIDDLE(...)
 };
@@ -1168,6 +1193,14 @@ class GLSLLayoutDerivativeGroupLinearAttribute : public Attribute
     FIDDLE(...)
 };
 
+// GLSL `layout(early_fragment_tests) in;` marker; the checker lifts it to an
+// `EarlyDepthStencilAttribute` on the fragment entry point.
+FIDDLE()
+class GLSLLayoutEarlyFragmentTestsAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
 // TODO: for attributes that take arguments, the syntax node
 // classes should provide accessors for the values of those arguments.
 
@@ -1216,6 +1249,20 @@ class EarlyDepthStencilAttribute : public Attribute
 };
 // `[earlydepthstencil]`
 
+FIDDLE()
+class PostDepthCoverageAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+// `[postdepthcoverage]`
+
+FIDDLE()
+class Shader64BitIndexingAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+// `[Shader64BitIndexing]`
+
 // An HLSL `[numthreads(x,y,z)]` attribute
 FIDDLE()
 class NumThreadsAttribute : public Attribute
@@ -1242,6 +1289,67 @@ class WaveSizeAttribute : public Attribute
     // followings: 4, 8, 16, 32, 64 or 128.
     //
     FIDDLE() IntVal* numLanes;
+};
+
+// Work-graph node shader attributes
+
+FIDDLE()
+class NodeLaunchAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() String mode; // "broadcasting" | "thread" | "coalescing"
+};
+
+FIDDLE()
+class NodeMaxDispatchGridAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() IntVal* x;
+    FIDDLE() IntVal* y;
+    FIDDLE() IntVal* z;
+};
+
+FIDDLE()
+class NodeDispatchGridAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() IntVal* x;
+    FIDDLE() IntVal* y;
+    FIDDLE() IntVal* z;
+};
+
+FIDDLE()
+class MaxRecordsAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() IntVal* value;
+};
+
+FIDDLE()
+class NodeIDAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() String name;
+    FIDDLE() IntVal* arrayIndex;
+};
+
+FIDDLE()
+class NodeIsProgramEntryAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class AllowSparseNodesAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class NodeArraySizeAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() IntVal* count;
 };
 
 FIDDLE()
@@ -1332,12 +1440,21 @@ class VulkanHitObjectAttributesAttribute : public Attribute
     FIDDLE() int location;
 };
 
+/// An attribute that specifies the passing mode of a declaration's receiver parameter.
+///
+/// Trailing `const` is represented separately by `CppStyleTrailingReceiverParamConstModifier`.
+FIDDLE(abstract)
+class ReceiverParamModeSpecifierAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
 // A `[mutating]` attribute, which indicates that a member
 // function is allowed to modify things through its `this`
 // argument.
 //
 FIDDLE()
-class MutatingAttribute : public Attribute
+class MutatingAttribute : public ReceiverParamModeSpecifierAttribute
 {
     FIDDLE(...)
 };
@@ -1347,7 +1464,20 @@ class MutatingAttribute : public Attribute
 // its `this` parameter.
 //
 FIDDLE()
-class NonmutatingAttribute : public Attribute
+class NonmutatingAttribute : public ReceiverParamModeSpecifierAttribute
+{
+    FIDDLE(...)
+};
+
+// A `[NoDiscard]` attribute, which indicates that the result of a
+// function call should not be discarded. When a call to a function
+// marked with this attribute is made in a context where its result is
+// discarded — an expression statement, or a `for` loop's side-effect
+// expression, including through parentheses and pass-through operands —
+// the compiler emits an error.
+//
+FIDDLE()
+class NoDiscardAttribute : public Attribute
 {
     FIDDLE(...)
 };
@@ -1356,7 +1486,7 @@ class NonmutatingAttribute : public Attribute
 // a member function should be passed by const reference.
 //
 FIDDLE()
-class ConstRefAttribute : public Attribute
+class ConstRefAttribute : public ReceiverParamModeSpecifierAttribute
 {
     FIDDLE(...)
 };
@@ -1365,9 +1495,21 @@ class ConstRefAttribute : public Attribute
 // a member function should be passed by reference.
 //
 FIDDLE()
-class RefAttribute : public Attribute
+class RefAttribute : public ReceiverParamModeSpecifierAttribute
 {
     FIDDLE(...)
+};
+
+/// Records the type and parameter-passing mode of a declaration's effective `this` parameter.
+///
+/// Signature checking attaches this attribute if and only if the declaration has an effective
+/// `this` parameter. Later compiler stages consume this checked semantic information instead of
+/// deriving it again from syntax or compilation options.
+FIDDLE()
+class ThisParamInfoAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() ParamInfo info;
 };
 
 // A `[__readNone]` attribute, which indicates that a function
@@ -1586,28 +1728,62 @@ class SpecializeAttribute : public Attribute
     FIDDLE(...)
 };
 
+
+// Attribute intended only for interface requirements, to indicate an optional conformance
+// to IForwardDifferentiable<Self> and IBackwardDifferentiable<Self>.
+//
+FIDDLE()
+class MaybeDifferentiableAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
 /// An attribute that marks a type, function or variable as differentiable.
 FIDDLE()
 class DifferentiableAttribute : public Attribute
 {
     FIDDLE(...)
-    // TODO(tfoley): Why is there this duplication here?
-    List<KeyValuePair<Type*, SubtypeWitness*>> m_typeToIDifferentiableWitnessMappings;
+    OrderedDictionary<Val*, OrderedDictionary<SlangInt, Val*>> m_associatedValMapping;
 
-    void addType(Type* declRef, SubtypeWitness* witness)
+    bool hasAssociatedVals(Val* targetVal) const
     {
-        getMapTypeToIDifferentiableWitness();
-        if (m_mapToIDifferentiableWitness.addIfNotExists(declRef, witness))
-        {
-            m_typeToIDifferentiableWitnessMappings.add(
-                KeyValuePair<Type*, SubtypeWitness*>(declRef, witness));
-        }
+        return m_associatedValMapping.containsKey(targetVal);
     }
 
-    /// Mapping from types to subtype witnesses for conformance to IDifferentiable.
-    const OrderedDictionary<Type*, SubtypeWitness*>& getMapTypeToIDifferentiableWitness();
+    auto begin(Val* targetVal) const
+    {
+        SLANG_ASSERT(hasAssociatedVals(targetVal));
+        return m_associatedValMapping.tryGetValue(targetVal)->begin();
+    }
+
+    auto end(Val* targetVal) const { return m_associatedValMapping.tryGetValue(targetVal)->end(); }
+
+    void resolveDictionaryKeys()
+    {
+        // Go over m_associatedValMapping & call ->resolve() on all
+        // the dictionary keys (and re-insert them, if they are different)
+        //
+        OrderedDictionary<Val*, OrderedDictionary<SlangInt, Val*>> newMapping;
+        for (auto& pair : m_associatedValMapping)
+        {
+            auto& assocVals = pair.value;
+            auto newKey = pair.key->resolve();
+            newMapping[newKey] = assocVals;
+        }
+        m_associatedValMapping = newMapping;
+    }
+
+    void addAssocVal(Val* targetVal, SlangInt id, Val* assocVal)
+    {
+        if (!hasAssociatedVals(targetVal))
+            m_associatedValMapping[targetVal] = OrderedDictionary<SlangInt, Val*>();
+        m_associatedValMapping.tryGetValue(targetVal)->addIfNotExists(id, assocVal);
+    }
 
     ValSet m_typeRegistrationWorkingSet;
+    UInt m_typeRegistrationRecursionDepth = 0;
+    bool m_typeRegistrationDepthExceeded = false;
+    SourceLoc m_typeRegistrationDiagnosticLoc;
 
 private:
     OrderedDictionary<Type*, SubtypeWitness*> m_mapToIDifferentiableWitness;
@@ -1656,6 +1832,8 @@ FIDDLE()
 class AutoPyBindCudaAttribute : public Attribute
 {
     FIDDLE(...)
+    FIDDLE() DeclRefExpr* fwdDiffFuncDeclRef = nullptr;
+    FIDDLE() DeclRefExpr* bwdDiffFuncDeclRef = nullptr;
 };
 
 FIDDLE()
@@ -1731,6 +1909,14 @@ class AlwaysFoldIntoUseSiteAttribute : public Attribute
 //
 FIDDLE()
 class TreatAsDifferentiableAttribute : public DifferentiableAttribute
+{
+    FIDDLE(...)
+};
+
+/// The `[HasTrivialForwardDerivative]` attribute indicates that a function has a trivial forward
+/// derivative.
+FIDDLE()
+class HasTrivialForwardDerivativeAttribute : public DifferentiableAttribute
 {
     FIDDLE(...)
 };
@@ -1829,6 +2015,7 @@ FIDDLE()
 class NoDiffThisAttribute : public Attribute
 {
     FIDDLE(...)
+    FIDDLE() bool isSynthesized = false;
 };
 
 /// Indicates that the modified declaration is one of the "magic" declarations
@@ -1942,6 +2129,17 @@ class DeprecatedAttribute : public Attribute
     FIDDLE() String message;
 };
 
+/// A `[RemovedSince(languageVersion, "message")]` attribute indicates that the
+/// target has been removed starting from the specified language version.
+///
+FIDDLE()
+class RemovedSinceAttribute : public Attribute
+{
+    FIDDLE(...)
+    FIDDLE() int32_t sinceVersion;
+    FIDDLE() String message;
+};
+
 FIDDLE()
 class NonCopyableTypeAttribute : public Attribute
 {
@@ -2019,6 +2217,72 @@ class SNormModifier : public ResourceElementFormatModifier
 
 FIDDLE()
 class NoDiffModifier : public TypeModifier
+{
+    FIDDLE(...)
+};
+
+// Modifiers that affect the storage layout for matrices.
+//
+// These are `TypeModifier`s so the parser grafts them onto the type specifier
+// (`row_major float2x3`), like `unorm`/`snorm`, keeping the layout on the
+// matrix element itself — including when a declarator wraps it in an array or
+// it precedes a function return type.
+//
+// The parser only moves these off a *declarator*, though; a traditional-style
+// function parameter (leading-modifier syntax, `void f(row_major float2x3 m)`)
+// keeps its modifiers on the `ParamDecl` — its type is parsed after the
+// modifiers — so that path applies the layout via `maybeApplyLayoutModifier`
+// (slang-check-decl.cpp) instead. (Modern `m: row_major float2x3` syntax puts
+// the modifier on the type expression, so it flows through the graft.)
+FIDDLE(abstract)
+class MatrixLayoutModifier : public TypeModifier
+{
+    FIDDLE(...)
+};
+
+
+// Modifiers that specify row- and column-major layout, respectively
+FIDDLE(abstract)
+class RowMajorLayoutModifier : public MatrixLayoutModifier
+{
+    FIDDLE(...)
+};
+
+FIDDLE(abstract)
+class ColumnMajorLayoutModifier : public MatrixLayoutModifier
+{
+    FIDDLE(...)
+};
+
+// The HLSL flavor of those modifiers
+FIDDLE()
+class HLSLRowMajorLayoutModifier : public RowMajorLayoutModifier
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class HLSLColumnMajorLayoutModifier : public ColumnMajorLayoutModifier
+{
+    FIDDLE(...)
+};
+
+
+// The GLSL flavor of those modifiers
+//
+// Note(tfoley): The GLSL versions of these modifiers are "backwards"
+// in the sense that when a GLSL programmer requests row-major layout,
+// we actually interpret that as requesting column-major. This makes
+// sense because we interpret matrix conventions backwards from how
+// GLSL specifies them.
+FIDDLE()
+class GLSLRowMajorLayoutModifier : public ColumnMajorLayoutModifier
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class GLSLColumnMajorLayoutModifier : public RowMajorLayoutModifier
 {
     FIDDLE(...)
 };
@@ -2118,6 +2382,12 @@ public:
 
 FIDDLE()
 class ExperimentalModuleAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class FunctionInterfaceAttribute : public Attribute
 {
     FIDDLE(...)
 };

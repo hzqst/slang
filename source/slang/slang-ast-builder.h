@@ -2,8 +2,8 @@
 #ifndef SLANG_AST_BUILDER_H
 #define SLANG_AST_BUILDER_H
 
-#include "../core/slang-memory-arena.h"
-#include "../core/slang-type-traits.h"
+#include "core/slang-memory-arena.h"
+#include "core/slang-type-traits.h"
 #include "slang-ast-all.h"
 #include "slang-ast-support-types.h"
 #include "slang-ir.h"
@@ -41,6 +41,18 @@ public:
     Type* getNoneType();
     /// Get the `IDifferentiable` type
     Type* getDiffInterfaceType();
+
+    // Three `[sealed]` marker interfaces over the builtin scalar types (`__BuiltinIntegerType`,
+    // `__BuiltinFloatingPointType`, `__BuiltinLogicalType`; see core.meta.slang), used by
+    // `SemanticsExprVisitor::classifyBuiltinArithmeticElementType` to widen the builtin-operator
+    // fast path to a generic parameter constrained by one of them -- see
+    // `BuiltinArithmeticElementFamily` in slang-check-impl.h for that usage, and the .cpp for why
+    // these are found by a core-module scan rather than `__magic_type` or scope lookup. Each
+    // accessor returns null before the core module is available to search, and caches its result
+    // (a linear scan of the core module) once found, so it runs at most once per session.
+    Type* getBuiltinIntegerInterfaceType();
+    Type* getBuiltinFloatingPointInterfaceType();
+    Type* getBuiltinLogicalInterfaceType();
 
     Type* getIBufferDataLayoutType();
 
@@ -108,6 +120,10 @@ protected:
     Type* m_nullPtrType = nullptr;
     Type* m_noneType = nullptr;
     Type* m_diffInterfaceType = nullptr;
+    Type* m_forwardDiffFuncInterfaceType = nullptr;
+    Type* m_builtinIntegerType = nullptr;
+    Type* m_builtinFloatingPointType = nullptr;
+    Type* m_builtinLogicalType = nullptr;
     Type* m_builtinTypes[Index(BaseType::CountOf)];
     Dictionary<String, Type*> m_magicEnumTypes;
 
@@ -221,6 +237,11 @@ public:
     ///
     Dictionary<ValKey, Val*, Hash<ValKey>, ValKeyEqual> m_cachedNodes;
 
+    Dictionary<GenericDecl*, List<Val*>> m_cachedGenericDefaultArgs;
+
+    // For [PrimalSubstitute] and [PrimalSubstituteOf] decorators
+    Dictionary<Decl*, ShortList<Decl*, 4>> m_substituteMap;
+
     /// Create AST types
     template<typename T>
     T* createImpl()
@@ -329,7 +350,7 @@ public:
         if (!parent)
             return getDirectDeclRef(memberDecl);
         // A Generic value/type ParamDecl is always referred to directly.
-        if (as<GenericTypeParamDecl>(memberDecl) || as<GenericValueParamDecl>(memberDecl))
+        if (isGenericParam(memberDecl))
             return getDirectDeclRef(memberDecl);
         if (as<ThisTypeDecl>(memberDecl) && !as<InterfaceDecl>(memberDecl->parentDecl))
             return as<T>(parent);
@@ -337,6 +358,30 @@ public:
         if (auto parentMemberDeclRef = as<MemberDeclRef>(parent.declRefBase))
         {
             return DeclRef<T>(getMemberDeclRef(parentMemberDeclRef->getParent(), memberDecl));
+        }
+        else if (auto parentGenericAppDeclRef = as<GenericAppDeclRef>(parent.declRefBase))
+        {
+            auto parentGenericDecl = parentGenericAppDeclRef->getGenericDecl();
+
+            // Generic signature constraints are direct members of the `GenericDecl`, not of the
+            // generic inner declaration. Consider this example:
+            //
+            //     void f<T>(T value) where T : IBar;
+            //
+            // The `where T : IBar` proof is stored under the `GenericDecl` for `f<T>`, while the
+            // callable declaration is `GenericDecl.inner`. If substitution starts from
+            // `MemberDeclRef(GenericAppDeclRef(G, G.inner, args), constraintUnderG)`, keep the
+            // constraint under the same specialized generic environment instead of manufacturing a
+            // member reference through `G.inner`, because the constraint is not a member of the
+            // callable body.
+            if (isConstraintDecl(memberDecl) && memberDecl->parentDecl == parentGenericDecl)
+            {
+                return getGenericAppDeclRef(
+                           DeclRef<GenericDecl>(parentGenericAppDeclRef->getGenericDeclRef()),
+                           parentGenericAppDeclRef->getArgs(),
+                           memberDecl)
+                    .template as<T>();
+            }
         }
         else if (auto lookupDeclRef = as<LookupDeclRef>(parent.declRefBase))
         {
@@ -348,6 +393,8 @@ public:
             //   Lookup of a decl defined in an extension is to lookup directly.
             // - Member(Lookup(w, AssociatedType), TypeConstraintDecl) ==> Lookup(w,
             // TypeConstraintDecl)
+            // - Member(Lookup(w, SubscriptDecl), GetterDecl/SetterDecl) ==> Lookup(w,
+            // GetterDecl/SetterDecl)
             //   Type constraint of an associated type is defined directly in w.
 
             auto parentDeclKind = lookupDeclRef->getDecl()->astNodeType;
@@ -361,11 +408,22 @@ public:
                            lookupDeclRef->getWitness(),
                            memberDecl)
                     .template as<T>();
+            case ASTNodeType::SubscriptDecl:
+                if (memberDecl->astNodeType == ASTNodeType::GetterDecl ||
+                    memberDecl->astNodeType == ASTNodeType::SetterDecl)
+                {
+                    return getLookupDeclRef(
+                               lookupDeclRef->getLookupSource(),
+                               lookupDeclRef->getWitness(),
+                               memberDecl)
+                        .template as<T>();
+                }
+                break;
             default:
                 break;
             }
         }
-        else if (auto directDeclRef = as<DirectDeclRef>(parent.declRefBase))
+        else if (auto directDeclRef = as<DirectDeclRef>(parent.declRefBase); directDeclRef)
         {
             return makeDeclRef(memberDecl);
         }
@@ -395,13 +453,40 @@ public:
         return getOrCreate<ConstantIntVal>(type, value);
     }
 
-    TypeCastIntVal* getTypeCastIntVal(Type* type, Val* base)
+    IntVal* getTypeCastIntVal(Type* type, Val* base)
     {
         // Unwrap any existing type casts.
         while (auto baseTypeCast = as<TypeCastIntVal>(base))
             base = baseTypeCast->getBase();
 
+        if (auto foldedCast = as<IntVal>(TypeCastIntVal::tryFoldImpl(this, type, base, nullptr)))
+            return foldedCast;
+
+        if (auto baseIntVal = as<IntVal>(base))
+        {
+            if (baseIntVal->getType() == type)
+                return baseIntVal;
+        }
+
         return getOrCreate<TypeCastIntVal>(type, base);
+    }
+
+    // Convert a declaration reference to the `Val` form used in generic substitution arguments:
+    // type declarations are represented as `DeclRefType`, while generic value declarations are
+    // represented as `DeclRefIntVal`.
+    Val* getDeclRefVal(DeclRef<Decl> declRef)
+    {
+        if (isGenericValueParam(declRef) || declRef.as<GlobalGenericValueParamDecl>())
+        {
+            auto varDeclRef = declRef.as<VarDeclBase>();
+            return getOrCreate<DeclRefIntVal>(varDeclRef.getDecl()->getType(), varDeclRef);
+        }
+
+        auto decl = declRef.getDecl();
+        if (as<SimpleTypeDecl>(decl) || as<AggTypeDeclBase>(decl))
+            return DeclRefType::create(this, declRef);
+
+        return nullptr;
     }
 
     DeclRef<Decl> getGenericAppDeclRef(
@@ -428,6 +513,12 @@ public:
 
     DeclRef<Decl> getLookupDeclRef(Type* base, SubtypeWitness* subtypeWitness, Decl* declToLookup)
     {
+        // A `LookupDeclRef`'s lookup `base` and its `subtypeWitness` must stay consistent:
+        // `base` should be the type that `subtypeWitness` proves conforms to the interface
+        // declaring `declToLookup` (i.e. `subtypeWitness->getSub()`). Conformance queries
+        // (`SemanticsVisitor::checkAndConstructSubtypeWitness`) now guarantee the witness is
+        // rooted at the queried type, so a caller threading both through here gets a
+        // well-formed lookup. See #11469 for the interface-as-existential-box subtlety.
         auto result = getOrCreate<LookupDeclRef>(declToLookup, base, subtypeWitness);
         return result;
     }
@@ -532,6 +623,11 @@ public:
     Type* getNoneType() { return m_sharedASTBuilder->getNoneType(); }
     Type* getEnumTypeType() { return m_sharedASTBuilder->getEnumTypeType(); }
     Type* getDiffInterfaceType() { return m_sharedASTBuilder->getDiffInterfaceType(); }
+
+    Type* getForwardDiffFuncInterfaceType(Type* baseType, Witness* typeInfoWitness);
+    Type* getBackwardDiffFuncInterfaceType(Type* baseType, Witness* typeInfoWitness);
+    Type* getBwdCallableBaseType(Type* baseType, Witness* typeInfoWitness);
+
     // Construct the type `Ptr<valueType>`, where `Ptr`
     // is looked up as a builtin type.
     PtrType* getPtrType(
@@ -549,6 +645,12 @@ public:
 
     // Construct the type `RefParam<valueType>`
     RefParamType* getRefParamType(Type* valueType);
+
+    // Construct the type `RefReadOnlyParam<valueType>`
+    RefReadOnlyParamType* getRefReadOnlyParamType(Type* valueType);
+
+    // Construct the type `RefWriteOnlyParam<valueType>`
+    RefWriteOnlyParamType* getRefWriteOnlyParamType(Type* valueType);
 
     // Construct the type `ImmutableBorrowParam<valueType>`
     BorrowInParamType* getConstRefParamType(Type* valueType);
@@ -610,13 +712,33 @@ public:
     DeclRef<InterfaceDecl> getDifferentiableInterfaceDecl();
     DeclRef<InterfaceDecl> getDifferentiableRefInterfaceDecl();
 
+    DeclRef<InterfaceDecl> getFunctionBaseInterfaceDecl();
+
     Type* getDifferentiableInterfaceType();
     Type* getDifferentiableRefInterfaceType();
+
+    Type* getFunctionBaseType();
 
     bool isDifferentiableInterfaceAvailable();
 
     DeclRef<InterfaceDecl> getDefaultInitializableTypeInterfaceDecl();
     Type* getDefaultInitializableType();
+
+    // See the identically named methods on `SharedASTBuilder` for what these are; these three
+    // forward to them so callers can reach them the same way they reach
+    // `getDifferentiableInterfaceType()` above.
+    Type* getBuiltinIntegerInterfaceType()
+    {
+        return m_sharedASTBuilder->getBuiltinIntegerInterfaceType();
+    }
+    Type* getBuiltinFloatingPointInterfaceType()
+    {
+        return m_sharedASTBuilder->getBuiltinFloatingPointInterfaceType();
+    }
+    Type* getBuiltinLogicalInterfaceType()
+    {
+        return m_sharedASTBuilder->getBuiltinLogicalInterfaceType();
+    }
 
     MeshOutputType* getMeshOutputTypeFromModifier(
         HLSLMeshShaderOutputModifier* modifier,
@@ -651,9 +773,50 @@ public:
 
     Type* getEachType(Type* baseType);
 
-    Type* getExpandType(Type* pattern, ArrayView<Type*> capturedPacks);
+    Type* getExpandType(Type* pattern, ArrayView<Val*> capturedPacks);
+
+    Type* getPackBranchType(Val* packOperand, Type* emptyType, Type* nonEmptyType);
+
+    Type* getFirstElement(Type* basePack);
+
+    Type* getLastElement(Type* basePack);
+
+    Type* getTrimFirstPack(Type* basePack);
+
+    Type* getTrimLastPack(Type* basePack);
 
     ConcreteTypePack* getTypePack(ArrayView<Type*> types);
+
+    ConcreteIntValPack* getIntValPack(ArrayView<IntVal*> vals);
+
+    IntVal* getEachIntVal(Type* elementType, Val* basePack);
+
+    Val* getExpandIntValPack(Val* patternVal, ArrayView<Val*> capturedPacks);
+
+    Val* getFirstElement(Val* basePack);
+
+    Val* getLastElement(Val* basePack);
+
+    Val* getTrimFirstPack(Val* basePack);
+
+    Val* getTrimLastPack(Val* basePack);
+
+    Val* getShapeConcatIntValPack(Val* leftPack, Val* rightPack, IntVal* axis);
+
+    Val* getShapePermuteIntValPack(Val* valuePack, Val* orderPack);
+
+    Val* getShapeSwapIntValPack(Val* valuePack, IntVal* dim0, IntVal* dim1);
+
+    Val* getShapeReduceIntValPack(Val* valuePack, IntVal* axis);
+
+    NonEmptyPackWitness* getNonEmptyPackWitness(Val* pack);
+    DeclaredVariadicPackCountWitness* getDeclaredVariadicPackCountWitness(
+        DeclRef<GenericVariadicPackCountConstraintDecl> declRef);
+    ConcreteVariadicPackCountWitness* getConcreteVariadicPackCountWitness(
+        IntVal* actualCount,
+        IntVal* expectedCount);
+    HasDiffTypeInfoWitness* getHasDiffTypeInfoWitness(
+        DeclRef<HasDiffTypeInfoConstraintDecl> declRef);
 
     /// Produce a witness that `T : T` for any type `T`
     TypeEqualityWitness* getTypeEqualityWitness(Type* type);
@@ -678,24 +841,37 @@ public:
         Type* superType,
         SubtypeWitness* patternWitness);
 
+    SubtypeWitness* getFirstSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getLastSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getTrimFirstSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getTrimLastSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        SubtypeWitness* patternWitness);
+
+    SubtypeWitness* getPackBranchSubtypeWitness(
+        Type* subType,
+        Type* superType,
+        Val* packOperand,
+        SubtypeWitness* emptyWitness,
+        SubtypeWitness* nonEmptyWitness);
+
     /// Produce a witness that `A <: C` given witnesses that `A <: B` and `B <: C`
     SubtypeWitness* getTransitiveSubtypeWitness(
         SubtypeWitness* aIsSubtypeOfBWitness,
         SubtypeWitness* bIsSubtypeOfCWitness);
-
-    /// Produce a witness that `T <: L` or `T <: R` given `T <: L&R`
-    SubtypeWitness* getExtractFromConjunctionSubtypeWitness(
-        Type* subType,
-        Type* superType,
-        SubtypeWitness* subIsSubtypeOfConjunction,
-        int indexOfSuperTypeInConjunction);
-
-    /// Produce a witnes that `S <: L&R` given witnesses that `S <: L` and `S <: R`
-    SubtypeWitness* getConjunctionSubtypeWitness(
-        Type* sub,
-        Type* lAndR,
-        SubtypeWitness* subIsLWitness,
-        SubtypeWitness* subIsRWitness);
 
     BuiltinTypeCoercionWitness* getBuiltinTypeCoercionWitness(Type* subType, Type* superType);
 

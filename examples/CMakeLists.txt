@@ -52,6 +52,11 @@ function(example dir)
         set(main_wrapper_libraries example-main)
     endif()
 
+    set(_optional_requires_arg "")
+    if(copy_assets_target)
+        set(_optional_requires_arg OPTIONAL_REQUIRES ${copy_assets_target})
+    endif()
+
     slang_add_target(
         .
         EXECUTABLE
@@ -68,13 +73,26 @@ function(example dir)
         EXTRA_COMPILE_DEFINITIONS_PRIVATE
             SLANG_EXAMPLE_NAME=${dir}
             $<$<BOOL:${SLANG_ENABLE_XLIB}>:SLANG_ENABLE_XLIB>
-        REQUIRED_BY all-examples
-        OPTIONAL_REQUIRES ${copy_assets_target} copy-prebuilt-binaries
+        REQUIRED_BY all-examples ${_optional_requires_arg}
         FOLDER examples
         DEBUG_DIR ${debug_dir}
         ${ARGN}
     )
 endfunction()
+
+if(SLANG_ENABLE_EXAMPLES)
+    #
+    # Meta target that depends on all examples
+    #
+    add_custom_target(
+        all-examples
+        COMMENT "meta target which depends on all examples"
+    )
+    set_target_properties(all-examples PROPERTIES FOLDER examples)
+
+    # Native coverage integration does not require slang-rhi.
+    add_subdirectory(shader-coverage-backends)
+endif()
 
 if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
     #
@@ -92,18 +110,20 @@ if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
             $<$<BOOL:${SLANG_ENABLE_CUDA}>:CUDA::cuda_driver>
         FOLDER examples
     )
-    slang_add_target(example-main STATIC FOLDER examples)
-    slang_add_target(example-winmain STATIC FOLDER examples EXCLUDE_FROM_ALL)
-    slang_add_target(stacktrace-windows STATIC FOLDER examples EXCLUDE_FROM_ALL)
-
-    #
-    # Meta target that depends on all examples
-    #
-    add_custom_target(
-        all-examples
-        COMMENT "meta target which depends on all examples"
+    slang_add_target(
+        example-main
+        STATIC
+        INCLUDE_DIRECTORIES_PRIVATE ${slang_SOURCE_DIR}/examples
+        FOLDER examples
     )
-    set_target_properties(all-examples PROPERTIES FOLDER examples)
+    slang_add_target(
+        example-winmain
+        STATIC
+        EXCLUDE_FROM_ALL
+        INCLUDE_DIRECTORIES_PRIVATE ${slang_SOURCE_DIR}/examples
+        FOLDER examples
+    )
+    slang_add_target(stacktrace-windows STATIC FOLDER examples EXCLUDE_FROM_ALL)
 
     #
     # Add individual examples as subdirectories
@@ -119,6 +139,8 @@ if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
     add_subdirectory(ray-tracing-pipeline)
     add_subdirectory(reflection-api)
     add_subdirectory(reflection-parameter-blocks)
+    add_subdirectory(shader-coverage-bvh-traversal)
+    add_subdirectory(shader-coverage-image-pipeline)
     add_subdirectory(shader-object)
     add_subdirectory(shader-toy)
     add_subdirectory(triangle)

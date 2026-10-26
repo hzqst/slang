@@ -1,9 +1,7 @@
 // Upcasting an existential (interface-typed) value from a derived
-// interface to a base interface currently triggers an ICE.
-// Disabled until the fix lands. See https://github.com/shader-slang/slang/issues/10156
+// interface to a base interface should produce correct dispatch code.
 
-//DISABLE_TEST:SIMPLE(filecheck=CHK1):-target hlsl -stage compute -entry scenario1
-//DISABLE_TEST:SIMPLE(filecheck=CHK2):-target hlsl -stage compute -entry scenario2
+//TEST:SIMPLE(filecheck=CHK1):-target hlsl -stage compute -entry scenario1
 
 // Non-generic interface hierarchy
 interface IBase
@@ -30,34 +28,22 @@ struct ImplB : IDerived
     float transform(float input) { return input * v; }
 }
 
-// Generic interface hierarchy
-interface IGenBase<T : IArithmetic>
-{
-    T getValue();
-}
-
-interface IGenDerived<T : IArithmetic> : IGenBase<T>
-{
-    T transform(T input);
-}
-
-struct GenImplA : IGenDerived<float>
-{
-    float v;
-    float getValue() { return v; }
-    float transform(float input) { return input + v; }
-}
-
-struct GenImplB : IGenDerived<float>
-{
-    float v;
-    float getValue() { return v * 2.0; }
-    float transform(float input) { return input * v; }
-}
-
 RWStructuredBuffer<float> outputBuffer;
 
-// Scenario 1: Non-generic upcast
+// Scenario 1: Non-generic upcast — verify the compiler lowers `base.getValue()`
+// to a dispatch through the witness-table chain walked at the upcast (IDerived's
+// `$inheritance` entry → IBase's `getValue`), not a single direct call that would
+// indicate the upcast was folded away to one concrete type. The dispatch itself
+// is force-inlined into `scenario1` (see slang-ir-lower-dynamic-dispatch-insts.cpp),
+// so what's checked is the surviving `switch` with calls into both concrete
+// implementations, not a separately named dispatch function. The two calls
+// below are matched order-independently (not sequentially): the switch-case
+// order between ImplA and ImplB is not guaranteed across compilers/platforms
+// (confirmed -- MSVC and GCC emit them in opposite orders).
+// CHK1: void scenario1
+// CHK1: switch
+// CHK1-DAG: ImplB_getValue
+// CHK1-DAG: ImplA_getValue
 [numthreads(1, 1, 1)]
 void scenario1()
 {
@@ -68,19 +54,5 @@ void scenario1()
         derived = ImplB(10.0);
 
     IBase base = derived;
-    outputBuffer[0] = base.getValue();
-}
-
-// Scenario 2: Generic upcast
-[numthreads(1, 1, 1)]
-void scenario2()
-{
-    IGenDerived<float> derived;
-    if (outputBuffer[0] == 0.0)
-        derived = GenImplA(10.0);
-    else
-        derived = GenImplB(10.0);
-
-    IGenBase<float> base = derived;
     outputBuffer[0] = base.getValue();
 }

@@ -225,30 +225,6 @@ public in float2 gl_SamplePosition : SV_VulkanSamplePosition;
 
 // Override operator* behavior to compute algebric product of matrices and vectors.
 
-[OverloadRank(15)]
-[ForceInline]
-[require(cpp_cuda_glsl_hlsl_spirv_llvm, sm_4_0_version)]
-public matrix<float, N, N> operator*<let N:int>(matrix<float, N, N> m1, matrix<float, N, N> m2)
-{
-    return mul(m2, m1);
-}
-
-[OverloadRank(15)]
-[ForceInline]
-[require(cpp_cuda_glsl_hlsl_spirv_llvm, sm_4_0_version)]
-public matrix<half, N, N> operator*<let N:int>(matrix<half, N, N> m1, matrix<half, N, N> m2)
-{
-    return mul(m2, m1);
-}
-
-[OverloadRank(15)]
-[ForceInline]
-[require(cpp_cuda_glsl_hlsl_spirv_llvm, sm_4_0_version)]
-public matrix<double, N, N> operator*<let N:int>(matrix<double, N, N> m1, matrix<double, N, N> m2)
-{
-    return mul(m2, m1);
-}
-
 [ForceInline]
 [OverloadRank(15)]
 [require(cpp_cuda_glsl_hlsl_spirv_llvm, sm_4_0_version)]
@@ -357,22 +333,6 @@ public bool operator!=<T:__BuiltinArithmeticType, let N:int>(vector<T, N> left, 
 [ForceInline]
 [OverloadRank(14)]
 [require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm)]
-public bool operator==<T:__BuiltinFloatingPointType, let N:int>(vector<T, N> left, vector<T, N> right)
-{
-    return all(equal(left, right));
-}
-
-[ForceInline]
-[OverloadRank(14)]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm)]
-public bool operator!=<T:__BuiltinFloatingPointType, let N:int>(vector<T, N> left, vector<T, N> right)
-{
-    return any(notEqual(left, right));
-}
-
-[ForceInline]
-[OverloadRank(14)]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm)]
 public bool operator==<T:__BuiltinLogicalType, let N:int>(vector<T, N> left, vector<T, N> right)
 {
     return all(equal(left, right));
@@ -385,30 +345,6 @@ public bool operator!=<T:__BuiltinLogicalType, let N:int>(vector<T, N> left, vec
 {
     return any(notEqual(left, right));
 }
-
-${
-for (auto type : kBaseTypes) {
-    char const* typeName = type.name;
-    if (!type.flags) continue;
-$}
-[ForceInline]
-[OverloadRank(15)]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm)]
-public bool operator==<let N:int>(vector<$(typeName), N> left, vector<$(typeName), N> right)
-{
-    return all(equal(left, right));
-}
-
-[ForceInline]
-[OverloadRank(15)]
-[require(cpp_cuda_glsl_hlsl_metal_spirv_wgsl_llvm)]
-public bool operator!=<let N:int>(vector<$(typeName), N> left, vector<$(typeName), N> right)
-{
-    return any(notEqual(left, right));
-}
-${
-}
-$}
 
 /// Array length
 __generic<T, let N : int>
@@ -493,12 +429,17 @@ __generic<T : __BuiltinFloatingPointType>
 [require(cpp_cuda_glsl_hlsl_spirv_llvm, sm_4_0_version)]
 public T mod(T x, T y)
 {
-    // SPIR-V doesn't have "modulus".
-    // All of Op?Mod and OpFRem are "remainder".
-
     __target_switch
     {
     case glsl: __intrinsic_asm "mod";
+    case spirv:
+        // `OpFMod` is a floor-modulus (its sign follows Operand 2), which is
+        // exactly what `mod()` computes, so use it directly rather than the
+        // multi-instruction `x - y*floor(x/y)` expansion below.
+        return spirv_asm
+        {
+            result:$$T = OpFMod $x $y
+        };
     default:
         return x - y * floor(x / y);
     }
@@ -513,6 +454,11 @@ public vector<T, N> mod(vector<T, N> x, T y)
     __target_switch
     {
     case glsl: __intrinsic_asm "mod";
+    case spirv:
+        // `OpFMod` requires both operands to have the result type, so broadcast
+        // the scalar divisor and defer to the vector/vector overload rather than
+        // duplicating the opcode here.
+        return mod(x, vector<T, N>(y));
     default:
         return x - y * floor(x / y);
     }
@@ -527,6 +473,11 @@ public vector<T, N> mod(vector<T, N> x, vector<T, N> y)
     __target_switch
     {
     case glsl: __intrinsic_asm "mod";
+    case spirv:
+        return spirv_asm
+        {
+            result:$$vector<T, N> = OpFMod $x $y
+        };
     default:
         return x - y * floor(x / y);
     }
@@ -938,7 +889,8 @@ public matrix<T, R, C> outerProduct(vector<T, C> c, vector<T, R> r)
 }
 
 __generic<T : __BuiltinFloatingPointType, let N : int>
-[require(glsl_spirv, GLSL_400)]
+[require(glsl, GLSL_400)]
+[require(spirv)]
 public matrix<T,N,N> inverse(matrix<T,N,N> m)
 {
     __target_switch
@@ -963,11 +915,11 @@ public uint uaddCarry(highp uint x, highp uint y, out lowp uint carry)
     {
     case glsl: __intrinsic_asm "uaddCarry";
     case spirv: return spirv_asm {
-        %ResType = OpTypeStruct $$uint $$uint;
-        %temp:%ResType = OpIAddCarry $x $y;
-        %carry:$$uint = OpCompositeExtract %temp 1;
-        OpStore &carry %carry;
-        result:$$uint = OpCompositeExtract %temp 0
+        %__ResType = OpTypeStruct $$uint $$uint;
+        %__temp:%__ResType = OpIAddCarry $x $y;
+        %__carry:$$uint = OpCompositeExtract %__temp 1;
+        OpStore &carry %__carry;
+        result:$$uint = OpCompositeExtract %__temp 0
     };
     default:
         let result = x * y;
@@ -986,11 +938,11 @@ public vector<uint,N> uaddCarry(highp vector<uint,N> x, highp vector<uint,N> y, 
     {
     case glsl: __intrinsic_asm "uaddCarry";
     case spirv: return spirv_asm {
-        %ResType = OpTypeStruct $$vector<uint,N> $$vector<uint,N>;
-        %temp:%ResType = OpIAddCarry $x $y;
-        %carry:$$vector<uint,N> = OpCompositeExtract %temp 1;
-        OpStore &carry %carry;
-        result:$$vector<uint,N> = OpCompositeExtract %temp 0
+        %__ResType = OpTypeStruct $$vector<uint,N> $$vector<uint,N>;
+        %__temp:%__ResType = OpIAddCarry $x $y;
+        %__carry:$$vector<uint,N> = OpCompositeExtract %__temp 1;
+        OpStore &carry %__carry;
+        result:$$vector<uint,N> = OpCompositeExtract %__temp 0
     };
     default:
         VECTOR_MAP_TRINARY(uint, N, uaddCarry, x, y, carry);
@@ -1006,11 +958,11 @@ public uint usubBorrow(highp uint x, highp uint y, out lowp uint borrow)
     {
     case glsl: __intrinsic_asm "usubBorrow";
     case spirv: return spirv_asm {
-        %ResType = OpTypeStruct $$uint $$uint;
-        %temp:%ResType = OpISubBorrow $x $y;
-        %borrow:$$uint = OpCompositeExtract %temp 1;
-        OpStore &borrow %borrow;
-        result:$$uint = OpCompositeExtract %temp 0
+        %__ResType = OpTypeStruct $$uint $$uint;
+        %__temp:%__ResType = OpISubBorrow $x $y;
+        %__borrow:$$uint = OpCompositeExtract %__temp 1;
+        OpStore &borrow %__borrow;
+        result:$$uint = OpCompositeExtract %__temp 0
     };
     default:
         borrow = (y > x) ? 1 : 0;
@@ -1028,11 +980,11 @@ public vector<uint,N> usubBorrow(highp vector<uint,N> x, highp vector<uint,N> y,
     {
     case glsl: __intrinsic_asm "usubBorrow";
     case spirv: return spirv_asm {
-        %ResType = OpTypeStruct $$vector<uint,N> $$vector<uint,N>;
-        %temp:%ResType = OpISubBorrow $x $y;
-        %borrow:$$vector<uint,N> = OpCompositeExtract %temp 1;
-        OpStore &borrow %borrow;
-        result:$$vector<uint,N> = OpCompositeExtract %temp 0
+        %__ResType = OpTypeStruct $$vector<uint,N> $$vector<uint,N>;
+        %__temp:%__ResType = OpISubBorrow $x $y;
+        %__borrow:$$vector<uint,N> = OpCompositeExtract %__temp 1;
+        OpStore &borrow %__borrow;
+        result:$$vector<uint,N> = OpCompositeExtract %__temp 0
     };
     default:
         VECTOR_MAP_TRINARY(uint, N, usubBorrow, x, y, borrow);
@@ -1048,12 +1000,12 @@ public void umulExtended(highp uint x, highp uint y, out highp uint msb, out hig
     {
     case glsl: __intrinsic_asm "umulExtended";
     case spirv: spirv_asm {
-        %ResType = OpTypeStruct $$uint $$uint;
-        %temp:%ResType = OpUMulExtended $x $y;
-        %lsb:$$uint = OpCompositeExtract %temp 0;
-        %msb:$$uint = OpCompositeExtract %temp 1;
-        OpStore &lsb %lsb;
-        OpStore &msb %msb;
+        %__ResType = OpTypeStruct $$uint $$uint;
+        %__temp:%__ResType = OpUMulExtended $x $y;
+        %__lsb:$$uint = OpCompositeExtract %__temp 0;
+        %__msb:$$uint = OpCompositeExtract %__temp 1;
+        OpStore &lsb %__lsb;
+        OpStore &msb %__msb;
     };
     default:
         uint64_t result = uint64_t(x) * uint64_t(y);
@@ -1072,12 +1024,12 @@ public void umulExtended(highp vector<uint,N> x, highp vector<uint,N> y, out hig
     {
     case glsl: __intrinsic_asm "umulExtended";
     case spirv: spirv_asm {
-        %ResType = OpTypeStruct $$vector<uint,N> $$vector<uint,N>;
-        %temp:%ResType = OpUMulExtended $x $y;
-        %lsb:$$vector<uint,N> = OpCompositeExtract %temp 0;
-        %msb:$$vector<uint,N> = OpCompositeExtract %temp 1;
-        OpStore &lsb %lsb;
-        OpStore &msb %msb;
+        %__ResType = OpTypeStruct $$vector<uint,N> $$vector<uint,N>;
+        %__temp:%__ResType = OpUMulExtended $x $y;
+        %__lsb:$$vector<uint,N> = OpCompositeExtract %__temp 0;
+        %__msb:$$vector<uint,N> = OpCompositeExtract %__temp 1;
+        OpStore &lsb %__lsb;
+        OpStore &msb %__msb;
     };
     default:
         [ForceUnroll]
@@ -1097,12 +1049,12 @@ public void imulExtended(highp int x, highp int y, out highp int msb, out highp 
     {
     case glsl: __intrinsic_asm "imulExtended";
     case spirv: spirv_asm {
-        %ResType = OpTypeStruct $$int $$int;
-        %temp:%ResType = OpSMulExtended $x $y;
-        %lsb:$$int = OpCompositeExtract %temp 0;
-        %msb:$$int = OpCompositeExtract %temp 1;
-        OpStore &lsb %lsb;
-        OpStore &msb %msb;
+        %__ResType = OpTypeStruct $$int $$int;
+        %__temp:%__ResType = OpSMulExtended $x $y;
+        %__lsb:$$int = OpCompositeExtract %__temp 0;
+        %__msb:$$int = OpCompositeExtract %__temp 1;
+        OpStore &lsb %__lsb;
+        OpStore &msb %__msb;
     };
     default:
         int64_t result = int64_t(x) * int64_t(y);
@@ -1121,12 +1073,12 @@ public void imulExtended(highp vector<int,N> x, highp vector<int,N> y, out highp
     {
     case glsl: __intrinsic_asm "imulExtended";
     case spirv: spirv_asm {
-        %ResType = OpTypeStruct $$vector<int,N> $$vector<int,N>;
-        %temp:%ResType = OpSMulExtended $x $y;
-        %lsb:$$vector<int,N> = OpCompositeExtract %temp 0;
-        %msb:$$vector<int,N> = OpCompositeExtract %temp 1;
-        OpStore &lsb %lsb;
-        OpStore &msb %msb;
+        %__ResType = OpTypeStruct $$vector<int,N> $$vector<int,N>;
+        %__temp:%__ResType = OpSMulExtended $x $y;
+        %__lsb:$$vector<int,N> = OpCompositeExtract %__temp 0;
+        %__msb:$$vector<int,N> = OpCompositeExtract %__temp 1;
+        OpStore &lsb %__lsb;
+        OpStore &msb %__msb;
     };
     default:
         [ForceUnroll]
@@ -1952,7 +1904,7 @@ public float texture(sampler1DShadow sampler, vec3 p)
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float texture(sampler1DShadow sampler, vec3 p, float bias)
 {
     float location = p.x;
@@ -1971,8 +1923,8 @@ public float texture(sampler1DShadow sampler, vec3 p, float bias)
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias $bias;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias);
     }
 }
 
@@ -1987,7 +1939,7 @@ public float texture(sampler2DShadow sampler, vec3 p)
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float texture(sampler2DShadow sampler, vec3 p, float bias)
 {
     vec2 location = p.xy;
@@ -2006,8 +1958,8 @@ public float texture(sampler2DShadow sampler, vec3 p, float bias)
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias $bias;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias);
     }
 }
 
@@ -2021,7 +1973,7 @@ public float texture(samplerCubeShadow sampler, vec4 p)
         return sampler.SampleCmpLevelZero(p.xyz, p.w);
 }
 
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 [ForceInline]
 public float texture(samplerCubeShadow sampler, vec4 p, float bias)
 {
@@ -2041,12 +1993,13 @@ public float texture(samplerCubeShadow sampler, vec4 p, float bias)
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias $bias;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias);
     }
 }
 
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+__glsl_extension(GL_EXT_texture_shadow_lod)
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 [ForceInline]
 public float texture(samplerCubeArrayShadow sampler, vec4 location, float compareValue, float bias)
 {
@@ -2056,15 +2009,18 @@ public float texture(samplerCubeArrayShadow sampler, vec4 location, float compar
     __requireComputeDerivative();
     __target_switch
     {
-    case glsl: __intrinsic_asm "texture";
+    case glsl:
+        // texture(samplerCubeArrayShadow, P, compare, bias) is added by GL_EXT_texture_shadow_lod.
+        __requireCapability(GL_EXT_texture_shadow_lod);
+        __intrinsic_asm "texture";
     case spirv:
         return spirv_asm
         {
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias $bias;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias);
     }
 }
 
@@ -2079,7 +2035,7 @@ public float texture(sampler1DArrayShadow sampler, vec3 p)
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float texture(sampler1DArrayShadow sampler, vec3 p, float bias)
 {
     vec2 location = p.xy;
@@ -2098,8 +2054,8 @@ public float texture(sampler1DArrayShadow sampler, vec3 p, float bias)
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias $bias;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias);
     }
 }
 
@@ -2109,6 +2065,17 @@ public float texture(sampler2DArrayShadow sampler, vec4 p)
 {
     if (__targetHasImplicitDerivatives())
         return sampler.SampleCmp(p.xyz, p.w);
+    else
+        return sampler.SampleCmpLevelZero(p.xyz, p.w);
+}
+
+// A GL_EXT_texture_shadow_lod form; the extension is requested branch-locally inside SampleCmpBias's wrapper.
+[ForceInline]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
+public float texture(sampler2DArrayShadow sampler, vec4 p, float bias)
+{
+    if (__targetHasImplicitDerivatives())
+        return sampler.SampleCmpBias(p.xyz, p.w, bias);
     else
         return sampler.SampleCmpLevelZero(p.xyz, p.w);
 }
@@ -2352,7 +2319,7 @@ public float textureProj(sampler1DShadow sampler, vec4 p)
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float textureProj(sampler1DShadow sampler, vec4 p, float bias)
 {
     if (!__targetHasImplicitDerivatives())
@@ -2400,7 +2367,7 @@ public float textureProj(sampler2DShadow sampler, vec4 p)
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float textureProj(sampler2DShadow sampler, vec4 p, float bias)
 {
     if (!__targetHasImplicitDerivatives())
@@ -2454,7 +2421,7 @@ public vector<T.Element,4> textureLod(_Texture<
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public float textureLod(sampler2DShadow sampler, vec3 p, float lod)
 {
     __target_switch
@@ -2472,13 +2439,16 @@ public float textureLod(sampler2DShadow sampler, vec3 p, float lod)
     }
 }
 
+__glsl_extension(GL_EXT_texture_shadow_lod)
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowlod_ext)]
 public float textureLod(sampler2DArrayShadow sampler, vec4 p, float lod)
 {
     __target_switch
     {
-    case glsl: __intrinsic_asm "textureLod";
+    case glsl:
+        __requireCapability(GL_EXT_texture_shadow_lod);
+        __intrinsic_asm "textureLod";
     case spirv:
     {
         float compareValue = p.w;
@@ -2491,22 +2461,38 @@ public float textureLod(sampler2DArrayShadow sampler, vec4 p, float lod)
     }
 }
 
+__glsl_extension(GL_EXT_texture_shadow_lod)
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowlod_ext)]
 public float textureLod(samplerCubeShadow sampler, vec4 p, float lod)
 {
-    return sampler.SampleCmpLevel(p.xyz, p.w, lod);
+    __target_switch
+    {
+    case glsl:
+        __requireCapability(GL_EXT_texture_shadow_lod);
+        return sampler.SampleCmpLevel(p.xyz, p.w, lod);
+    default:
+        return sampler.SampleCmpLevel(p.xyz, p.w, lod);
+    }
 }
 
+__glsl_extension(GL_EXT_texture_shadow_lod)
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowlod_ext)]
 public float textureLod(samplerCubeArrayShadow sampler, vec4 p, float compareValue, float lod)
 {
-    return sampler.SampleCmpLevel(p, compareValue, lod);
+    __target_switch
+    {
+    case glsl:
+        __requireCapability(GL_EXT_texture_shadow_lod);
+        return sampler.SampleCmpLevel(p, compareValue, lod);
+    default:
+        return sampler.SampleCmpLevel(p, compareValue, lod);
+    }
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public float textureLod(sampler1DShadow sampler, vec3 p, float lod)
 {
     __target_switch
@@ -2525,7 +2511,7 @@ public float textureLod(sampler1DShadow sampler, vec3 p, float lod)
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public float textureLod(sampler1DArrayShadow sampler, vec3 p, float lod)
 {
     __target_switch
@@ -2580,9 +2566,38 @@ public vector<T.Element,4> textureOffset(Sampler3D<T> sampler, vec3 p, constexpr
         return __vectorReshape2<T.Element,4>(sampler.SampleLevelZero(p, offset));
 }
 
+// No-bias offset shadow sample. Kept as a distinct overload (not a `bias = 0.0` default on the
+// biased form) so that no-bias callers — e.g. `textureProjOffset(sampler2DShadow, vec4, ivec2)` —
+// bind here and stay at the SM4.1/GLSL-150 baseline, never inheriting the biased form's
+// `texture_shadowbias` (SM6.8) requirement. This mirrors the split already used for
+// `textureOffset(sampler1DShadow, ...)`.
 [ForceInline]
 [require(glsl_hlsl_spirv, texture_shadowlod)]
-public float textureOffset(sampler2DShadow sampler, vec3 p, constexpr ivec2 offset, float bias = 0.0)
+public float textureOffset(sampler2DShadow sampler, vec3 p, constexpr ivec2 offset)
+{
+    vec2 location = p.xy;
+    float compareValue = p.z;
+
+    if (!__targetHasImplicitDerivatives())
+        return sampler.SampleCmpLevelZero(location, compareValue, offset);
+
+    __requireComputeDerivative();
+    __target_switch
+    {
+    case glsl: __intrinsic_asm "textureOffset";
+    case spirv:
+        return spirv_asm
+        {
+            result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue ConstOffset $offset;
+        };
+    default:
+        return sampler.SampleCmp(location, compareValue, offset);
+    }
+}
+
+[ForceInline]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
+public float textureOffset(sampler2DShadow sampler, vec3 p, constexpr ivec2 offset, float bias)
 {
     vec2 location = p.xy;
     float compareValue = p.z;
@@ -2600,8 +2615,8 @@ public float textureOffset(sampler2DShadow sampler, vec3 p, constexpr ivec2 offs
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias|ConstOffset $bias $offset;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue, offset);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias, offset);
     }
 }
 
@@ -2625,13 +2640,12 @@ public float textureOffset(sampler1DShadow sampler, vec3 p, constexpr int offset
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue ConstOffset $offset;
         };
     default:
-        // TODO: Need to apply bias
         return sampler.SampleCmp(location, compareValue, offset);
     }
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float textureOffset(sampler1DShadow sampler, vec3 p, constexpr int offset, float bias)
 {
     float location = p.x;
@@ -2650,8 +2664,8 @@ public float textureOffset(sampler1DShadow sampler, vec3 p, constexpr int offset
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias|ConstOffset $bias $offset;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue, offset);
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias, offset);
     }
 }
 
@@ -2698,13 +2712,12 @@ public float textureOffset(sampler1DArrayShadow sampler, vec3 p, constexpr int o
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue ConstOffset $offset;
         };
     default:
-        // TODO: Need to apply bias
         return sampler.SampleCmp(location, compareValue, vector<int,1>(offset));
     }
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float textureOffset(sampler1DArrayShadow sampler, vec3 p, constexpr int offset, float bias)
 {
     vec2 location = p.xy;
@@ -2723,8 +2736,8 @@ public float textureOffset(sampler1DArrayShadow sampler, vec3 p, constexpr int o
             result:$$float = OpImageSampleDrefImplicitLod $sampler $location $compareValue Bias|ConstOffset $bias $offset;
         };
     default:
-        // TODO: Need to apply bias
-        return sampler.SampleCmp(location, compareValue, vector<int,1>(offset));
+        // HLSL (the only target reaching default: here) applies the bias via SampleCmpBias.
+        return sampler.SampleCmpBias(location, compareValue, bias, vector<int,1>(offset));
     }
 }
 
@@ -2738,13 +2751,35 @@ public float textureOffset(sampler2DArrayShadow sampler, vec4 p, constexpr ivec2
         return sampler.SampleCmpLevelZero(p.xyz, p.w, offset);
 }
 
+// A GL_EXT_texture_shadow_lod form; the extension is requested branch-locally inside SampleCmpBias's wrapper.
+[ForceInline]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
+public float textureOffset(sampler2DArrayShadow sampler, vec4 p, constexpr ivec2 offset, float bias)
+{
+    if (__targetHasImplicitDerivatives())
+        return sampler.SampleCmpBias(p.xyz, p.w, bias, offset);
+    else
+        return sampler.SampleCmpLevelZero(p.xyz, p.w, offset);
+}
+
 // -------------------
 // texelFetch
 // -------------------
+//
+// These `texelFetch` (and the `texelFetchOffset` below) overloads all take a *combined*
+// sampler -- `Sampler1D`/`Sampler2DRect`/`SamplerBuffer`, or an explicit `isCombined=1`
+// `_Texture`. On GLSL they lower to `texelFetch(sampler2D, ...)`, which never needs
+// `GL_EXT_samplerless_texture_functions` (that extension is only for texelFetch on a *bare*
+// texture). The static requirement is therefore plain `texture_sm_4_1`, not the
+// `texture_sm_4_1_samplerless` alias: carrying the samplerless atom on these combined-only
+// sites would spuriously fire `warning[E41012] profile implicitly upgraded` under an explicit
+// `-profile`, even though no `#extension` is emitted (see #11874). Where the samplerless
+// extension is genuinely needed (a bare-texture fetch) it is added at emit time by the
+// `isCombined`-gated `__requireTargetExtension` in `_Texture`'s `Load`.
 
 __generic<T:ITexelElement>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetch(Sampler1D<T> sampler, int p, int lod)
 {
     return __vectorReshape2<T.Element,4>(sampler.Load(int2(p, lod)));
@@ -2752,7 +2787,7 @@ public vector<T.Element,4> texelFetch(Sampler1D<T> sampler, int p, int lod)
 
 __generic<T:ITexelElement, Shape:__ITextureShape, let isArray:int, let sampleCount:int, let format:int>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetch(_Texture<
         T,
         Shape,
@@ -2770,7 +2805,7 @@ public vector<T.Element,4> texelFetch(_Texture<
 
 __generic<T:ITexelElement>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetch(Sampler2DRect<T> sampler, ivec2 p)
 {
     return __vectorReshape2<T.Element,4>(sampler.Load(int3(p.xy,0)));
@@ -2778,7 +2813,7 @@ public vector<T.Element,4> texelFetch(Sampler2DRect<T> sampler, ivec2 p)
 
 __generic<T:ITexelElement, let format:int>
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetch(SamplerBuffer<T,format> sampler, int p)
 {
     return __vectorReshape2<T.Element,4>(sampler.Load(p));
@@ -2786,7 +2821,7 @@ public vector<T.Element,4> texelFetch(SamplerBuffer<T,format> sampler, int p)
 
 __generic<T:ITexelElement, let isArray:int, let sampleCount:int, let format:int>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetch(_Texture<
         T,
         __Shape2D,
@@ -2814,7 +2849,7 @@ public vector<T.Element,4> texelFetch(_Texture<
 
 __generic<T:ITexelElement>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetchOffset(Sampler1D<T> sampler, int p, int lod, constexpr int offset)
 {
     return __vectorReshape2<T.Element,4>(sampler.Load(int2(p, lod), offset));
@@ -2822,7 +2857,7 @@ public vector<T.Element,4> texelFetchOffset(Sampler1D<T> sampler, int p, int lod
 
 __generic<T:ITexelElement, Shape:__ITextureShape, let isArray:int, let sampleCount:int, let format:int>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetchOffset(_Texture<
         T,
         Shape,
@@ -2840,7 +2875,7 @@ public vector<T.Element,4> texelFetchOffset(_Texture<
 
 __generic<T:ITexelElement>
 [ForceInline]
-[require(cpp_glsl_hlsl_spirv, texture_sm_4_1_samplerless)]
+[require(cpp_glsl_hlsl_spirv, texture_sm_4_1)]
 public vector<T.Element,4> texelFetchOffset(Sampler2DRect<T> sampler, ivec2 p, constexpr ivec2 offset)
 {
     return __vectorReshape2<T.Element,4>(sampler.Load(__makeVector(p, 0), offset));
@@ -3091,7 +3126,7 @@ public float textureProjOffset(sampler1DShadow sampler, vec4 p, constexpr int of
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float textureProjOffset(sampler1DShadow sampler, vec4 p, constexpr int offset, float bias)
 {
     if (!__targetHasImplicitDerivatives())
@@ -3139,7 +3174,7 @@ public float textureProjOffset(sampler2DShadow sampler, vec4 p, constexpr ivec2 
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_shadowbias)]
 public float textureProjOffset(sampler2DShadow sampler, vec4 p, constexpr ivec2 offset, float bias)
 {
     if (!__targetHasImplicitDerivatives())
@@ -3193,7 +3228,7 @@ public vector<T.Element,4> textureLodOffset(_Texture<
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public float textureLodOffset(sampler1DShadow sampler, vec3 p, float lod, constexpr int offset)
 {
     __target_switch
@@ -3213,7 +3248,7 @@ public float textureLodOffset(sampler1DShadow sampler, vec3 p, float lod, conste
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public float textureLodOffset(sampler2DShadow sampler, vec3 p, float lod, constexpr ivec2 offset)
 {
     __target_switch
@@ -3233,7 +3268,7 @@ public float textureLodOffset(sampler2DShadow sampler, vec3 p, float lod, conste
 }
 
 [ForceInline]
-[require(glsl_hlsl_spirv, texture_shadowlod)]
+[require(glsl_hlsl_spirv, texture_sm_4_1)]
 public float textureLodOffset(sampler1DArrayShadow sampler, vec3 p, float lod, constexpr int offset)
 {
     __target_switch
@@ -3250,6 +3285,14 @@ public float textureLodOffset(sampler1DArrayShadow sampler, vec3 p, float lod, c
         // TODO: Need to apply lod
         return sampler.SampleCmpLevelZero(p.xy, p.z, offset);
     }
+}
+
+// A GL_EXT_texture_shadow_lod form; the extension is requested branch-locally inside SampleCmpLevel's wrapper.
+[ForceInline]
+[require(glsl_hlsl_spirv, texture_shadowlod_ext)]
+public float textureLodOffset(sampler2DArrayShadow sampler, vec4 p, float lod, constexpr ivec2 offset)
+{
+    return sampler.SampleCmpLevel(p.xyz, p.w, lod, offset);
 }
 
 // -------------------
@@ -4313,7 +4356,7 @@ public vec4 shadow1D(sampler1DShadow sampler, vec3 coord)
     return texture(sampler, coord);
 }
 
-[require(glsl_spirv, texture_shadowlod)]
+[require(glsl_spirv, texture_shadowbias)]
 public vec4 shadow1D(sampler1DShadow sampler, vec3 coord, float bias)
 {
     return texture(sampler, coord, bias);
@@ -4325,7 +4368,7 @@ public vec4 shadow2D(sampler2DShadow sampler, vec3 coord)
     return texture(sampler, coord);
 }
 
-[require(glsl_spirv, texture_shadowlod)]
+[require(glsl_spirv, texture_shadowbias)]
 public vec4 shadow2D(sampler2DShadow sampler, vec3 coord, float bias)
 {
     return texture(sampler, coord, bias);
@@ -4337,7 +4380,7 @@ public vec4 shadow1DProj(sampler1DShadow sampler, vec4 coord)
     return textureProj(sampler, coord);
 }
 
-[require(glsl_spirv, texture_shadowlod)]
+[require(glsl_spirv, texture_shadowbias)]
 public vec4 shadow1DProj(sampler1DShadow sampler, vec4 coord, float bias)
 {
     return textureProj(sampler, coord, bias);
@@ -4349,7 +4392,7 @@ public vec4 shadow2DProj(sampler2DShadow sampler, vec4 coord)
     return textureProj(sampler, coord);
 }
 
-[require(glsl_spirv, texture_shadowlod)]
+[require(glsl_spirv, texture_shadowbias)]
 public vec4 shadow2DProj(sampler2DShadow sampler, vec4 coord, float bias)
 {
     return textureProj(sampler, coord, bias);
@@ -4449,6 +4492,26 @@ __generic<T : __BuiltinType>
         return;
     }
 }
+
+// Typed pointer to an image texel used by image atomic spirv_asm snippets.
+internal typealias __ImagePtr<T> =
+    Ptr<T, Access::ReadWrite, (AddressSpace)$((uint64_t)AddressSpace::Image)>;
+
+// Form a texel pointer for image atomics at the IR level.
+// Kept outside spirv_asm so NonUniform propagates to the texel pointer.
+__intrinsic_op($(kIROp_ImageTexelPointer))
+__ImagePtr<T> __imageTexelPointer<T, TImage, TCoord>(TImage image, TCoord coord, int sample);
+
+// Internal SPIR-V-legalization helper for the image-atomic snippets below. Its
+// `GetLegalizedSPIRVGlobalParamAddr` inst has no emitter; the SPIR-V legalize
+// pass only strips it while rewriting a global parameter's uses. A user call
+// passes an ordinary rvalue, not a global parameter, so that rewrite never
+// reaches it and the inst would survive to emit and abort. `internal` keeps the
+// name out of user scope; it is declared here, in the same module as its only
+// callers (the image-atomic snippets below), so those callers can still see it.
+internal __generic<T>
+__intrinsic_op($(kIROp_GetLegalizedSPIRVGlobalParamAddr))
+__Addr<T> __getLegalizedSPIRVGlobalParamAddr(T val);
 
 ${
 {
@@ -4663,12 +4726,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomic$(targetType.SPVTypePrefix)Add$(targetType.SPVAtomicSuffix) %ptr Device None $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomic$(targetType.SPVTypePrefix)Add$(targetType.SPVAtomicSuffix) $ptr Device None $data
                 };
             }
             }
@@ -4686,12 +4749,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomicExchange %ptr Device Relaxed $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomicExchange $ptr Device Relaxed $data
                 };
             }
             }
@@ -4709,12 +4772,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomic$(targetType.SPVSubTypePrefix)Min$(targetType.SPVAtomicSuffix) %ptr Device Relaxed $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomic$(targetType.SPVSubTypePrefix)Min$(targetType.SPVAtomicSuffix) $ptr Device Relaxed $data
                 };
             }
             }
@@ -4732,12 +4795,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomic$(targetType.SPVSubTypePrefix)Max$(targetType.SPVAtomicSuffix) %ptr Device Relaxed $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomic$(targetType.SPVSubTypePrefix)Max$(targetType.SPVAtomicSuffix) $ptr Device Relaxed $data
                 };
             }
             }
@@ -4758,12 +4821,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomicAnd %ptr Device Relaxed $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomicAnd $ptr Device Relaxed $data
                 };
             }
             }
@@ -4780,12 +4843,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomicOr %ptr Device Relaxed $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomicOr $ptr Device Relaxed $data
                 };
             }
             }
@@ -4803,12 +4866,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomicXor %ptr Device Relaxed $data
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomicXor $ptr Device Relaxed $data
                 };
             }
             }
@@ -4825,12 +4888,12 @@ $}
                 let imageP = __getLegalizedSPIRVGlobalParamAddr(image);
                 typeRequireChecks_image_atomic_int64<$(targetType.type)>();
                 $(SPV_DEFAULT_SAMPLE_VAR_IF_MISSING)
+                let ptr = __imageTexelPointer<$(targetType.type)>(imageP, P, sample);
                 return spirv_asm
                 {
                     OpCapability ImageQuery;
-                    %ptrType = OpTypePointer Image $$$(targetType.type);
-                    %ptr:%ptrType = OpImageTexelPointer $imageP $P $sample;
-                    result:$$$(targetType.type) = OpAtomicCompareExchange %ptr Device Relaxed Relaxed $data $compare
+                    // Do not copy resource-type $operands into %temporaries; NonUniform does not propagate to asm-local ids.
+                    result:$$$(targetType.type) = OpAtomicCompareExchange $ptr Device Relaxed Relaxed $data $compare
                 };
             }
             }
@@ -5000,7 +5063,7 @@ public property int gl_InstanceCustomIndexEXT
 
 public property int gl_GeometryIndexEXT
 {
-    [require(glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+    [require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
     get
     {
         setupExtForRayTracingBuiltIn();
@@ -5180,8 +5243,8 @@ public property mat3x4 gl_ObjectToWorld3x4EXT
         {
             return spirv_asm
             {
-                %mat:$$mat4x3 = OpLoad builtin(ObjectToWorldKHR:mat4x3);
-                result:$$mat3x4 = OpTranspose %mat
+                %__mat:$$mat4x3 = OpLoad builtin(ObjectToWorldKHR:mat4x3);
+                result:$$mat3x4 = OpTranspose %__mat
             };
         }
         }
@@ -5227,8 +5290,8 @@ public property mat3x4 gl_WorldToObject3x4EXT
         {
             return spirv_asm
             {
-                %mat:$$mat4x3 = OpLoad builtin(WorldToObjectKHR:mat4x3);
-                result:$$mat3x4 = OpTranspose %mat
+                %__mat:$$mat4x3 = OpLoad builtin(WorldToObjectKHR:mat4x3);
+                result:$$mat3x4 = OpTranspose %__mat
             };
         }
         }
@@ -5396,7 +5459,6 @@ public bool rayQueryProceedEXT(inout rayQueryEXT q)
 
 __glsl_extension(GL_EXT_ray_query)
 [require(glsl_spirv, rayquery)]
-[mutating]
 [ForceInline]
 public void rayQueryTerminateEXT(inout rayQueryEXT q)
 {
@@ -5660,7 +5722,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public void hitObjectTraceRayNV(
     inout hitObjectNV hitObject,
     accelerationStructureEXT topLevel,
@@ -5692,7 +5754,7 @@ __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 __glsl_extension(GL_NV_ray_tracing_motion_blur)
 [ForceInline]
-[require(glsl_spirv, ser_motion_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_motion_raygen_closesthit_miss)]
 public void hitObjectTraceRayMotionNV(
     inout hitObjectNV hitObject,
     accelerationStructureEXT topLevel,
@@ -5758,7 +5820,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public void hitObjectRecordHitNV(
     inout hitObjectNV hitObject,
     accelerationStructureEXT topLevel,
@@ -5823,7 +5885,7 @@ __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 __glsl_extension(GL_NV_ray_tracing_motion_blur)
 [ForceInline]
-[require(glsl_spirv, ser_motion_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_motion_raygen_closesthit_miss)]
 public void hitObjectRecordHitMotionNV(
     inout hitObjectNV hitObject,
     accelerationStructureEXT topLevel,
@@ -5844,7 +5906,7 @@ public void hitObjectRecordHitMotionNV(
     {
     case _GL_NV_shader_invocation_reorder_motion:
     {
-        HitObject::__glslMakeMotionHit(
+        HitObject::__glslMakeMotionHitNV(
             hitObject,
             topLevel,
             instanceid,
@@ -5892,7 +5954,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public void hitObjectRecordHitWithIndexNV(
     inout hitObjectNV hitObject,
     accelerationStructureEXT topLevel,
@@ -5954,7 +6016,7 @@ __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 __glsl_extension(GL_NV_ray_tracing_motion_blur)
 [ForceInline]
-[require(glsl_spirv, ser_motion_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_motion_raygen_closesthit_miss)]
 public void hitObjectRecordHitWithIndexMotionNV(
     inout hitObjectNV hitObject,
     accelerationStructureEXT topLevel,
@@ -5974,7 +6036,7 @@ public void hitObjectRecordHitWithIndexMotionNV(
     {
     case _GL_NV_shader_invocation_reorder_motion:
     {
-        HitObject::__glslMakeMotionHitWithIndex(
+        HitObject::__glslMakeMotionHitWithIndexNV(
             hitObject,
             topLevel,
             instanceid,
@@ -6020,7 +6082,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public void hitObjectRecordMissNV(
     inout hitObjectNV hitObject,
     uint sbtRecordIndex,
@@ -6040,7 +6102,7 @@ __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 __glsl_extension(GL_NV_ray_tracing_motion_blur)
 [ForceInline]
-[require(glsl_spirv, ser_motion_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_motion_raygen_closesthit_miss)]
 public void hitObjectRecordMissMotionNV(
     inout hitObjectNV hitObject,
     uint sbtRecordIndex,
@@ -6061,8 +6123,8 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
-public void hitObjectRecordEmptyNV(hitObjectNV hitObject)
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
+public void hitObjectRecordEmptyNV(inout hitObjectNV hitObject)
 {
     hitObject = HitObject::MakeNop();
 }
@@ -6071,7 +6133,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public void hitObjectExecuteShaderNV(
     inout hitObjectNV hitObject,
     constexpr int payload)
@@ -6098,7 +6160,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public bool hitObjectIsEmptyNV(hitObjectNV hitObject)
 {
     return hitObject.IsNop();
@@ -6108,7 +6170,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public bool hitObjectIsMissNV(hitObjectNV hitObject)
 {
     return hitObject.IsMiss();
@@ -6118,7 +6180,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public bool hitObjectIsHitNV(hitObjectNV hitObject)
 {
     return hitObject.IsHit();
@@ -6128,7 +6190,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public float hitObjectGetRayTMinNV(hitObjectNV hitObject)
 {
     return hitObject.GetRayDesc().TMin;
@@ -6138,7 +6200,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public float hitObjectGetRayTMaxNV(hitObjectNV hitObject)
 {
     return hitObject.GetRayDesc().TMax;
@@ -6148,7 +6210,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public vec3 hitObjectGetWorldRayOriginNV(hitObjectNV hitObject)
 {
     return hitObject.GetRayDesc().Origin;
@@ -6158,7 +6220,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public vec3 hitObjectGetWorldRayDirectionNV(hitObjectNV hitObject)
 {
     return hitObject.GetRayDesc().Direction;
@@ -6168,7 +6230,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public vec3 hitObjectGetObjectRayOriginNV(hitObjectNV hitObject)
 {
     return hitObject.GetObjectRayOrigin();
@@ -6178,7 +6240,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public vec3 hitObjectGetObjectRayDirectionNV(hitObjectNV hitObject)
 {
     return hitObject.GetObjectRayDirection();
@@ -6188,7 +6250,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public mat4x3 hitObjectGetObjectToWorldNV(hitObjectNV hitObject)
 {
     return hitObject.GetObjectToWorld();
@@ -6198,7 +6260,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public mat4x3 hitObjectGetWorldToObjectNV(hitObjectNV hitObject)
 {
     return hitObject.GetWorldToObject();
@@ -6208,7 +6270,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public int hitObjectGetInstanceCustomIndexNV(hitObjectNV hitObject)
 {
     return hitObject.GetInstanceID();
@@ -6218,7 +6280,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public int hitObjectGetInstanceIdNV(hitObjectNV hitObject)
 {
     return hitObject.GetInstanceIndex();
@@ -6228,7 +6290,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public int hitObjectGetGeometryIndexNV(hitObjectNV hitObject)
 {
     return hitObject.GetGeometryIndex();
@@ -6238,7 +6300,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public int hitObjectGetPrimitiveIndexNV(hitObjectNV hitObject)
 {
     return hitObject.GetPrimitiveIndex();
@@ -6248,7 +6310,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public uint hitObjectGetHitKindNV(hitObjectNV hitObject)
 {
     return hitObject.GetHitKind();
@@ -6258,7 +6320,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public void hitObjectGetAttributesNV(
     inout hitObjectNV hitObject,
     constexpr int attributeLocation)
@@ -6284,7 +6346,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public uvec2 hitObjectGetShaderRecordBufferHandleNV(hitObjectNV hitObject)
 {
     return hitObject.GetShaderRecordBufferHandle();
@@ -6294,7 +6356,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public uint hitObjectGetShaderBindingTableRecordIndexNV(hitObjectNV hitObject)
 {
     return hitObject.GetShaderTableIndex();
@@ -6304,7 +6366,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen_closesthit_miss)]
+[require(glsl_spirv, ser_nv_raygen_closesthit_miss)]
 public float hitObjectGetCurrentTimeNV(hitObjectNV hitObject)
 {
     return hitObject.GetCurrentTime();
@@ -6314,7 +6376,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen)]
+[require(glsl_spirv, ser_nv_raygen)]
 public void reorderThreadNV(uint hint, uint bits)
 {
     ReorderThread(hint, bits);
@@ -6324,7 +6386,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen)]
+[require(glsl_spirv, ser_nv_raygen)]
 public void reorderThreadNV(hitObjectNV hitObject)
 {
     ReorderThread(hitObject);
@@ -6334,7 +6396,7 @@ __glsl_extension(GL_EXT_ray_tracing)
 __glsl_extension(GL_NV_shader_invocation_reorder)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl_spirv, ser_raygen)]
+[require(glsl_spirv, ser_nv_raygen)]
 public void reorderThreadNV(hitObjectNV hitObject, uint hint, uint bits)
 {
     ReorderThread(hitObject, hint, bits);
@@ -6890,8 +6952,8 @@ __glsl_extension(GL_EXT_shader_invocation_reorder)
 __glsl_extension(GL_EXT_ray_tracing_position_fetch)
 __glsl_extension(GLSL_EXT_buffer_reference_uvec2)
 [ForceInline]
-[require(glsl, ser_raygen_closesthit_miss)]
-[require(spirv, ser_raygen_closesthit_miss)]
+[require(glsl, ser_position_raygen_closesthit_miss)]
+[require(spirv, ser_position_raygen_closesthit_miss)]
 public void hitObjectGetIntersectionTriangleVertexPositionsEXT(hitObjectEXT hitObject, out vec3 positions[3])
 {
     __target_switch
@@ -6899,15 +6961,14 @@ public void hitObjectGetIntersectionTriangleVertexPositionsEXT(hitObjectEXT hitO
     case _GL_EXT_shader_invocation_reorder:
         __intrinsic_asm "hitObjectGetIntersectionTriangleVertexPositionsEXT($0, $1)";
     case spvShaderInvocationReorderEXT:
-        spirv_asm
+        typedef vec3[3] vec3Arr3;
+        positions = spirv_asm
         {
             OpExtension "SPV_KHR_ray_tracing_position_fetch";
             OpCapability RayTracingPositionFetchKHR;
             OpExtension "SPV_EXT_shader_invocation_reorder";
             OpCapability ShaderInvocationReorderEXT;
-            OpHitObjectGetIntersectionTriangleVertexPositionsEXT
-                &hitObject
-                &positions;
+            result: $$vec3Arr3 = OpHitObjectGetIntersectionTriangleVertexPositionsEXT &hitObject;
         };
     }
 }
@@ -7251,30 +7312,23 @@ void setupExtForSubgroupBallotBuiltIn() {
     }
 }
 
+[require(glsl_spirv, subgroup_workgroup_index)]
 public property uint gl_NumSubgroups
 {
     [ForceInline]
-    [require(glsl_spirv, subgroup_basic)]
+    [require(glsl_spirv, subgroup_workgroup_index)]
     get {
         return WaveGetNumWaves();
     }
 }
 
+[require(glsl_spirv, subgroup_workgroup_index)]
 public property uint gl_SubgroupID
 {
-    [require(glsl_spirv, subgroup_basic)]
+    [ForceInline]
+    [require(glsl_spirv, subgroup_workgroup_index)]
     get {
-        setupExtForSubgroupBasicBuiltIn();
-        __target_switch
-        {
-        case glsl:
-            __intrinsic_asm "(gl_SubgroupID)";
-        case spirv:
-            return spirv_asm {
-                        OpCapability GroupNonUniform;
-                        result:$$uint = OpLoad builtin(SubgroupId:uint);
-                    };
-        }
+        return WaveGetWaveIndex();
     }
 }
 
@@ -8711,292 +8765,119 @@ public vector<T,N> subgroupShuffleDown(vector<T,N> value, uint delta)
 // GL_KHR_shader_subgroup_clustered
 
 __generic<T : __BuiltinArithmeticType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredAdd(T value, uint clusterSize)
+public T subgroupClusteredAdd(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredAdd($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFAdd $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformIAdd $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredSum(value, clusterSize);
 }
 
 __generic<T : __BuiltinArithmeticType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredMul(T value, uint clusterSize)
+public T subgroupClusteredMul(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredMul($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFMul $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformIMul $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredProduct(value, clusterSize);
 }
 
 __generic<T : __BuiltinArithmeticType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredMin(T value, uint clusterSize)
+public T subgroupClusteredMin(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredMin($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFMin $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isSignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformSMin $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isUnsignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformUMin $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredMin(value, clusterSize);
 }
 
 __generic<T : __BuiltinArithmeticType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredMax(T value, uint clusterSize)
+public T subgroupClusteredMax(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredMax($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFMax $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isSignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformSMax $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isUnsignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered;  OpGroupNonUniformUMax $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredMax(value, clusterSize);
 }
 
 __generic<T : __BuiltinLogicalType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredAnd(T value, uint clusterSize)
+public T subgroupClusteredAnd(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredAnd($0, $1)";
-    case spirv:
-        if (__isBool<T>()) return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformLogicalAnd $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformBitwiseAnd $$T result Subgroup ClusteredReduce $value $clusterSize};
-    }
+    return WaveClusteredBitAnd(value, clusterSize);
 }
 
 __generic<T : __BuiltinLogicalType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredOr(T value, uint clusterSize)
+public T subgroupClusteredOr(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredOr($0, $1)";
-    case spirv:
-        if (__isBool<T>()) return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformLogicalOr $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformBitwiseOr $$T result Subgroup ClusteredReduce $value $clusterSize};
-    }
+    return WaveClusteredBitOr(value, clusterSize);
 }
 
 
 
 __generic<T : __BuiltinLogicalType>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public T subgroupClusteredXor(T value, uint clusterSize)
+public T subgroupClusteredXor(T value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredXor($0, $1)";
-    case spirv:
-        if (__isBool<T>()) return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformLogicalXor $$T result Subgroup ClusteredReduce $value $clusterSize};
-        else return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformBitwiseXor $$T result Subgroup ClusteredReduce $value $clusterSize};
-    }
+    return WaveClusteredBitXor(value, clusterSize);
 }
 
 
 
 __generic<T : __BuiltinArithmeticType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredAdd(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredAdd(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredAdd($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered;
-            OpGroupNonUniformFAdd $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformIAdd $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredSum(value, clusterSize);
 }
 
 __generic<T : __BuiltinArithmeticType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredMul(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredMul(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredMul($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFMul $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformIMul $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredProduct(value, clusterSize);
 }
 
 __generic<T : __BuiltinArithmeticType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredMin(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredMin(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredMin($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFMin $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isSignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformSMin $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isUnsignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformUMin $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredMin(value, clusterSize);
 }
 
 __generic<T : __BuiltinArithmeticType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredMax(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredMax(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredMax($0, $1)";
-    case spirv:
-        if (__isFloat<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformFMax $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isSignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformSMax $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else if (__isUnsignedInt<T>())
-            return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered;  OpGroupNonUniformUMax $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return value;
-    }
+    return WaveClusteredMax(value, clusterSize);
 }
 
 __generic<T : __BuiltinLogicalType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredAnd(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredAnd(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredAnd($0, $1)";
-    case spirv:
-        if (__isBool<T>()) return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformLogicalAnd $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformBitwiseAnd $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-    }
+    return WaveClusteredBitAnd(value, clusterSize);
 }
 
 __generic<T : __BuiltinLogicalType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredOr(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredOr(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredOr($0, $1)";
-    case spirv:
-        if (__isBool<T>()) return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformLogicalOr $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformBitwiseOr $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-    }
+    return WaveClusteredBitOr(value, clusterSize);
 }
 
 __generic<T : __BuiltinLogicalType, let N : int>
-__spirv_version(1.3)
-__glsl_extension(GL_KHR_shader_subgroup_clustered)
 [ForceInline]
 [require(glsl_spirv, subgroup_clustered)]
-public vector<T,N> subgroupClusteredXor(vector<T,N> value, uint clusterSize)
+public vector<T,N> subgroupClusteredXor(vector<T,N> value, constexpr uint clusterSize)
 {
-    shader_subgroup_preamble<T>();
-    __target_switch
-    {
-    case glsl:
-        __intrinsic_asm "subgroupClusteredXor($0, $1)";
-    case spirv:
-        if (__isBool<T>()) return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformLogicalXor $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-        else return spirv_asm {OpCapability GroupNonUniformArithmetic; OpCapability GroupNonUniformClustered; OpGroupNonUniformBitwiseXor $$vector<T,N> result Subgroup ClusteredReduce $value $clusterSize};
-    }
+    return WaveClusteredBitXor(value, clusterSize);
 }
 
 // GL_KHR_shader_subgroup_quad
@@ -9918,7 +9799,7 @@ public uint atomicCounterDecrement(atomic_uint c)
         // we want a discarded side effect and then return the new value
         return spirv_asm
         {
-            %discardedValue:$$uint = OpAtomicIDecrement $c Device AtomicCounterMemory;
+            %__discardedValue:$$uint = OpAtomicIDecrement $c Device AtomicCounterMemory;
             OpLoad $$uint result $c
         };
     }
@@ -10590,7 +10471,7 @@ $}
     __generic<T>
     [__NoSideEffect]
     [ForceInline]
-    [require(glsl_hlsl_spirv, subpass)]
+    [require(glsl_hlsl_metal_spirv, subpass)]
     public T subpassLoad(__SubpassImpl<T,0> subpass)
     {
         return subpass.SubpassLoad();
@@ -10598,7 +10479,7 @@ $}
     __generic<T>
     [__NoSideEffect]
     [ForceInline]
-    [require(glsl_hlsl_spirv, subpass)]
+    [require(glsl_hlsl_metal_spirv, subpass)]
     public T subpassLoad(__SubpassImpl<T,1> subpass, int sample)
     {
         return subpass.SubpassLoad(sample);

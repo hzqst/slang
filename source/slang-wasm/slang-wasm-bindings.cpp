@@ -15,11 +15,38 @@ EMSCRIPTEN_BINDINGS(slang)
 
     function("getCompileTargets", &slang::wgsl::getCompileTargets);
 
+    // TypeScript types for the descriptors that GlobalSession.createSession reads. They mirror
+    // the C++ structs of the same names in include/slang.h. The fields must match the list on
+    // GlobalSession::createSession in slang-wasm.h. Enum fields are the integer values from
+    // include/slang.h; `profile` comes from findProfile().
+    register_type<slang::wgsl::js::CompilerOptionValue>(
+        "CompilerOptionValue",
+        "{ kind: number; intValue0?: number; intValue1?: number; stringValue0?: string; "
+        "stringValue1?: string }");
+    register_type<slang::wgsl::js::CompilerOptionEntry>(
+        "CompilerOptionEntry",
+        "{ name: number; value: CompilerOptionValue }");
+    register_type<slang::wgsl::js::PreprocessorMacroDesc>(
+        "PreprocessorMacroDesc",
+        "{ name: string; value?: string }");
+    register_type<slang::wgsl::js::TargetDesc>(
+        "TargetDesc",
+        "{ format: number; profile?: number; flags?: number; floatingPointMode?: number; "
+        "lineDirectiveMode?: number; forceGLSLScalarBufferLayout?: boolean; "
+        "compilerOptionEntries?: CompilerOptionEntry[] }");
+    register_type<slang::wgsl::js::SessionDesc>(
+        "SessionDesc",
+        "{ targets?: TargetDesc[]; defaultMatrixLayoutMode?: number; searchPaths?: string[]; "
+        "preprocessorMacros?: PreprocessorMacroDesc[]; "
+        "compilerOptionEntries?: CompilerOptionEntry[] }");
+    register_type<slang::wgsl::js::SessionDescOrTarget>(
+        "SessionDescOrTarget",
+        "SessionDesc | number");
+
     class_<slang::wgsl::GlobalSession>("GlobalSession")
-        .function(
-            "createSession",
-            &slang::wgsl::GlobalSession::createSession,
-            allow_raw_pointers());
+        .function("createSession", &slang::wgsl::GlobalSession::createSession, allow_raw_pointers())
+        .function("findProfile", &slang::wgsl::GlobalSession::findProfile)
+        .function("getBuiltinModuleSource", &slang::wgsl::GlobalSession::getBuiltinModuleSource);
 
     function("createGlobalSession", &slang::wgsl::createGlobalSession, allow_raw_pointers());
 
@@ -74,7 +101,8 @@ EMSCRIPTEN_BINDINGS(slang)
             "getUserAttributeByIndex",
             &slang::wgsl::VariableReflection::getUserAttributeByIndex,
             allow_raw_pointers())
-        .function("hasDefaultValue", &slang::wgsl::VariableReflection::hasDefaultValue);
+        .function("hasDefaultValue", &slang::wgsl::VariableReflection::hasDefaultValue)
+        .function("getDefaultValueBlob", &slang::wgsl::VariableReflection::getDefaultValueBlob);
 
 
     class_<slang::wgsl::VariableLayoutReflection>("VariableLayoutReflection")
@@ -157,7 +185,12 @@ EMSCRIPTEN_BINDINGS(slang)
         .value("Int8", slang::TypeReflection::ScalarType::Int8)
         .value("UInt8", slang::TypeReflection::ScalarType::UInt8)
         .value("Int16", slang::TypeReflection::ScalarType::Int16)
-        .value("UInt16", slang::TypeReflection::ScalarType::UInt16);
+        .value("UInt16", slang::TypeReflection::ScalarType::UInt16)
+        .value("IntPtr", slang::TypeReflection::ScalarType::IntPtr)
+        .value("UIntPtr", slang::TypeReflection::ScalarType::UIntPtr)
+        .value("BFloat16", slang::TypeReflection::ScalarType::BFloat16)
+        .value("FloatE4M3", slang::TypeReflection::ScalarType::FloatE4M3)
+        .value("FloatE5M2", slang::TypeReflection::ScalarType::FloatE5M2);
 
     class_<slang::wgsl::TypeReflection>("TypeReflection")
         .function("getScalarType", &slang::wgsl::TypeReflection::getScalarType)
@@ -237,6 +270,14 @@ EMSCRIPTEN_BINDINGS(slang)
         .function(
             "findFunctionByName",
             &slang::wgsl::ProgramLayout::findFunctionByName,
+            allow_raw_pointers())
+        .function(
+            "findTypeByName",
+            &slang::wgsl::ProgramLayout::findTypeByName,
+            allow_raw_pointers())
+        .function(
+            "findVarByNameInType",
+            &slang::wgsl::ProgramLayout::findVarByNameInType,
             allow_raw_pointers());
 
     enum_<slang::BindingType>("BindingType")

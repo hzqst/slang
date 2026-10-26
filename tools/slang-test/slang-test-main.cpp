@@ -1,37 +1,40 @@
 // slang-test-main.cpp
 
-#include "../../source/compiler-core/slang-artifact-desc-util.h"
-#include "../../source/compiler-core/slang-artifact-helper.h"
-#include "../../source/core/slang-byte-encode-util.h"
-#include "../../source/core/slang-castable.h"
-#include "../../source/core/slang-char-util.h"
-#include "../../source/core/slang-hex-dump-util.h"
-#include "../../source/core/slang-io.h"
-#include "../../source/core/slang-memory-arena.h"
-#include "../../source/core/slang-process-util.h"
-#include "../../source/core/slang-render-api-util.h"
-#include "../../source/core/slang-shared-library.h"
-#include "../../source/core/slang-std-writers.h"
-#include "../../source/core/slang-string-escape-util.h"
-#include "../../source/core/slang-string-util.h"
-#include "../../source/core/slang-token-reader.h"
-#include "../../source/core/slang-type-text-util.h"
+#include "compiler-core/slang-artifact-desc-util.h"
+#include "compiler-core/slang-artifact-helper.h"
+#include "core/slang-byte-encode-util.h"
+#include "core/slang-castable.h"
+#include "core/slang-char-util.h"
+#include "core/slang-hex-dump-util.h"
+#include "core/slang-io.h"
+#include "core/slang-memory-arena.h"
+#include "core/slang-process-util.h"
+#include "core/slang-render-api-util.h"
+#include "core/slang-shared-library.h"
+#include "core/slang-std-writers.h"
+#include "core/slang-string-escape-util.h"
+#include "core/slang-string-util.h"
+#include "core/slang-test-tool-util.h"
+#include "core/slang-token-reader.h"
+#include "core/slang-type-text-util.h"
 #include "slang-com-helper.h"
 #include "unit-test/slang-unit-test.h"
 #undef SLANG_UNIT_TEST
 
-#include "../../source/compiler-core/slang-artifact-associated-impl.h"
-#include "../../source/compiler-core/slang-downstream-compiler.h"
-#include "../../source/compiler-core/slang-language-server-protocol.h"
-#include "../../source/compiler-core/slang-nvrtc-compiler.h"
-#include "../render-test/slang-support.h"
+#include "compiler-core/slang-artifact-associated-impl.h"
+#include "compiler-core/slang-downstream-compiler.h"
+#include "compiler-core/slang-language-server-protocol.h"
+#include "compiler-core/slang-nvrtc-compiler.h"
 #include "diagnostic-annotation-util.h"
 #include "directory-util.h"
 #include "options.h"
 #include "parse-diagnostic-util.h"
+#include "render-test/slang-support.h"
+#include "slang-test-optimization-options.h"
 #include "slangc-tool.h"
 #include "slangi-tool.h"
 #include "test-context.h"
+#include "test-output-path-util.h"
 #include "test-reporter.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -44,10 +47,14 @@
 #include <stdlib.h>
 
 #define SLANG_PRELUDE_NAMESPACE CPPPrelude
-#include "../../prelude/slang-cpp-types.h"
+#include "slang-cpp-types.h"
 
 #include <atomic>
 #include <thread>
+
+#if SLANG_UNIX_FAMILY
+#include <signal.h>
+#endif
 
 #if defined(_WIN32)
 #include <slang-rhi/agility-sdk.h>
@@ -162,7 +169,10 @@ typedef TestResult (*TestCallback)(TestContext* context, TestInput& input);
 // Globals
 
 // Pre declare
-static void _addRenderTestOptions(const Options& options, CommandLine& ioCmdLine);
+static void _addRenderTestOptions(
+    const Options& options,
+    CommandLine& ioCmdLine,
+    bool allowCacheRHI);
 
 /* !!!!!!!!!!!!!!!!!!!!!!!!!!!!! Functions !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
 
@@ -552,6 +562,30 @@ static void applyMacroSubstitution(String filePath, TestDetails& details)
     }
 }
 
+// Normalizes and validates the output-path arguments of a parsed test directive, reporting any
+// rejection (an absolute `-o` / `-separate-debug-info-output` path) as a run error against
+// `filePath` so the test fails rather than silently running with an unportable path.
+static SlangResult _normalizeTestOutputPaths(
+    const String& filePath,
+    List<String>& args,
+    TestContext* context)
+{
+    String error;
+    const SlangResult res = normalizeTestOutputPathsForTestFile(filePath, args, error);
+    if (SLANG_FAILED(res))
+    {
+        // Every path that reaches directive parsing installs a reporter first, so a missing one is
+        // a programming error rather than a case to handle.
+        SLANG_ASSERT(context && context->getTestReporter());
+        context->getTestReporter()->messageFormat(
+            TestMessageType::RunError,
+            "Invalid test directive in file '%s': %s",
+            filePath.getBuffer(),
+            error.getBuffer());
+    }
+    return res;
+}
+
 // Try to read command-line options from the test file itself
 static SlangResult _gatherTestsForFile(
     TestCategorySet* categorySet,
@@ -732,6 +766,8 @@ static SlangResult _gatherTestsForFile(
 
             // Apply the file wide options
             _combineOptions(categorySet, fileOptions, testDetails.options);
+            SLANG_RETURN_ON_FAIL(
+                _normalizeTestOutputPaths(filePath, testDetails.options.args, context));
 
             outTestList->tests.add(testDetails);
         }
@@ -762,6 +798,8 @@ static SlangResult _gatherTestsForFile(
 
             // Apply the file wide options
             _combineOptions(categorySet, fileOptions, testDetails.options);
+            SLANG_RETURN_ON_FAIL(
+                _normalizeTestOutputPaths(filePath, testDetails.options.args, context));
 
             // Mark that it is a diagnostic test
             testDetails.options.type = TestOptions::Type::Diagnostic;
@@ -1141,7 +1179,156 @@ Result spawnAndWaitProxy(
     return res;
 }
 
-static Result _executeRPC(
+/// Why an RPC attempt did not produce a result.
+///
+/// The distinction that matters is Lost vs TimedOut. A lost connection says nothing at all
+/// about the test that was in flight -- the request never completed, so there is no verdict
+/// to report -- whereas a timeout is a statement about this test: it ran and did not finish.
+/// Collapsing the two, as this code used to, means a server that dies for its own reasons is
+/// recorded as "this test failed", which is simply false.
+enum class RPCAttemptOutcome
+{
+    Ok,            ///< A result came back (whatever the test's own verdict is).
+    Lost,          ///< The connection closed or errored: a running server went away.
+    StartFailed,   ///< No server could be spawned, so nothing ever ran.
+    TimedOut,      ///< The server is alive but did not answer in connectionTimeOutInMs.
+    ProtocolError, ///< A reply arrived but was not the expected result message.
+    SendFailed     ///< The request could not even be written.
+};
+
+/// Describe the death of a test server as precisely as the OS will let us.
+///
+/// Everything here was previously discarded. The transport already distinguishes a closed
+/// pipe from a read error from a timeout (HTTPPacketConnection::getReadState), and the
+/// process object already knows the exit status -- but the only thing that reached the log
+/// was the name of the function that failed, which is the one detail that cannot tell an
+/// OOM kill from a segfault from a clean exit.
+static void _reportServerLoss(
+    TestContext* context,
+    JSONRPCConnection* rpcConnection,
+    RPCAttemptOutcome outcome,
+    int requestOrdinal,
+    const char* phase)
+{
+    StringBuilder detail;
+
+    SLANG_RELEASE_ASSERT(rpcConnection);
+    auto* connection = rpcConnection->getUnderlyingConnection();
+
+    switch (outcome)
+    {
+    case RPCAttemptOutcome::SendFailed:
+        detail << "the request could not be written, though the server is still running";
+        break;
+    case RPCAttemptOutcome::TimedOut:
+        detail << "no reply within the timeout";
+        break;
+    case RPCAttemptOutcome::Lost:
+        if (!connection)
+        {
+            detail << "no transport";
+        }
+        else if (connection->getReadState() == HTTPPacketConnection::ReadState::Closed)
+        {
+            detail << "the server closed the connection";
+        }
+        else if (connection->getReadState() == HTTPPacketConnection::ReadState::Error)
+        {
+            detail << "the connection errored";
+        }
+        else
+        {
+            // Header, Content or Done: the transport saw no failure, so the loss was
+            // established by the process being gone rather than by the pipe. Header does
+            // mean nothing was read on this connection, but Content and Done reach here too
+            // (via the sendCall path, where an earlier packet was read), so this says only
+            // what is certain -- not that the death fell between requests.
+            detail << "the server is gone";
+        }
+        break;
+    default:
+        // Ok and ProtocolError are not losses. Reaching here means a caller labelled an
+        // outcome wrongly, and the result would be a "test server lost" line for a server
+        // that is fine -- the same misreporting this whole change exists to remove.
+        SLANG_RELEASE_ASSERT(!"_reportServerLoss called with a non-loss outcome");
+        break;
+    }
+
+    // How the server ended separates the leading explanations at a glance: killed by SIGKILL
+    // is the OOM killer, SIGSEGV is a crash, and an ordinary exit status means it chose to
+    // stop. Reported as a signal rather than as a shell-style 137/139 because that is what
+    // the OS actually told us -- Unix exit statuses are narrowed to int8_t to round-trip
+    // negative return codes, so 137 would surface as -119 and a signal death would surface
+    // as nothing at all.
+    if (auto* process = rpcConnection->getProcess())
+    {
+        if (!process->isTerminated())
+        {
+            detail << ", server process still running";
+        }
+        else if (const int32_t signalNumber = process->getTerminationSignal())
+        {
+            detail << ", server killed by signal " << signalNumber;
+#if SLANG_UNIX_FAMILY
+            // Named only where the constants exist: signal.h is Unix-guarded above, and the
+            // MSVC CRT has no SIGKILL at all. The number is always printed, so a Windows
+            // build loses nothing but the gloss -- and cannot report a signal anyway.
+            if (signalNumber == SIGKILL)
+            {
+                detail << " (SIGKILL -- typically the OOM killer)";
+            }
+            else if (signalNumber == SIGSEGV)
+            {
+                detail << " (SIGSEGV -- a crash)";
+            }
+#endif
+        }
+        else
+        {
+            detail << ", server exited with status " << process->getReturnValue();
+        }
+    }
+
+    // The lead phrase follows the OUTCOME. Hardcoding "lost" made a timeout claim the server
+    // was gone when it is alive-but-slow, and made a send failure emit "test server lost ...
+    // the request could not be written, though the server is still running" -- one line
+    // asserting both halves of a contradiction, in a change whose whole point is that these
+    // logs stop lying about what happened.
+    const char* lead = "test server lost";
+    switch (outcome)
+    {
+    case RPCAttemptOutcome::TimedOut:
+        lead = "test server did not answer";
+        break;
+    case RPCAttemptOutcome::SendFailed:
+        lead = "test server could not be sent to";
+        break;
+    default:
+        break;
+    }
+
+    // "died ON request N", not "after serving N": advanceRPCRequestOrdinal() numbers the request
+    // being sent, so the server had answered N-1 of them. Stated as the ordinal it died on
+    // because that is the number worth comparing across runs -- if deaths cluster near a fixed
+    // ordinal the server is accumulating something per request, and an off-by-one in the
+    // instrument would misplace exactly that clustering.
+    context->getTestReporter()->messageFormat(
+        TestMessageType::RunError,
+        "%s in %s on request #%d of this connection (it had answered %d): %s",
+        lead,
+        phase,
+        requestOrdinal,
+        requestOrdinal - 1,
+        detail.produceString().getBuffer());
+}
+
+/// One RPC attempt.
+///
+/// Records no pass/fail VERDICT for the test -- the caller decides what a non-Ok outcome
+/// means. Server-loss diagnostics are still emitted from here, which is the distinction the
+/// old wording blurred. outRes is written only on Ok, so a failed attempt leaves whatever the
+/// caller initialised it with rather than a half-populated result.
+static RPCAttemptOutcome _executeRPCOnce(
     TestContext* context,
     SpawnType spawnType,
     const UnownedStringSlice& method,
@@ -1159,40 +1346,85 @@ static Result _executeRPC(
     JSONRPCConnection* rpcConnection = context->getOrCreateJSONRPCConnection();
     if (!rpcConnection)
     {
+        // NOT Lost. Nothing was spawned, so no server closed a connection and no request
+        // was ever sent -- attributing this to the test would let a missing test-server
+        // binary or a fork failure be reported as "this test killed a freshly spawned test
+        // server twice", which names an innocent input for a broken machine.
         context->getTestReporter()->messageFormat(
             TestMessageType::RunError,
-            "JSON RPC failure: getOrCreateJSONRPCConnection()");
-        return SLANG_FAIL;
+            "JSON RPC failure: getOrCreateJSONRPCConnection() -- no test server could be "
+            "spawned, so this test never ran");
+        return RPCAttemptOutcome::StartFailed;
     }
+
+    const int requestOrdinal = context->advanceRPCRequestOrdinal();
 
     // Execute
     if (SLANG_FAILED(rpcConnection->sendCall(method, rttiInfo, args)))
     {
-        context->getTestReporter()->messageFormat(
-            TestMessageType::RunError,
-            "JSON RPC failure: sendCall()");
+        // A write that fails because the peer is GONE is a lost server, not a bad request.
+        // A server that dies between requests leaves the next test writing into a closed
+        // pipe, and that test has not run at all yet -- blaming it would be the same false
+        // verdict this function exists to stop, just moved one step earlier. Asked of the
+        // process rather than the transport because nothing has been read on this connection,
+        // so the read state has no opinion to give.
+        //
+        // Give the OS a moment to answer, rather than asking once and believing a "no". The
+        // write can fail before the peer's exit has been observed, and WinProcess's
+        // isTerminated() is a zero-timeout wait that then reports a dead server as running --
+        // which classified the loss as SendFailed, skipped the retry, and failed a test that
+        // had not run. Only on the failure path, so a healthy run pays nothing.
+        bool serverGone = !rpcConnection->isActive();
+        if (!serverGone)
+        {
+            if (auto* process = rpcConnection->getProcess())
+            {
+                static const Int kServerExitGraceInMs = 250;
+                serverGone = process->waitForTermination(kServerExitGraceInMs);
+            }
+        }
+        const RPCAttemptOutcome outcome =
+            serverGone ? RPCAttemptOutcome::Lost : RPCAttemptOutcome::SendFailed;
+
+        _reportServerLoss(context, rpcConnection, outcome, requestOrdinal, "sendCall");
 
         context->destroyRPCConnection();
-        return SLANG_FAIL;
+        return outcome;
     }
 
     // Wait for the result
-    if (SLANG_FAILED(rpcConnection->waitForResult(context->connectionTimeOutInMs)))
-    {
-        context->getTestReporter()->messageFormat(
-            TestMessageType::RunError,
-            "JSON RPC failure: waitForResult()");
-    }
+    const bool waitFailed =
+        SLANG_FAILED(rpcConnection->waitForResult(context->connectionTimeOutInMs));
 
-    if (!rpcConnection->hasMessage())
+    if (waitFailed || !rpcConnection->hasMessage())
     {
-        context->getTestReporter()->messageFormat(
-            TestMessageType::RunError,
-            "JSON RPC failure: hasMessage()");
+        // A malformed HTTP header or JSON value leaves the connection unusable just like EOF,
+        // but starting a fresh server cannot repair a protocol disagreement. Keep it out of the
+        // loss retry and attribution paths.
+        const auto readError = rpcConnection->getReadError();
+        if (readError == JSONRPCConnection::ReadError::Protocol)
+        {
+            context->getTestReporter()->message(
+                TestMessageType::RunError,
+                "JSON RPC protocol error: the test server returned a malformed HTTP or JSON "
+                "response");
+            context->destroyRPCConnection();
+            return RPCAttemptOutcome::ProtocolError;
+        }
 
-        // We can assume somethings gone wrong. So lets kill the connection and fail.
+        // A live-but-slow server has no read error and is a timeout (this test's problem), while
+        // EOF or a transport failure is a lost connection (not this test's problem).
+        const bool serverGone = readError == JSONRPCConnection::ReadError::ConnectionClosed ||
+                                readError == JSONRPCConnection::ReadError::Transport;
+        const RPCAttemptOutcome outcome =
+            serverGone ? RPCAttemptOutcome::Lost : RPCAttemptOutcome::TimedOut;
+
+        _reportServerLoss(context, rpcConnection, outcome, requestOrdinal, "waitForResult");
+
+        // Either way the connection is unusable now: a timed-out request may still land later
+        // and would then be read as the answer to the NEXT request.
         context->destroyRPCConnection();
-        return SLANG_FAIL;
+        return outcome;
     }
 
     if (rpcConnection->getMessageType() != JSONRPCMessageType::Result)
@@ -1202,7 +1434,7 @@ static Result _executeRPC(
             "JSON RPC failure: getMessageType() != JSONRPCMessageType::Result");
 
         context->destroyRPCConnection();
-        return SLANG_FAIL;
+        return RPCAttemptOutcome::ProtocolError;
     }
 
     // Get the result
@@ -1214,7 +1446,7 @@ static Result _executeRPC(
             "JSON RPC failure: getMessage()");
 
         context->destroyRPCConnection();
-        return SLANG_FAIL;
+        return RPCAttemptOutcome::ProtocolError;
     }
 
     outRes.resultCode = exeRes.returnCode;
@@ -1222,7 +1454,126 @@ static Result _executeRPC(
     outRes.standardOutput = exeRes.stdOut;
     outRes.debugLayer = exeRes.debugLayer;
 
-    return SLANG_OK;
+    return RPCAttemptOutcome::Ok;
+}
+
+static Result _executeRPC(
+    TestContext* context,
+    SpawnType spawnType,
+    const UnownedStringSlice& method,
+    const RttiInfo* rttiInfo,
+    const void* args,
+    ExecuteResult& outRes)
+{
+    const RPCAttemptOutcome first =
+        _executeRPCOnce(context, spawnType, method, rttiInfo, args, outRes);
+
+    if (first == RPCAttemptOutcome::Ok)
+    {
+        return SLANG_OK;
+    }
+
+    // Lost and StartFailed retry, kept distinct because only Lost can be charged to the test:
+    // nothing ran on a server that never started.
+    //
+    // ProtocolError retries too. This used to reason that a wire-format disagreement would
+    // repeat on a new process, but the errors seen are not that: ~7 per 6300-test run, on
+    // different tests each time, each passing on other runs (#12534). They are replies
+    // corrupted in flight, which a fresh server discriminates -- and a real disagreement
+    // still repeats and is charged to the test below.
+    //
+    // The rest do not:
+    // - TimedOut re-pays connectionTimeOutInMs plus a core-module recompile on the new server.
+    // - SendFailed never got a reply to corrupt; the request was never written.
+    const bool isRetryable = first == RPCAttemptOutcome::Lost ||
+                             first == RPCAttemptOutcome::StartFailed ||
+                             first == RPCAttemptOutcome::ProtocolError;
+    if (!isRetryable)
+    {
+        return SLANG_FAIL;
+    }
+
+    // _executeRPCOnce already tore the connection down, so this attempt gets a server that
+    // has served nothing else. That is what makes the retry a DISCRIMINATOR rather than a
+    // mask: an ambient death (whatever the server had accumulated, or whatever the machine
+    // was doing) does not reproduce on a virgin process, while an input that genuinely kills
+    // the compiler kills this one too -- and then the failure is reported against the test,
+    // where it belongs, instead of being retried until it looks green.
+    //
+    // One message per cause: only Lost and ProtocolError can be charged to the test, so the
+    // spawn path must not promise that a second failure will be.
+    const char* retryMessage = nullptr;
+    switch (first)
+    {
+    case RPCAttemptOutcome::StartFailed:
+        retryMessage =
+            "no test server could be spawned; retrying once, and a second failure to spawn "
+            "will fail this test without blaming its input";
+        break;
+    case RPCAttemptOutcome::ProtocolError:
+        retryMessage =
+            "retrying once on a freshly spawned test server; a second unreadable reply will "
+            "be reported against this test";
+        break;
+    case RPCAttemptOutcome::Lost:
+        retryMessage =
+            "retrying once on a freshly spawned test server; a second loss will be reported "
+            "against this test";
+        break;
+    default:
+        // Unreachable: isRetryable above admits exactly the three cases handled here. Listed
+        // rather than defaulted so that adding a fourth retryable outcome fails here instead
+        // of silently inheriting one of these messages.
+        SLANG_ASSERT(!"unhandled retryable outcome");
+        retryMessage = "retrying once on a freshly spawned test server";
+        break;
+    }
+    context->getTestReporter()->message(TestMessageType::RunError, retryMessage);
+
+    // Straight into outRes, as the first attempt does: _executeRPCOnce writes it only on
+    // success, so a second loss leaves the caller's own init() value intact rather than a
+    // half-populated copy.
+    const RPCAttemptOutcome second =
+        _executeRPCOnce(context, spawnType, method, rttiInfo, args, outRes);
+
+    if (second == RPCAttemptOutcome::Ok)
+    {
+        // The RPC is fine; if a server was actually lost, keep that loss countable. A recovered
+        // StartFailed means no server existed, so recording it here would make the summary claim
+        // that one died.
+        if (first == RPCAttemptOutcome::Lost)
+        {
+            context->getTestReporter()->recordTestServerLoss();
+        }
+        else if (first == RPCAttemptOutcome::ProtocolError)
+        {
+            context->getTestReporter()->recordTestServerProtocolError();
+        }
+        return SLANG_OK;
+    }
+
+    // Only a genuine second LOSS implicates the input. A spawn failure repeating means the
+    // machine still cannot start a server, which says nothing about the test.
+    if (second == RPCAttemptOutcome::Lost && first == RPCAttemptOutcome::Lost)
+    {
+        context->getTestReporter()->messageFormat(
+            TestMessageType::TestFailure,
+            "this test killed a freshly spawned test server twice in a row; treating it as a "
+            "crash caused by this input rather than as an unrelated server loss");
+    }
+
+    // Likewise a repeated PROTOCOL ERROR: two fresh servers failing to frame a reply to this
+    // one request reproduces, so it is the test's to answer for.
+    if (second == RPCAttemptOutcome::ProtocolError && first == RPCAttemptOutcome::ProtocolError)
+    {
+        context->getTestReporter()->messageFormat(
+            TestMessageType::TestFailure,
+            "this test drew an unreadable reply from a freshly spawned test server twice in a "
+            "row; treating it as caused by this input rather than as an unrelated malformed "
+            "response");
+    }
+
+    return SLANG_FAIL;
 }
 
 template<typename T>
@@ -1418,7 +1769,6 @@ static SlangResult _extractRenderTestRequirements(
     }
 
     // The native language for the API
-    SlangSourceLanguage nativeLanguage = SLANG_SOURCE_LANGUAGE_UNKNOWN;
     SlangCompileTarget target = SLANG_TARGET_NONE;
     SlangPassThrough passThru = SLANG_PASS_THROUGH_NONE;
 
@@ -1426,12 +1776,10 @@ static SlangResult _extractRenderTestRequirements(
     {
     case RenderApiType::D3D11:
         target = SLANG_DXBC;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_HLSL;
         passThru = SLANG_PASS_THROUGH_FXC;
         break;
     case RenderApiType::D3D12:
         target = SLANG_DXIL;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_HLSL;
         passThru = SLANG_PASS_THROUGH_DXC;
         if (useDxbc)
         {
@@ -1441,55 +1789,53 @@ static SlangResult _extractRenderTestRequirements(
         break;
     case RenderApiType::Vulkan:
         target = SLANG_SPIRV;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_GLSL;
         passThru = SLANG_PASS_THROUGH_GLSLANG;
         break;
     case RenderApiType::Metal:
         target = SLANG_METAL_LIB;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_METAL;
         passThru = SLANG_PASS_THROUGH_METAL;
         break;
     case RenderApiType::CPU:
         target = SLANG_SHADER_HOST_CALLABLE;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_CPP;
         passThru = SLANG_PASS_THROUGH_GENERIC_C_CPP;
         break;
     case RenderApiType::CUDA:
         target = SLANG_PTX;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_CUDA;
         passThru = SLANG_PASS_THROUGH_NVRTC;
         break;
     case RenderApiType::WebGPU:
         target = SLANG_WGSL;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_WGSL;
         passThru = SLANG_PASS_THROUGH_TINT;
         break;
     case RenderApiType::LLVM:
         target = SLANG_SHADER_HOST_CALLABLE;
-        nativeLanguage = SLANG_SOURCE_LANGUAGE_LLVM;
         passThru = SLANG_PASS_THROUGH_NONE;
         break;
     }
 
-    SlangSourceLanguage sourceLanguage = nativeLanguage;
     if (!usePassthru)
     {
-        sourceLanguage = SLANG_SOURCE_LANGUAGE_SLANG;
         passThru = SLANG_PASS_THROUGH_NONE;
     }
 
-    if (passThru == SLANG_PASS_THROUGH_NONE)
+    // In compile-only mode, we need neither the GPU API nor downstream compilers.
+    // render-test will use text output targets (HLSL, GLSL, MSL, CUDA source)
+    // that only exercise Slang's own emit code.
+    bool isCompileOnly =
+        cmdLine.findArgIndex(UnownedStringSlice::fromLiteral("-compile-only")) >= 0;
+    if (!isCompileOnly)
     {
-        // Work out backends needed based on the target
-        ioRequirements->addUsedBackends(_getPassThroughFlagsForTarget(target));
-    }
-    else
-    {
-        ioRequirements->addUsedBackEnd(passThru);
-    }
+        if (passThru == SLANG_PASS_THROUGH_NONE)
+        {
+            ioRequirements->addUsedBackends(_getPassThroughFlagsForTarget(target));
+        }
+        else
+        {
+            ioRequirements->addUsedBackEnd(passThru);
+        }
 
-    // Add the render api used
-    ioRequirements->addUsedRenderApi(renderApiType);
+        ioRequirements->addUsedRenderApi(renderApiType);
+    }
 
     return SLANG_OK;
 }
@@ -1519,6 +1865,14 @@ static SlangResult _extractSlangCTestRequirements(
             ioRequirements->addUsedBackends(_getPassThroughFlagsForTarget(target));
         }
     }
+
+    // `-emit-cpu-via-llvm` routes CPU/host-callable code generation through the slang-llvm
+    // backend regardless of the `-target`, so a test using it depends on that backend.
+    if (_hasOption(cmdLine.m_args, "-emit-cpu-via-llvm"))
+    {
+        ioRequirements->addUsedBackEnd(SLANG_PASS_THROUGH_LLVM);
+    }
+
     return SLANG_OK;
 }
 
@@ -1542,7 +1896,7 @@ static SlangResult _extractTestRequirements(const CommandLine& cmdLine, TestRequ
     {
         return _extractSlangCTestRequirements(cmdLine, ioInfo);
     }
-    else if (exeName == "slangi")
+    else if (exeName == "slangi" || exeName == "slang")
     {
         return SLANG_OK;
     }
@@ -1565,6 +1919,14 @@ static RenderApiFlags _getAvailableRenderApiFlags(TestContext* context)
         // Call the render-test tool asking it only to startup a specified render api
         // (taking into account adapter options)
 
+        // Only the positive "Check <api>: Supported" lines are noise to hide below Info verbosity
+        // (e.g. `-v failure`); the "Not Supported" lines and the accompanying startup-failure
+        // stderr/stdout dump are always shown, since a missing backend explains why tests are
+        // skipped and is exactly what someone running `-v failure` needs to see. CI runs at default
+        // (Info) and greps this output, so gating only the positive line keeps CI detection
+        // working.
+        const bool showDiscovery = context->options.verbosity >= VerbosityLevel::Info;
+
         RenderApiFlags availableRenderApiFlags = 0;
         for (int i = 0; i < int(RenderApiType::CountOf); ++i)
         {
@@ -1583,9 +1945,10 @@ static RenderApiFlags _getAvailableRenderApiFlags(TestContext* context)
                         SLANG_PASS_THROUGH_GENERIC_C_CPP)))
                 {
                     availableRenderApiFlags |= RenderApiFlags(1) << int(apiType);
-                    StdWriters::getOut().print(
-                        "Check %s: Supported\n",
-                        RenderApiUtil::getApiName(apiType).begin());
+                    if (showDiscovery)
+                        StdWriters::getOut().print(
+                            "Check %s: Supported\n",
+                            RenderApiUtil::getApiName(apiType).begin());
                 }
                 else
                 {
@@ -1608,7 +1971,9 @@ static RenderApiFlags _getAvailableRenderApiFlags(TestContext* context)
                 CommandLine cmdLine;
                 cmdLine.setExecutableLocation(
                     ExecutableLocation(context->options.binDir, "render-test"));
-                _addRenderTestOptions(context->options, cmdLine);
+                // Don't cache startup devices: a cached non-experimental device would prevent
+                // D3D12EnableExperimentalFeatures from succeeding in subsequent test runs.
+                _addRenderTestOptions(context->options, cmdLine, false);
                 // We just want to see if the device can be started up
                 cmdLine.addArg("-only-startup");
 
@@ -1624,9 +1989,10 @@ static RenderApiFlags _getAvailableRenderApiFlags(TestContext* context)
                         ToolReturnCode::Success)
                 {
                     availableRenderApiFlags |= RenderApiFlags(1) << int(apiType);
-                    StdWriters::getOut().print(
-                        "Check %s: Supported\n",
-                        RenderApiUtil::getApiName(apiType).begin());
+                    if (showDiscovery)
+                        StdWriters::getOut().print(
+                            "Check %s: Supported\n",
+                            RenderApiUtil::getApiName(apiType).begin());
                 }
                 else
                 {
@@ -1920,6 +2286,12 @@ static SlangResult _initSlangInterpreter(TestContext* context, CommandLine& ioCm
     return SLANG_OK;
 }
 
+static SlangResult _initSlangDispatcher(TestContext* context, CommandLine& ioCmdLine)
+{
+    ioCmdLine.setExecutableLocation(ExecutableLocation(context->options.binDir, "slang"));
+    return SLANG_OK;
+}
+
 static SlangResult _initSlangCompiler(TestContext* context, CommandLine& ioCmdLine)
 {
     ioCmdLine.setExecutableLocation(ExecutableLocation(context->options.binDir, "slangc"));
@@ -2020,6 +2392,39 @@ static SlangResult _createArtifactFromHexDump(
     return SLANG_OK;
 }
 
+static SlangResult _executeBinaryFile(const UnownedStringSlice& fileName, ExecuteResult& outExeRes)
+{
+    CommandLine cmdLine;
+
+#if SLANG_LINUX_FAMILY
+    // Consider a //TEST:EXECUTABLE: case in sanitizer CI. slangc first invokes an
+    // uninstrumented host compiler to produce the binary, and slang-test then runs it.
+    // Applying LD_PRELOAD to slang-test would also inject the sanitizer into the compiler
+    // and linker. Keep the requested value inert until this exact execution boundary instead.
+    StringBuilder preloadValue;
+    if (SLANG_SUCCEEDED(PlatformUtil::getEnvironmentVariable(
+            UnownedStringSlice("SLANG_TEST_EXECUTABLE_LD_PRELOAD"),
+            preloadValue)) &&
+        preloadValue.getLength())
+    {
+        cmdLine.setExecutableLocation(ExecutableLocation("env"));
+
+        StringBuilder preloadAssignment;
+        preloadAssignment << "LD_PRELOAD=" << preloadValue;
+        cmdLine.addArg(preloadAssignment.produceString());
+        cmdLine.addArg(fileName);
+
+        return ProcessUtil::execute(cmdLine, outExeRes);
+    }
+#endif
+
+    ExecutableLocation exe;
+    exe.setPath(fileName);
+    cmdLine.setExecutableLocation(exe);
+
+    return ProcessUtil::execute(cmdLine, outExeRes);
+}
+
 static SlangResult _executeBinary(const UnownedStringSlice& hexDump, ExecuteResult& outExeRes)
 {
     ComPtr<IArtifact> artifact;
@@ -2035,15 +2440,7 @@ static SlangResult _executeBinary(const UnownedStringSlice& hexDump, ExecuteResu
     SLANG_RETURN_ON_FAIL(artifact->requireFile(ArtifactKeep::Yes, fileRep.writeRef()));
 
     const auto fileName = fileRep->getPath();
-
-    // Execute it
-    ExecutableLocation exe;
-    exe.setPath(fileName);
-
-    CommandLine cmdLine;
-    cmdLine.setExecutableLocation(exe);
-
-    return ProcessUtil::execute(cmdLine, outExeRes);
+    return _executeBinaryFile(UnownedStringSlice(fileName), outExeRes);
 }
 
 static bool _areDiagnosticsEqual(const UnownedStringSlice& a, const UnownedStringSlice& b)
@@ -2115,6 +2512,7 @@ TestResult runDocTest(TestContext* context, TestInput& input)
     }
 
     _initSlangCompiler(context, cmdLine);
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -2242,6 +2640,7 @@ TestResult runExecutableTest(TestContext* context, TestInput& input)
             cmdLine.addArg(arg);
         }
     }
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
     ExecuteResult exeRes;
 
     // TODO(Yong) HACK:
@@ -2264,15 +2663,8 @@ TestResult runExecutableTest(TestContext* context, TestInput& input)
     else
     {
         // Execute the binary and see what we get
-        CommandLine cmdLine;
-
-        ExecutableLocation exe;
-        exe.setPath(moduleExePath);
-
-        cmdLine.setExecutableLocation(exe);
-
         ExecuteResult exeRes;
-        if (SLANG_FAILED(ProcessUtil::execute(cmdLine, exeRes)))
+        if (SLANG_FAILED(_executeBinaryFile(moduleExePath.getUnownedSlice(), exeRes)))
         {
             return TestResult::Fail;
         }
@@ -2305,6 +2697,15 @@ TestResult runExecutableTest(TestContext* context, TestInput& input)
     return TestResult::Pass;
 }
 
+// Inspect the raw result kind: deserializing into a zero-field struct via getMessage() accepts `{}`
+// but rejects JSON `null`, so it cannot detect a null result.
+static bool receivedNullResult(JSONRPCConnection* connection)
+{
+    JSONResultResponse resultResponse;
+    return SLANG_SUCCEEDED(connection->getRPC(&resultResponse)) &&
+           resultResponse.result.getKind() == JSONValue::Kind::Null;
+}
+
 TestResult runLanguageServerTest(TestContext* context, TestInput& input)
 {
     // We don't support running language server tests in parallel yet.
@@ -2329,7 +2730,53 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
     String fullPath;
     Path::getCanonical(input.filePath, fullPath);
     wsFolder.uri = URI::fromLocalFilePath(Path::getParentDirectory(fullPath).getUnownedSlice()).uri;
-    initParams.workspaceFolders.add(wsFolder);
+    if (input.testOptions->commandOptions.containsKey("workspace-search-path-order"))
+    {
+        // Keep the fixture roots outside the opened document's directory. Opening a document adds
+        // that directory as a search path, and putting the roots below it verifies their explicit
+        // workspaceFolders order without relying on recursive directory enumeration order.
+        auto fixtureDir = Path::getParentDirectory(fullPath);
+        wsFolder.name = "first";
+        wsFolder.uri =
+            URI::fromLocalFilePath(Path::combine(fixtureDir, "first-root").getUnownedSlice()).uri;
+        initParams.workspaceFolders.add(wsFolder);
+        wsFolder.name = "second";
+        wsFolder.uri =
+            URI::fromLocalFilePath(Path::combine(fixtureDir, "second-root").getUnownedSlice()).uri;
+        initParams.workspaceFolders.add(wsFolder);
+    }
+    else if (
+        input.testOptions->commandOptions.containsKey("additional-search-path-order") ||
+        input.testOptions->commandOptions.containsKey("workspace-search-toggle"))
+    {
+        auto fixtureDir = Path::getParentDirectory(fullPath);
+        wsFolder.name = "workspace";
+        wsFolder.uri =
+            URI::fromLocalFilePath(Path::combine(fixtureDir, "workspace-root").getUnownedSlice())
+                .uri;
+        initParams.workspaceFolders.add(wsFolder);
+    }
+    else if (input.testOptions->commandOptions.containsKey("root-uri-only"))
+        initParams.rootUri = wsFolder.uri;
+    else if (input.testOptions->commandOptions.containsKey("root-path-only"))
+        initParams.rootPath = Path::getParentDirectory(fullPath);
+    else
+    {
+        initParams.workspaceFolders.add(wsFolder);
+        if (input.testOptions->commandOptions.containsKey("multi-root"))
+        {
+            // Put an empty root last so the test detects implementations that retain only the
+            // final workspace folder's search paths.
+            LanguageServerProtocol::WorkspaceFolder emptyFolder;
+            emptyFolder.name = "empty";
+            emptyFolder.uri =
+                URI::fromLocalFilePath(
+                    Path::combine(Path::getParentDirectory(fullPath), "__empty_workspace_root__")
+                        .getUnownedSlice())
+                    .uri;
+            initParams.workspaceFolders.add(emptyFolder);
+        }
+    }
     if (SLANG_FAILED(connection->sendCall(
             LanguageServerProtocol::InitializeParams::methodName,
             &initParams,
@@ -2348,7 +2795,29 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
         return TestResult::Fail;
     }
 
-    // Send open document call.
+    // Configuration changes ask the client to refresh semantic tokens and inlay hints. Drain
+    // those requests before reading the response to a subsequent completion request.
+    auto sendConfig = [&](const char* key, JSONValue value) -> SlangResult
+    {
+        auto container = connection->getContainer();
+        JSONValue settingsValue = container->createObject(nullptr, 0);
+        container->setKeyValue(settingsValue, container->getKey(UnownedStringSlice(key)), value);
+
+        LanguageServerProtocol::DidChangeConfigurationParams configParams;
+        configParams.settings = settingsValue;
+        SLANG_RETURN_ON_FAIL(connection->sendCall(
+            LanguageServerProtocol::DidChangeConfigurationParams::methodName,
+            &configParams));
+
+        for (Index i = 0; i < 2; ++i)
+        {
+            SLANG_RETURN_ON_FAIL(connection->waitForResult(-1));
+            JSONRPCCall refreshCall;
+            SLANG_RETURN_ON_FAIL(connection->getRPC(&refreshCall));
+        }
+        return SLANG_OK;
+    };
+
     String testFileContent;
 
     if (SLANG_FAILED(File::readAllText(input.filePath, testFileContent)))
@@ -2356,6 +2825,139 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
         return TestResult::Fail;
     }
 
+    List<UnownedStringSlice> lines;
+    StringUtil::calcLines(testFileContent.getUnownedSlice(), lines);
+
+    // A `//CONFIG_REPLY:<section>=<json>` or `//CONFIG:<key>=<json>` directive holds a JSON value.
+    // It is parsed into the connection's container right before use, because the container is
+    // reset whenever a message is read.
+    auto parseConfigValue = [&](UnownedStringSlice text, JSONValue& outValue) -> SlangResult
+    {
+        return JSONRPCUtil::parseJSON(
+            text.trim(),
+            connection->getContainer(),
+            connection->getSink(),
+            outValue);
+    };
+
+    auto reportDirectiveError = [&](UnownedStringSlice line, const char* problem)
+    {
+        StringBuilder lineText;
+        lineText << line;
+        context->getTestReporter()->messageFormat(
+            TestMessageType::RunError,
+            "Invalid LANG_SERVER directive in '%s': %s: %s",
+            input.filePath.getBuffer(),
+            problem,
+            lineText.getBuffer());
+        return TestResult::Fail;
+    };
+
+    Dictionary<String, UnownedStringSlice> configReplies;
+    for (auto line : lines)
+    {
+        line = line.trimStart();
+        if (!line.startsWith("//"))
+            continue;
+        line = line.tail(2).trimStart();
+        if (!line.startsWith("CONFIG_REPLY:"))
+            continue;
+        if (!input.testOptions->commandOptions.containsKey("config-pull"))
+            return reportDirectiveError(line, "CONFIG_REPLY requires the config-pull option");
+        auto reply = line.tail(UnownedStringSlice("CONFIG_REPLY:").getLength());
+        Index eqIndex = reply.indexOf('=');
+        if (eqIndex < 0)
+            return reportDirectiveError(line, "expected <section>=<json>");
+        String section = reply.head(eqIndex).trim();
+        if (configReplies.containsKey(section))
+            return reportDirectiveError(line, "duplicate section");
+        configReplies[section] = reply.tail(eqIndex + 1);
+    }
+
+    List<LanguageServerProtocol::PublishDiagnosticsParams> diagnostics;
+    bool diagnosticsReceived = false;
+    // Every LANG_SERVER test shares one language server process, so a call the server sends must
+    // be read before the test ends or the next test reads it in place of its own response. A
+    // configuration message makes the server send zero or more refresh requests, depending on the
+    // setting and whether it changed. We set this flag whenever one is sent, and `waitForResponse`
+    // clears it, because the server sends those requests before it answers any later request.
+    bool mayHaveUnreadServerCalls = false;
+    // Record a `textDocument/publishDiagnostics` notification, or skip any other server-to-client
+    // call. The server never blocks on a reply to the calls it sends, so skipping is safe.
+    auto handleServerCall = [&](const JSONRPCCall& call) -> SlangResult
+    {
+        if (call.method != "textDocument/publishDiagnostics")
+            return SLANG_OK;
+        diagnosticsReceived = true;
+        LanguageServerProtocol::PublishDiagnosticsParams arg;
+        SLANG_RETURN_ON_FAIL(connection->getMessage(&arg));
+        diagnostics.add(arg);
+        return SLANG_OK;
+    };
+
+    // The harness answers the server's `workspace/configuration` request with one value per
+    // requested section, taken from `//CONFIG_REPLY:` lines, and JSON null for every other section.
+    // LSP requires null for a setting the client cannot provide, so this is the reply an editor
+    // without Slang-specific defaults (such as Zed) sends. Other server calls that arrive first are
+    // handled as `handleServerCall` does, and a request among them, such as
+    // `client/registerCapability`, is answered with a null result.
+    auto answerConfigRequest = [&]() -> SlangResult
+    {
+        for (;;)
+        {
+            SLANG_RETURN_ON_FAIL(connection->waitForResult(-1));
+            JSONRPCCall call;
+            SLANG_RETURN_ON_FAIL(connection->getRPC(&call));
+            if (call.method != LanguageServerProtocol::ConfigurationParams::methodName)
+            {
+                SLANG_RETURN_ON_FAIL(handleServerCall(call));
+                if (call.id.isValid())
+                    SLANG_RETURN_ON_FAIL(connection->sendNullResult(call.id));
+                continue;
+            }
+
+            LanguageServerProtocol::ConfigurationParams configParams;
+            SLANG_RETURN_ON_FAIL(
+                connection->toNativeArgsOrSendError(call.params, &configParams, call.id));
+            List<JSONValue> values;
+            for (auto& item : configParams.items)
+            {
+                JSONValue value = JSONValue::makeNull();
+                UnownedStringSlice replyText;
+                if (configReplies.tryGetValue(item.section, replyText))
+                    SLANG_RETURN_ON_FAIL(parseConfigValue(replyText, value));
+                values.add(value);
+            }
+            JSONResultResponse response;
+            response.id = call.id;
+            response.result =
+                connection->getContainer()->createArray(values.getBuffer(), values.getCount());
+            mayHaveUnreadServerCalls = true;
+            return connection->sendRPC(&response);
+        }
+    };
+
+    if (input.testOptions->commandOptions.containsKey("config-pull"))
+    {
+        if (SLANG_FAILED(connection->sendCall(UnownedStringSlice("initialized"))) ||
+            SLANG_FAILED(answerConfigRequest()))
+            return TestResult::Fail;
+    }
+
+    if (input.testOptions->commandOptions.containsKey("additional-search-path-order"))
+    {
+        // Configured search paths intentionally precede auto-discovered workspace paths. Exercise
+        // that contract through the same notification a real editor sends.
+        auto container = connection->getContainer();
+        auto fixtureDir = Path::getParentDirectory(fullPath);
+        auto additionalPath = Path::combine(fixtureDir, "additional-root");
+        JSONValue pathValue = container->createString(additionalPath.getUnownedSlice());
+        JSONValue pathsValue = container->createArray(&pathValue, 1);
+        if (SLANG_FAILED(sendConfig("slang.additionalSearchPaths", pathsValue)))
+            return TestResult::Fail;
+    }
+
+    // Send open document call.
     LanguageServerProtocol::DidOpenTextDocumentParams openDocParams;
     openDocParams.textDocument.version = 0;
     openDocParams.textDocument.uri = URI::fromLocalFilePath(fullPath.getUnownedSlice()).uri;
@@ -2364,32 +2966,50 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
         LanguageServerProtocol::DidOpenTextDocumentParams::methodName,
         &openDocParams,
         JSONValue::makeInt(1));
-    List<LanguageServerProtocol::PublishDiagnosticsParams> diagnostics;
-    bool diagnosticsReceived = false;
-    auto waitForNonDiagnosticResponse = [&]() -> SlangResult
+    auto waitForResponse = [&]() -> SlangResult
     {
-        repeat:
-            if (SLANG_FAILED(connection->waitForResult(-1)))
-                return SLANG_FAIL;
-            if (connection->getMessageType() == JSONRPCMessageType::Call)
+        for (;;)
+        {
+            SLANG_RETURN_ON_FAIL(connection->waitForResult(-1));
+            if (connection->getMessageType() != JSONRPCMessageType::Call)
             {
-                JSONRPCCall call;
-                connection->getRPC(&call);
-                if (call.method == "textDocument/publishDiagnostics")
-                {
-                    diagnosticsReceived = true;
-                    LanguageServerProtocol::PublishDiagnosticsParams arg;
-                    if (SLANG_FAILED(connection->getMessage(&arg)))
-                        return SLANG_FAIL;
-                    diagnostics.add(arg);
-                    goto repeat;
-                }
+                mayHaveUnreadServerCalls = false;
+                return SLANG_OK;
             }
-            return SLANG_OK;
+            JSONRPCCall call;
+            SLANG_RETURN_ON_FAIL(connection->getRPC(&call));
+            SLANG_RETURN_ON_FAIL(handleServerCall(call));
+        }
     };
 
-    List<UnownedStringSlice> lines;
-    StringUtil::calcLines(testFileContent.getUnownedSlice(), lines);
+    // Send a `//CONFIG:<key>=<json>` directive as a `workspace/didChangeConfiguration`
+    // notification. Any refresh requests it causes are read by the next `waitForResponse`. The
+    // server keeps formatting, inlay-hint, commit-character and trace options across `initialize`,
+    // so a test that changes one of them sets it back to its default before the test ends.
+    auto sendConfigNotification = [&](UnownedStringSlice directive) -> SlangResult
+    {
+        Index eqIndex = directive.indexOf('=');
+        if (eqIndex < 0)
+        {
+            reportDirectiveError(directive, "expected CONFIG:<key>=<json>");
+            return SLANG_FAIL;
+        }
+        JSONValue value;
+        SLANG_RETURN_ON_FAIL(parseConfigValue(directive.tail(eqIndex + 1), value));
+        auto container = connection->getContainer();
+        JSONValue settingsValue = container->createObject(nullptr, 0);
+        container->setKeyValue(
+            settingsValue,
+            container->getKey(directive.head(eqIndex).trim()),
+            value);
+
+        LanguageServerProtocol::DidChangeConfigurationParams configParams;
+        configParams.settings = settingsValue;
+        mayHaveUnreadServerCalls = true;
+        return connection->sendCall(
+            LanguageServerProtocol::DidChangeConfigurationParams::methodName,
+            &configParams);
+    };
 
     StringBuilder actualOutputSB;
     auto parseLocation = [&](UnownedStringSlice text, Index startPos, Int& linePos, Int& colPos)
@@ -2400,6 +3020,13 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
         return startPos;
     };
     int callId = 2;
+    // Items of the most recent COMPLETE (empty if it returned null or nothing), and the item picked
+    // by SAVE_COMPLETION_ITEM, so that a later RESOLVE_SAVED_ITEM can resolve an item that belongs
+    // to an earlier completion request. SAVE_COMPLETION_ITEM fails the test if the most recent
+    // COMPLETE has no item with that label, and RESOLVE_SAVED_ITEM fails it if no item was saved.
+    List<LanguageServerProtocol::CompletionItem> lastCompletionItems;
+    LanguageServerProtocol::CompletionItem savedCompletionItem;
+    bool hasSavedCompletionItem = false;
     for (auto line : lines)
     {
         line = line.trimStart();
@@ -2416,6 +3043,7 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
             params.position.line = int(linePos - 1);
             params.position.character = int(colPos - 1);
             params.textDocument.uri = openDocParams.textDocument.uri;
+            lastCompletionItems.clear();
             if (SLANG_FAILED(connection->sendCall(
                     LanguageServerProtocol::CompletionParams::methodName,
                     &params,
@@ -2423,26 +3051,160 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
             {
                 return TestResult::Fail;
             }
-            if (SLANG_FAILED(waitForNonDiagnosticResponse()))
+            if (SLANG_FAILED(waitForResponse()))
                 return TestResult::Fail;
             actualOutputSB << "--------\n";
-            LanguageServerProtocol::NullResponse nullResponse;
             List<LanguageServerProtocol::CompletionItem> completionItems;
-            if (SLANG_SUCCEEDED(connection->getMessage(&nullResponse)))
+            if (receivedNullResult(connection))
             {
                 actualOutputSB << "null\n";
             }
             else if (SLANG_SUCCEEDED(connection->getMessage(&completionItems)))
             {
+                lastCompletionItems = completionItems;
                 for (auto item : completionItems)
                 {
                     actualOutputSB << item.label << ": " << item.kind << " " << item.detail << " ";
                     for (auto ch : item.commitCharacters)
-                        actualOutputSB << ch;
+                    {
+                        if (ch == " ")
+                            actualOutputSB << "<space>";
+                        else
+                            actualOutputSB << ch;
+                    }
                     if (item.sortText.hasValue)
                         actualOutputSB << " sort(" << item.sortText.value << ")";
                     actualOutputSB << "\n";
                 }
+            }
+        }
+        else if (line.startsWith("SAVE_COMPLETION_ITEM:"))
+        {
+            auto label = line.tail(UnownedStringSlice("SAVE_COMPLETION_ITEM:").getLength()).trim();
+            bool found = false;
+            for (auto item : lastCompletionItems)
+            {
+                if (item.label.getUnownedSlice() == label)
+                {
+                    savedCompletionItem = item;
+                    hasSavedCompletionItem = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                return TestResult::Fail;
+        }
+        else if (line.startsWith("RESOLVE_SAVED_ITEM:"))
+        {
+            // This resolves the item saved by SAVE_COMPLETION_ITEM, which may come from an earlier
+            // completion request than the most recent one. The directive is matched with its
+            // trailing colon like the other directives, so that it cannot collide with a
+            // directive that merely shares a prefix; it takes no argument.
+            if (!hasSavedCompletionItem)
+                return TestResult::Fail;
+            if (SLANG_FAILED(connection->sendCall(
+                    UnownedStringSlice("completionItem/resolve"),
+                    &savedCompletionItem,
+                    JSONValue::makeInt(callId++))))
+            {
+                return TestResult::Fail;
+            }
+            if (SLANG_FAILED(waitForResponse()))
+                return TestResult::Fail;
+            actualOutputSB << "--------\n";
+            LanguageServerProtocol::CompletionItem resolved;
+            if (receivedNullResult(connection))
+            {
+                actualOutputSB << "null\n";
+            }
+            else if (SLANG_SUCCEEDED(connection->getMessage(&resolved)))
+            {
+                actualOutputSB << "label: " << resolved.label << "\n";
+                actualOutputSB << "detail: " << resolved.detail << "\n";
+            }
+        }
+        else if (line.startsWith("DISABLE_WORKSPACE_SEARCH"))
+        {
+            if (SLANG_FAILED(sendConfig(
+                    "slang.searchInAllWorkspaceDirectories",
+                    JSONValue::makeBool(false))))
+                return TestResult::Fail;
+            actualOutputSB << "--------\nsearchInAllWorkspaceDirectories: false\n";
+        }
+        else if (line.startsWith("CONFIG:"))
+        {
+            auto arg = line.tail(UnownedStringSlice("CONFIG:").getLength());
+            if (SLANG_FAILED(sendConfigNotification(arg)))
+                return TestResult::Fail;
+            actualOutputSB << "--------\nconfig: " << arg.trim() << "\n";
+        }
+        else if (line.trim() == "CONFIG_REPULL")
+        {
+            if (!input.testOptions->commandOptions.containsKey("config-pull"))
+                return reportDirectiveError(line, "CONFIG_REPULL requires the config-pull option");
+            // A `settings: null` notification asks the server to pull every setting again.
+            LanguageServerProtocol::DidChangeConfigurationParams configParams;
+            configParams.settings = JSONValue::makeNull();
+            if (SLANG_FAILED(connection->sendCall(
+                    LanguageServerProtocol::DidChangeConfigurationParams::methodName,
+                    &configParams)) ||
+                SLANG_FAILED(answerConfigRequest()))
+                return TestResult::Fail;
+            mayHaveUnreadServerCalls = true;
+            actualOutputSB << "--------\nconfig: re-pulled\n";
+        }
+        else if (line.startsWith("ON_TYPE_FORMAT:"))
+        {
+            // Only whether on-type formatting is enabled is reported: a disabled server answers
+            // null, and an enabled one answers a list of edits, which is empty when clang-format
+            // is unavailable.
+            auto arg = line.tail(UnownedStringSlice("ON_TYPE_FORMAT:").getLength());
+            Int linePos, colPos;
+            parseLocation(arg, 0, linePos, colPos);
+
+            LanguageServerProtocol::DocumentOnTypeFormattingParams params;
+            params.textDocument.uri = openDocParams.textDocument.uri;
+            params.position.line = int(linePos - 1);
+            params.position.character = int(colPos - 1);
+            params.ch = "}";
+            if (SLANG_FAILED(connection->sendCall(
+                    LanguageServerProtocol::DocumentOnTypeFormattingParams::methodName,
+                    &params,
+                    JSONValue::makeInt(callId++))))
+            {
+                return TestResult::Fail;
+            }
+            if (SLANG_FAILED(waitForResponse()))
+                return TestResult::Fail;
+            actualOutputSB << "--------\non-type formatting: "
+                           << (receivedNullResult(connection) ? "disabled" : "enabled") << "\n";
+        }
+        else if (line.trim() == "INLAY")
+        {
+            LanguageServerProtocol::InlayHintParams params;
+            params.textDocument.uri = openDocParams.textDocument.uri;
+            params.range.start.line = 0;
+            params.range.start.character = 0;
+            params.range.end.line = int(lines.getCount());
+            params.range.end.character = 0;
+            if (SLANG_FAILED(connection->sendCall(
+                    LanguageServerProtocol::InlayHintParams::methodName,
+                    &params,
+                    JSONValue::makeInt(callId++))))
+            {
+                return TestResult::Fail;
+            }
+            if (SLANG_FAILED(waitForResponse()))
+                return TestResult::Fail;
+            actualOutputSB << "--------\ninlay hints:\n";
+            List<LanguageServerProtocol::InlayHint> hints;
+            if (!receivedNullResult(connection) && SLANG_FAILED(connection->getMessage(&hints)))
+                return TestResult::Fail;
+            for (auto& hint : hints)
+            {
+                actualOutputSB << hint.position.line << "," << hint.position.character << " "
+                               << hint.label << "\n";
             }
         }
         else if (line.startsWith("SIGNATURE:"))
@@ -2462,12 +3224,11 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
             {
                 return TestResult::Fail;
             }
-            if (SLANG_FAILED(waitForNonDiagnosticResponse()))
+            if (SLANG_FAILED(waitForResponse()))
                 return TestResult::Fail;
             actualOutputSB << "--------\n";
-            LanguageServerProtocol::NullResponse nullResponse;
             LanguageServerProtocol::SignatureHelp sigInfo;
-            if (SLANG_SUCCEEDED(connection->getMessage(&nullResponse)))
+            if (receivedNullResult(connection))
             {
                 actualOutputSB << "null\n";
             }
@@ -2509,12 +3270,11 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
             {
                 return TestResult::Fail;
             }
-            if (SLANG_FAILED(waitForNonDiagnosticResponse()))
+            if (SLANG_FAILED(waitForResponse()))
                 return TestResult::Fail;
             actualOutputSB << "--------\n";
-            LanguageServerProtocol::NullResponse nullResponse;
             LanguageServerProtocol::Hover hover;
-            if (SLANG_SUCCEEDED(connection->getMessage(&nullResponse)))
+            if (receivedNullResult(connection))
             {
                 actualOutputSB << "null\n";
             }
@@ -2526,11 +3286,48 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
                 actualOutputSB << "\ncontent:\n" << hover.contents.value << "\n";
             }
         }
+        else if (line.startsWith("RESOLVE"))
+        {
+            // Drive completionItem/resolve for an item that carries a textEdit but no `data`
+            // (the file/import completion shape). LSP requires resolve to answer with the item,
+            // never null, so the server must echo it back with its textEdit preserved.
+            LanguageServerProtocol::TextEditCompletionItem item;
+            item.label = "resolveItem";
+            item.textEdit.newText = "resolveItem";
+            item.textEdit.range.start.line = 5;
+            item.textEdit.range.start.character = 0;
+            item.textEdit.range.end.line = 5;
+            item.textEdit.range.end.character = 3;
+            if (SLANG_FAILED(connection->sendCall(
+                    UnownedStringSlice("completionItem/resolve"),
+                    &item,
+                    JSONValue::makeInt(callId++))))
+            {
+                return TestResult::Fail;
+            }
+            if (SLANG_FAILED(waitForResponse()))
+                return TestResult::Fail;
+            actualOutputSB << "--------\n";
+            LanguageServerProtocol::TextEditCompletionItem resolved;
+            if (receivedNullResult(connection))
+            {
+                actualOutputSB << "null\n";
+            }
+            else if (SLANG_SUCCEEDED(connection->getMessage(&resolved)))
+            {
+                actualOutputSB << "label: " << resolved.label << "\n";
+                actualOutputSB << "textEdit: " << resolved.textEdit.newText << "\n";
+                actualOutputSB << "range: " << resolved.textEdit.range.start.line << ","
+                               << resolved.textEdit.range.start.character << " - "
+                               << resolved.textEdit.range.end.line << ","
+                               << resolved.textEdit.range.end.character << "\n";
+            }
+        }
         else if (line.startsWith("DIAGNOSTICS"))
         {
             if (!diagnosticsReceived)
             {
-                waitForNonDiagnosticResponse();
+                waitForResponse();
             }
             actualOutputSB << "--------\n";
             for (auto item : diagnostics)
@@ -2545,6 +3342,21 @@ TestResult runLanguageServerTest(TestContext* context, TestInput& input)
             }
         }
     }
+    // A configuration message sent after the last request may have left server calls unread (see
+    // `mayHaveUnreadServerCalls`). A document symbol request has no side effects, and the server
+    // answers it only after handling every message sent before it.
+    if (mayHaveUnreadServerCalls)
+    {
+        LanguageServerProtocol::DocumentSymbolParams params;
+        params.textDocument.uri = openDocParams.textDocument.uri;
+        if (SLANG_FAILED(connection->sendCall(
+                LanguageServerProtocol::DocumentSymbolParams::methodName,
+                &params,
+                JSONValue::makeInt(callId++))) ||
+            SLANG_FAILED(waitForResponse()))
+            return TestResult::Fail;
+    }
+
     LanguageServerProtocol::DidCloseTextDocumentParams closeDocParams;
     closeDocParams.textDocument.uri = URI::fromLocalFilePath(fullPath.getUnownedSlice()).uri;
     connection->sendCall(
@@ -2661,6 +3473,8 @@ TestResult runSimpleTest(TestContext* context, TestInput& input)
     {
         return TestResult::Ignored;
     }
+    // Keep compiler-based tests on the default optimization level unless a test opts out.
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -2723,6 +3537,7 @@ TestResult runSimpleLineTest(TestContext* context, TestInput& input)
     {
         cmdLine.addArg(arg);
     }
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -2822,6 +3637,41 @@ TestResult runInterpreterTest(TestContext* context, TestInput& input)
         [&input](auto e, auto a) { return _areResultsEqual(input.testOptions->type, e, a); });
 }
 
+TestResult runDispatcherTest(TestContext* context, TestInput& input)
+{
+    auto outputStem = input.outputStem;
+
+    CommandLine cmdLine;
+
+    for (auto arg : input.testOptions->args)
+    {
+        cmdLine.addArg(arg);
+    }
+
+    if (SLANG_FAILED(_initSlangDispatcher(context, cmdLine)))
+    {
+        return TestResult::Ignored;
+    }
+
+    ExecuteResult exeRes;
+    TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, SpawnType::UseExe, cmdLine, exeRes));
+
+    if (context->isCollectingRequirements())
+    {
+        return TestResult::Pass;
+    }
+
+    String actualOutput = getOutput(exeRes);
+
+    return _validateOutput(
+        context,
+        input,
+        actualOutput,
+        false,
+        "result code = 0\nstandard error = {\n}\nstandard output = {\n}\n",
+        [&input](auto e, auto a) { return _areResultsEqual(input.testOptions->type, e, a); });
+}
+
 TestResult runCompile(TestContext* context, TestInput& input)
 {
     auto outputStem = input.outputStem;
@@ -2846,6 +3696,48 @@ TestResult runCompile(TestContext* context, TestInput& input)
             cmdLine.addArg(arg);
         }
     }
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
+
+    ExecuteResult exeRes;
+    TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
+    if (context->isCollectingRequirements())
+    {
+        return TestResult::Pass;
+    }
+
+    if (exeRes.resultCode != 0)
+    {
+        auto reporter = context->getTestReporter();
+        if (reporter)
+        {
+            auto output = getOutput(exeRes);
+            reporter->message(TestMessageType::TestFailure, output);
+        }
+
+        return TestResult::Fail;
+    }
+
+    return TestResult::Pass;
+}
+
+TestResult runCompileTarget(TestContext* context, TestInput& input)
+{
+    auto outputStem = input.outputStem;
+
+    CommandLine cmdLine;
+    cmdLine.setExecutableLocation(ExecutableLocation(context->options.binDir, "render-test"));
+    cmdLine.addArg(input.filePath);
+    _addRenderTestOptions(context->options, cmdLine, true);
+
+    for (auto arg : input.testOptions->args)
+    {
+        cmdLine.addArg(arg);
+    }
+
+    cmdLine.addArg("-compile-only");
+    SlangTest::addDefaultRenderTestSlangOptimization(
+        cmdLine,
+        context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -2921,6 +3813,7 @@ TestResult runReflectionTest(TestContext* context, TestInput& input)
     {
         cmdLine.addArg(arg);
     }
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -3016,6 +3909,7 @@ static TestResult runCPPCompilerCompile(TestContext* context, TestInput& input)
     {
         cmdLine.addArg(arg);
     }
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -3118,17 +4012,15 @@ static TestResult runCPPCompilerSharedLibrary(TestContext* context, TestInput& i
     options.modulePath = SliceUtil::asTerminatedCharSlice(modulePath);
 
     ComPtr<IArtifact> artifact;
-    if (SLANG_FAILED(compiler->compile(options, artifact.writeRef())))
-    {
-        return TestResult::Fail;
-    }
+    const SlangResult compileRes = compiler->compile(options, artifact.writeRef());
 
-    auto diagnostics = findAssociatedRepresentation<IArtifactDiagnostics>(artifact);
+    auto diagnostics =
+        artifact ? findAssociatedRepresentation<IArtifactDiagnostics>(artifact) : nullptr;
 
-    if (diagnostics && SLANG_FAILED(diagnostics->getResult()))
+    if (SLANG_FAILED(compileRes) || (diagnostics && SLANG_FAILED(diagnostics->getResult())))
     {
         // Compilation failed
-        String actualOutput = _calcSummary(diagnostics);
+        String actualOutput = diagnostics ? _calcSummary(diagnostics) : String("Compile: Error\n");
 
         // Write the output
         Slang::File::writeAllText(actualOutputPath, actualOutput);
@@ -3377,6 +4269,9 @@ static TestResult generateExpectedOutput(
     {
         expectedCmdLine.addArg(arg);
     }
+    SlangTest::addDefaultSlangOptimization(
+        expectedCmdLine,
+        context->options.defaultOptimizationLevel);
 
     ExecuteResult expectedExeRes;
     TEST_RETURN_ON_DONE(
@@ -3423,6 +4318,9 @@ TestResult generateActualOutput(
     {
         actualCmdLine.addArg(arg);
     }
+    SlangTest::addDefaultSlangOptimization(
+        actualCmdLine,
+        context->options.defaultOptimizationLevel);
 
     ExecuteResult actualExeRes;
     TEST_RETURN_ON_DONE(
@@ -3540,6 +4438,7 @@ TestResult generateHLSLBaseline(
     cmdLine.addArg(targetFormat);
     cmdLine.addArg("-pass-through");
     cmdLine.addArg(passThroughName);
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -3599,6 +4498,7 @@ static TestResult _runHLSLComparisonTest(
 
     cmdLine.addArg("-target");
     cmdLine.addArg(targetFormat);
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -3686,6 +4586,7 @@ TestResult doGLSLComparisonTestRun(
     {
         cmdLine.addArg(arg);
     }
+    SlangTest::addDefaultSlangOptimization(cmdLine, context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -3774,7 +4675,10 @@ TestResult runGLSLComparisonTest(TestContext* context, TestInput& input)
     return TestResult::Pass;
 }
 
-static void _addRenderTestOptions(const Options& options, CommandLine& ioCmdLine)
+static void _addRenderTestOptions(
+    const Options& options,
+    CommandLine& ioCmdLine,
+    bool allowCacheRHI)
 {
     if (!options.emitSPIRVDirectly)
     {
@@ -3792,12 +4696,7 @@ static void _addRenderTestOptions(const Options& options, CommandLine& ioCmdLine
         ioCmdLine.addArg("-enable-debug-layers");
     }
 
-    if (options.ignoreAbortMsg)
-    {
-        ioCmdLine.addArg("-ignore-abort-msg");
-    }
-
-    if (options.cacheRhiDevice)
+    if (allowCacheRHI && options.cacheRhiDevice)
     {
         ioCmdLine.addArg("-cache-rhi-device");
     }
@@ -3835,12 +4734,15 @@ TestResult runPerformanceProfile(TestContext* context, TestInput& input)
     cmdLine.addArg(input.filePath);
     cmdLine.addArg("-performance-profile");
 
-    _addRenderTestOptions(context->options, cmdLine);
+    _addRenderTestOptions(context->options, cmdLine, true);
 
     for (auto arg : input.testOptions->args)
     {
         cmdLine.addArg(arg);
     }
+    SlangTest::addDefaultRenderTestSlangOptimization(
+        cmdLine,
+        context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -3960,6 +4862,9 @@ static SlangResult _compareWithType(
         case ScalarType::Float16:
         case ScalarType::Float32:
         case ScalarType::Float64:
+        case ScalarType::BFloat16:
+        case ScalarType::FloatE4M3:
+        case ScalarType::FloatE5M2:
             {
 
                 // Compare as double
@@ -3994,7 +4899,7 @@ TestResult runComputeComparisonImpl(
     cmdLine.setExecutableLocation(ExecutableLocation(context->options.binDir, "render-test"));
     cmdLine.addArg(filePath999);
 
-    _addRenderTestOptions(context->options, cmdLine);
+    _addRenderTestOptions(context->options, cmdLine, true);
 
     for (auto arg : input.testOptions->args)
     {
@@ -4008,6 +4913,9 @@ TestResult runComputeComparisonImpl(
     cmdLine.addArg("-o");
     auto actualOutputFile = outputStem + ".actual.txt";
     cmdLine.addArg(actualOutputFile);
+    SlangTest::addDefaultRenderTestSlangOptimization(
+        cmdLine,
+        context->options.defaultOptimizationLevel);
 
     if (context->isExecuting())
     {
@@ -4102,7 +5010,7 @@ TestResult doRenderComparisonTestRun(
     cmdLine.setExecutableLocation(ExecutableLocation(context->options.binDir, "render-test"));
     cmdLine.addArg(filePath);
 
-    _addRenderTestOptions(context->options, cmdLine);
+    _addRenderTestOptions(context->options, cmdLine, true);
 
     for (auto arg : input.testOptions->args)
     {
@@ -4112,6 +5020,9 @@ TestResult doRenderComparisonTestRun(
     cmdLine.addArg(langOption);
     cmdLine.addArg("-o");
     cmdLine.addArg(outputStem + outputKind + ".png");
+    SlangTest::addDefaultRenderTestSlangOptimization(
+        cmdLine,
+        context->options.defaultOptimizationLevel);
 
     ExecuteResult exeRes;
     TEST_RETURN_ON_DONE(spawnAndWait(context, outputStem, input.spawnType, cmdLine, exeRes));
@@ -4430,6 +5341,670 @@ TestResult skipTest(TestContext* /* context */, TestInput& /*input*/)
     return TestResult::Ignored;
 }
 
+// ---------------------------------------------------------------------------
+// SPVDB_DEBUGGER: compile a .slang file to SPIR-V, then execute debugger
+// commands embedded in the source file as "// SPVDB-CMD: ..." comments
+// in-process via libspvdb, and validate the output with FileCheck.
+//
+// Test directive syntax:
+//   //TEST:SPVDB_DEBUGGER(filecheck=SPVDB): -entry main -stage compute
+//
+// The args are forwarded to slangc (after -target spirv -g2 -o <stem>.spv).
+// libspvdb is vendored at tests/spvdb and is always linked in when slang-test
+// is built (see the SLANG_ENABLE_SPVDB block in tools/CMakeLists.txt).
+// ---------------------------------------------------------------------------
+
+#ifdef SLANG_ENABLE_SPVDB
+#include "api/spvdb.h"
+#include "api/spvdb_session.h"
+
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <vector>
+
+// Format a spvdb Value as a human-readable string.
+static std::string spvdb_value_str(const spvdb::Value& v)
+{
+    using Kind = spvdb::Value::Kind;
+    switch (v.kind)
+    {
+    case Kind::Bool:
+        return v.scalar.b ? "true" : "false";
+    case Kind::Int32:
+        return std::to_string(v.scalar.i32);
+    case Kind::UInt32:
+        return std::to_string(v.scalar.u32);
+    case Kind::Int64:
+        return std::to_string(v.scalar.i64);
+    case Kind::UInt64:
+        return std::to_string(v.scalar.u64);
+    case Kind::Float32:
+        {
+            std::ostringstream os;
+            os << v.scalar.f32;
+            return os.str();
+        }
+    case Kind::Float64:
+        {
+            std::ostringstream os;
+            os << v.scalar.f64;
+            return os.str();
+        }
+    case Kind::Composite:
+        {
+            bool named = !v.member_names.empty() && v.member_names.size() == v.elements.size();
+            std::string s = named ? "{" : "(";
+            for (size_t i = 0; i < v.elements.size(); ++i)
+            {
+                if (i)
+                    s += ", ";
+                if (named && !v.member_names[i].empty())
+                    s += v.member_names[i] + "=";
+                s += spvdb_value_str(v.elements[i]);
+            }
+            return s + (named ? "}" : ")");
+        }
+    default:
+        return "<complex>";
+    }
+}
+
+static std::string spvdb_stop_reason_str(spvdb::StopReason r)
+{
+    using SR = spvdb::StopReason;
+    switch (r)
+    {
+    case SR::Breakpoint:
+        return "Breakpoint";
+    case SR::Step:
+        return "Step";
+    case SR::EntryReached:
+        return "EntryReached";
+    case SR::EntryFinished:
+        return "EntryFinished";
+    case SR::Panic:
+        return "Panic";
+    }
+    return "Unknown";
+}
+
+// Split a line into whitespace-separated tokens.
+static std::vector<std::string> spvdb_tokenize(const std::string& line)
+{
+    std::vector<std::string> tokens;
+    std::istringstream ss(line);
+    std::string tok;
+    while (ss >> tok)
+        tokens.push_back(tok);
+    return tokens;
+}
+
+// Scan a source file for "// SPVDB-CMD: <command>" directives.
+static std::vector<std::string> spvdb_extract_commands(const std::string& path)
+{
+    std::vector<std::string> cmds;
+    std::ifstream f(path);
+    if (!f.is_open())
+        return cmds;
+    std::string line;
+    while (std::getline(f, line))
+    {
+        // Strip leading whitespace.
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos)
+            continue;
+        std::string trimmed = line.substr(start);
+
+        const std::string prefix = "// SPVDB-CMD:";
+        if (trimmed.size() < prefix.size())
+            continue;
+        if (trimmed.compare(0, prefix.size(), prefix) != 0)
+            continue;
+
+        std::string cmd = trimmed.substr(prefix.size());
+        // Strip leading whitespace from the command itself.
+        size_t cs = cmd.find_first_not_of(" \t");
+        if (cs != std::string::npos)
+            cmds.push_back(cmd.substr(cs));
+    }
+    return cmds;
+}
+
+// Parse `str` as an unsigned 32-bit integer, returning false instead of throwing on
+// invalid input (empty string, non-numeric text, or a value that overflows). Directive
+// tokens come from `// SPVDB-CMD:` lines in user-authored .slang test files, so a typo
+// there must fail that one test gracefully rather than let std::stoul's
+// std::invalid_argument/std::out_of_range propagate uncaught and abort the whole
+// slang-test process.
+static bool spvdb_parse_uint32(const std::string& str, uint32_t* out)
+{
+    try
+    {
+        size_t pos = 0;
+        unsigned long val = std::stoul(str, &pos);
+        if (pos != str.size())
+            return false;
+        *out = static_cast<uint32_t>(val);
+        return true;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+// Parse `str` as a float, returning false instead of throwing on invalid input. See
+// spvdb_parse_uint32 for why this must not throw.
+static bool spvdb_parse_float(const std::string& str, float* out)
+{
+    try
+    {
+        size_t pos = 0;
+        float val = std::stof(str, &pos);
+        if (pos != str.size())
+            return false;
+        *out = val;
+        return true;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+// Execute a list of SPVDB-CMD directives against a loaded SPIR-V module.
+// Returns the collected output as a string suitable for FileCheck validation.
+// On error, sets *error_out and returns "".
+static std::string spvdb_run_commands(
+    const std::string& spv_path,
+    const std::vector<std::string>& commands,
+    std::string* error_out)
+{
+    auto mod_result = spvdb::load_module_from_file(spv_path);
+    if (!mod_result)
+    {
+        *error_out = std::string("spvdb: failed to load SPIR-V: ") + spv_path;
+        return "";
+    }
+    auto mod = *mod_result;
+
+    std::string entry_name = "main";
+    std::unique_ptr<spvdb::Session> sess;
+    std::ostringstream out;
+
+    auto ensure_session = [&]() -> bool
+    {
+        if (!sess)
+        {
+            auto r = spvdb::create_session(mod, entry_name);
+            if (!r)
+            {
+                *error_out = std::string("spvdb: create_session failed: ") + r.error().message;
+                return false;
+            }
+            sess = std::move(*r);
+        }
+        return true;
+    };
+
+    for (const auto& cmd_line : commands)
+    {
+        auto tokens = spvdb_tokenize(cmd_line);
+        if (tokens.empty())
+            continue;
+        const std::string& cmd = tokens[0];
+
+        if (cmd == "entry")
+        {
+            if (tokens.size() < 2)
+            {
+                *error_out = "spvdb: entry requires <name>";
+                return "";
+            }
+            entry_name = tokens[1];
+            sess.reset();
+        }
+        else if (cmd == "descriptor")
+        {
+            if (tokens.size() < 4)
+            {
+                *error_out = "spvdb: descriptor requires <set> <binding> <json>";
+                return "";
+            }
+            if (!ensure_session())
+                return "";
+            uint32_t set = 0, binding = 0;
+            if (!spvdb_parse_uint32(tokens[1], &set) || !spvdb_parse_uint32(tokens[2], &binding))
+            {
+                *error_out =
+                    "spvdb: descriptor: invalid <set>/<binding>: " + tokens[1] + " " + tokens[2];
+                return "";
+            }
+            std::string json;
+            for (size_t i = 3; i < tokens.size(); ++i)
+            {
+                if (i > 3)
+                    json += " ";
+                json += tokens[i];
+            }
+            auto r = spvdb::set_descriptor_json(*sess, set, binding, json);
+            if (!r)
+            {
+                *error_out = std::string("spvdb: set_descriptor_json failed: ") + r.error().message;
+                return "";
+            }
+        }
+        else if (cmd == "inputloc")
+        {
+            // inputloc <location> <json>  — bind a vertex/fragment Input variable by Location.
+            if (tokens.size() < 3)
+            {
+                *error_out = "spvdb: inputloc requires <location> <json>";
+                return "";
+            }
+            if (!ensure_session())
+                return "";
+            uint32_t loc = 0;
+            if (!spvdb_parse_uint32(tokens[1], &loc))
+            {
+                *error_out = "spvdb: inputloc: invalid <location>: " + tokens[1];
+                return "";
+            }
+            std::string json;
+            for (size_t i = 2; i < tokens.size(); ++i)
+            {
+                if (i > 2)
+                    json += " ";
+                json += tokens[i];
+            }
+            auto r = spvdb::set_input_location_json(*sess, loc, json);
+            if (!r)
+            {
+                *error_out =
+                    std::string("spvdb: set_input_location_json failed: ") + r.error().message;
+                return "";
+            }
+        }
+        else if (cmd == "outputs")
+        {
+            if (!ensure_session())
+                return "";
+            auto vars = spvdb::output_variables(*sess);
+            for (const auto& lv : vars)
+                out << "output: " << lv.name << " = " << spvdb_value_str(lv.value) << "\n";
+            if (vars.empty())
+                out << "outputs: (none)\n";
+        }
+        else if (cmd == "break")
+        {
+            if (tokens.size() < 3)
+            {
+                *error_out = "spvdb: break requires <file_suffix> <line>";
+                return "";
+            }
+            if (!ensure_session())
+                return "";
+            std::string file = tokens[1];
+            uint32_t line = 0;
+            if (!spvdb_parse_uint32(tokens[2], &line))
+            {
+                *error_out = "spvdb: break: invalid <line>: " + tokens[2];
+                return "";
+            }
+            auto r = spvdb::set_breakpoint(*sess, file, line);
+            if (!r)
+            {
+                *error_out = std::string("spvdb: set_breakpoint failed: ") + r.error().message;
+                return "";
+            }
+        }
+        else if (cmd == "run" || cmd == "continue")
+        {
+            if (!ensure_session())
+                return "";
+            spvdb::StopReason reason = spvdb::run(*sess);
+            out << "stopped: " << spvdb_stop_reason_str(reason);
+            if (reason == spvdb::StopReason::Panic)
+                out << ": " << spvdb::panic_message(*sess);
+            out << "\n";
+        }
+        else if (cmd == "step")
+        {
+            if (!ensure_session())
+                return "";
+            spvdb::StopReason reason = spvdb::step(*sess);
+            out << "stopped: " << spvdb_stop_reason_str(reason);
+            if (reason == spvdb::StopReason::Panic)
+                out << ": " << spvdb::panic_message(*sess);
+            out << "\n";
+        }
+        else if (cmd == "stepi")
+        {
+            if (!ensure_session())
+                return "";
+            spvdb::StopReason reason = spvdb::step_instruction(*sess);
+            out << "stopped: " << spvdb_stop_reason_str(reason);
+            if (reason == spvdb::StopReason::Panic)
+                out << ": " << spvdb::panic_message(*sess);
+            out << "\n";
+        }
+        else if (cmd == "next")
+        {
+            if (!ensure_session())
+                return "";
+            spvdb::StopReason reason = spvdb::step_over(*sess);
+            out << "stopped: " << spvdb_stop_reason_str(reason);
+            if (reason == spvdb::StopReason::Panic)
+                out << ": " << spvdb::panic_message(*sess);
+            out << "\n";
+        }
+        else if (cmd == "finish")
+        {
+            if (!ensure_session())
+                return "";
+            spvdb::StopReason reason = spvdb::step_out(*sess);
+            out << "stopped: " << spvdb_stop_reason_str(reason);
+            if (reason == spvdb::StopReason::Panic)
+                out << ": " << spvdb::panic_message(*sess);
+            out << "\n";
+        }
+        else if (cmd == "print")
+        {
+            if (tokens.size() < 2)
+            {
+                *error_out = "spvdb: print requires <name>";
+                return "";
+            }
+            if (!ensure_session())
+                return "";
+            auto r = spvdb::evaluate_variable(*sess, tokens[1]);
+            if (!r)
+            {
+                *error_out = std::string("spvdb: evaluate_variable failed: ") + r.error().message;
+                return "";
+            }
+            out << "print: " << r->name << " = " << spvdb_value_str(r->value) << "\n";
+        }
+        else if (cmd == "builtin")
+        {
+            // builtin <name> <val0> [val1] [val2] [val3]
+            if (tokens.size() < 3)
+            {
+                *error_out = "spvdb: builtin requires <name> <val...>";
+                return "";
+            }
+            if (!ensure_session())
+                return "";
+
+            // Map common builtin names to SpvBuiltIn enum values.
+            static const struct
+            {
+                const char* name;
+                uint32_t id;
+            } kBuiltins[] = {
+                {"GlobalInvocationID", SpvBuiltInGlobalInvocationId},
+                {"LocalInvocationID", SpvBuiltInLocalInvocationId},
+                {"WorkgroupID", SpvBuiltInWorkgroupId},
+                {"LocalInvocationIndex", SpvBuiltInLocalInvocationIndex},
+                {"VertexIndex", SpvBuiltInVertexIndex},
+                {"InstanceIndex", SpvBuiltInInstanceIndex},
+                {"Position", SpvBuiltInPosition},
+                {"PointSize", SpvBuiltInPointSize},
+                {"FragCoord", SpvBuiltInFragCoord},
+                {"FrontFacing", SpvBuiltInFrontFacing},
+                {"FragDepth", SpvBuiltInFragDepth},
+                {"NumWorkgroups", SpvBuiltInNumWorkgroups},
+                {"SubgroupSize", SpvBuiltInSubgroupSize},
+            };
+            uint32_t bi = 0;
+            bool found = false;
+            for (const auto& kb : kBuiltins)
+            {
+                if (tokens[1] == kb.name)
+                {
+                    bi = kb.id;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                *error_out = std::string("spvdb: unknown builtin: ") + tokens[1];
+                return "";
+            }
+
+            spvdb::Value bval;
+            size_t nvals = tokens.size() - 2; // number of value tokens
+            bool parseOk = true;
+            if (nvals >= 2)
+            {
+                // Two, three, or four components — build a composite. (A genuinely
+                // scalar builtin only ever supplies one value token; anything with
+                // 2+ must be kept as a composite so no component is silently
+                // dropped.)
+                std::vector<spvdb::Value> elems;
+                bool as_float = false;
+                for (size_t i = 2; i < tokens.size(); ++i)
+                {
+                    if (tokens[i].find('.') != std::string::npos)
+                    {
+                        as_float = true;
+                        break;
+                    }
+                }
+                for (size_t i = 2; i < tokens.size() && parseOk; ++i)
+                {
+                    if (as_float)
+                    {
+                        float fv = 0.0f;
+                        parseOk = spvdb_parse_float(tokens[i], &fv);
+                        if (parseOk)
+                            elems.push_back(spvdb::Value::make_f32(fv));
+                    }
+                    else
+                    {
+                        uint32_t uv = 0;
+                        parseOk = spvdb_parse_uint32(tokens[i], &uv);
+                        if (parseOk)
+                            elems.push_back(spvdb::Value::make_u32(uv));
+                    }
+                }
+                if (parseOk)
+                    bval = spvdb::Value::make_composite(std::move(elems));
+            }
+            else
+            {
+                // Single scalar — try uint first, then float.
+                const std::string& sv = tokens[2];
+                if (sv.find('.') != std::string::npos)
+                {
+                    float fv = 0.0f;
+                    parseOk = spvdb_parse_float(sv, &fv);
+                    if (parseOk)
+                        bval = spvdb::Value::make_f32(fv);
+                }
+                else
+                {
+                    uint32_t uv = 0;
+                    parseOk = spvdb_parse_uint32(sv, &uv);
+                    if (parseOk)
+                        bval = spvdb::Value::make_u32(uv);
+                }
+            }
+            if (!parseOk)
+            {
+                *error_out = "spvdb: builtin: invalid numeric value in: " + cmd_line;
+                return "";
+            }
+
+            auto r = spvdb::set_builtin(*sess, bi, bval);
+            if (!r)
+            {
+                *error_out = std::string("spvdb: set_builtin failed: ") + r.error().message;
+                return "";
+            }
+        }
+        else if (cmd == "location")
+        {
+            if (!ensure_session())
+                return "";
+            auto loc = spvdb::current_location(*sess);
+            out << "location: " << loc.file << ":" << loc.line << "\n";
+        }
+        else if (cmd == "locals")
+        {
+            if (!ensure_session())
+                return "";
+            auto vars = spvdb::local_variables(*sess);
+            for (const auto& lv : vars)
+                out << "local: " << lv.name << " = " << spvdb_value_str(lv.value) << "\n";
+            if (vars.empty())
+                out << "locals: (none)\n";
+        }
+        else if (cmd == "backtrace")
+        {
+            if (!ensure_session())
+                return "";
+            auto bt = spvdb::backtrace(*sess);
+            for (size_t i = 0; i < bt.size(); ++i)
+            {
+                out << "frame[" << i << "]: " << bt[i].function_name << " at " << bt[i].loc.file
+                    << ":" << bt[i].loc.line << "\n";
+            }
+            if (bt.empty())
+                out << "backtrace: (empty)\n";
+        }
+        else if (cmd == "read")
+        {
+            if (tokens.size() < 3)
+            {
+                *error_out = "spvdb: read requires <set> <binding>";
+                return "";
+            }
+            if (!ensure_session())
+                return "";
+            uint32_t set = 0, binding = 0;
+            if (!spvdb_parse_uint32(tokens[1], &set) || !spvdb_parse_uint32(tokens[2], &binding))
+            {
+                *error_out = "spvdb: read: invalid <set>/<binding>: " + tokens[1] + " " + tokens[2];
+                return "";
+            }
+            auto r = spvdb::read_descriptor(*sess, set, binding);
+            if (!r)
+            {
+                *error_out = std::string("spvdb: read_descriptor failed: ") + r.error().message;
+                return "";
+            }
+            const auto& bytes = *r;
+            size_t n_u32 = bytes.size() / sizeof(uint32_t);
+            out << "read[" << set << "][" << binding << "]: [";
+            for (size_t i = 0; i < n_u32; ++i)
+            {
+                if (i)
+                    out << ", ";
+                uint32_t val;
+                std::memcpy(&val, bytes.data() + i * sizeof(uint32_t), sizeof(uint32_t));
+                out << val;
+            }
+            out << "]\n";
+        }
+        else
+        {
+            *error_out = std::string("spvdb: unknown command: ") + cmd;
+            return "";
+        }
+    }
+
+    return out.str();
+}
+#endif // SLANG_ENABLE_SPVDB
+
+TestResult runSpvdbDebuggerTest(TestContext* context, TestInput& input)
+{
+    if (context->isCollectingRequirements())
+        return TestResult::Pass;
+
+#ifndef SLANG_ENABLE_SPVDB
+    // libspvdb not linked in this build of slang-test (see the
+    // SLANG_ENABLE_SPVDB block in tools/CMakeLists.txt).
+    auto reporter = context->getTestReporter();
+    if (reporter)
+        reporter->message(
+            TestMessageType::Info,
+            "SPVDB_DEBUGGER test skipped: spvdb not available in this slang-test build");
+    return TestResult::Ignored;
+#else
+    auto outputStem = input.outputStem;
+    String spvPath = outputStem + ".spvdb.spv";
+
+    // --- Step 1: compile the source file to SPIR-V with debug info ---
+    {
+        CommandLine slangcCmdLine;
+        slangcCmdLine.setExecutableLocation(ExecutableLocation(context->options.binDir, "slangc"));
+        slangcCmdLine.addArg(input.filePath);
+        slangcCmdLine.addArg("-target");
+        slangcCmdLine.addArg("spirv");
+        slangcCmdLine.addArg("-g2");
+        slangcCmdLine.addArg("-o");
+        slangcCmdLine.addArg(spvPath);
+
+        for (auto arg : input.testOptions->args)
+            slangcCmdLine.addArg(arg);
+
+        SlangTest::addDefaultSlangOptimization(
+            slangcCmdLine,
+            context->options.defaultOptimizationLevel);
+
+        ExecuteResult slangcRes;
+        TEST_RETURN_ON_DONE(
+            spawnAndWait(context, outputStem, SpawnType::UseExe, slangcCmdLine, slangcRes));
+
+        if (slangcRes.resultCode != 0)
+        {
+            auto reporter = context->getTestReporter();
+            if (reporter)
+                reporter->message(
+                    TestMessageType::TestFailure,
+                    String("slangc failed:\n") + getOutput(slangcRes));
+            return TestResult::Fail;
+        }
+    }
+
+    // --- Step 2: run SPVDB-CMD directives in-process via libspvdb ---
+    String actualOutput;
+    {
+        std::string sourcePath(input.filePath.getBuffer());
+        std::string spvPathStd(spvPath.getBuffer());
+
+        auto commands = spvdb_extract_commands(sourcePath);
+        if (commands.empty())
+        {
+            auto reporter = context->getTestReporter();
+            if (reporter)
+                reporter->message(
+                    TestMessageType::TestFailure,
+                    String("spvdb: no SPVDB-CMD directives found in: ") + input.filePath);
+            return TestResult::Fail;
+        }
+
+        std::string error;
+        std::string output = spvdb_run_commands(spvPathStd, commands, &error);
+        if (!error.empty())
+        {
+            auto reporter = context->getTestReporter();
+            if (reporter)
+                reporter->message(TestMessageType::TestFailure, error.c_str());
+            return TestResult::Fail;
+        }
+        actualOutput = output.c_str();
+    }
+
+    // --- Step 3: validate output via FileCheck / comparison ---
+    return _validateOutput(context, input, actualOutput);
+#endif // SLANG_ENABLE_SPVDB
+}
+
 // based on command name, dispatch to an appropriate callback
 struct TestCommandInfo
 {
@@ -4443,6 +6018,7 @@ static const TestCommandInfo s_testCommandInfos[] = {
     {"SIMPLE_EX", &runSimpleTest, 0},
     {"SIMPLE_LINE", &runSimpleLineTest, 0},
     {"INTERPRET", &runInterpreterTest, 0},
+    {"DISPATCHER", &runDispatcherTest, 0},
     {"REFLECTION", &runReflectionTest, 0},
     {"CPU_REFLECTION", &runReflectionTest, 0},
     {"COMMAND_LINE_SIMPLE", &runSimpleCompareCommandLineTest, 0},
@@ -4462,9 +6038,11 @@ static const TestCommandInfo s_testCommandInfos[] = {
     {"CPP_COMPILER_COMPILE", &runCPPCompilerCompile, RenderApiFlag::CPU},
     {"PERFORMANCE_PROFILE", &runPerformanceProfile, 0},
     {"COMPILE", &runCompile, 0},
+    {"COMPILE_TARGET", &runCompileTarget, 0},
     {"DOC", &runDocTest, 0},
     {"LANG_SERVER", &runLanguageServerTest, 0},
-    {"EXECUTABLE", &runExecutableTest, RenderApiFlag::CPU}};
+    {"EXECUTABLE", &runExecutableTest, RenderApiFlag::CPU},
+    {"SPVDB_DEBUGGER", &runSpvdbDebuggerTest, 0}};
 
 const TestCommandInfo* _findTestCommandInfoByCommand(const UnownedStringSlice& name)
 {
@@ -4491,10 +6069,17 @@ TestResult runTest(
     String const& testName,
     TestOptions const& testOptions)
 {
-    // If we are collecting requirements and it's diagnostic test, we always run
-    // (ie no requirements need to be captured - effectively it has 'no requirements')
+    // Diagnostic tests validate front-end diagnostics that slangc emits before any backend
+    // runs, so they normally need no backend and run everywhere. The exception is
+    // `-emit-cpu-via-llvm`, which forces the slang-llvm backend before the diagnostic is
+    // reached; capture that here too. This branch returns before the general
+    // `_extractSlangCTestRequirements` path runs, so the two checks stay disjoint.
     if (context->isCollectingRequirements() && testOptions.type == TestOptions::Diagnostic)
     {
+        if (_hasOption(testOptions.args, "-emit-cpu-via-llvm"))
+        {
+            context->getTestRequirements()->addUsedBackEnd(SLANG_PASS_THROUGH_LLVM);
+        }
         return TestResult::Pass;
     }
 
@@ -4673,6 +6258,93 @@ static void _calcSynthesizedTests(
     }
 }
 
+static bool _isGpuComputeCommand(const String& command)
+{
+    return command == "COMPARE_COMPUTE" || command == "COMPARE_COMPUTE_EX" ||
+           command == "COMPARE_RENDER_COMPUTE" || command == "HLSL_COMPUTE";
+}
+
+static RenderApiType _getRenderApiFromArgs(const List<String>& args)
+{
+    for (const auto& arg : args)
+    {
+        if (arg.getLength() > 1 && arg[0] == '-')
+        {
+            UnownedStringSlice name(arg.getUnownedSlice().begin() + 1, arg.getUnownedSlice().end());
+            RenderApiType apiType = RenderApiUtil::findApiTypeByName(name);
+            if (apiType != RenderApiType::Unknown)
+                return apiType;
+        }
+    }
+    return RenderApiType::Unknown;
+}
+
+static void _calcSynthesizedCompileTargetTests(
+    TestContext* context,
+    const String& filePath,
+    const List<TestDetails>& srcTests,
+    List<TestDetails>& ioSynthTests)
+{
+    SLANG_UNUSED(filePath);
+
+    HashSet<String> synthesizedKeys;
+
+    for (const auto& srcTest : srcTests)
+    {
+        if (!srcTest.options.isEnabled || srcTest.options.isSynthesized ||
+            !_isGpuComputeCommand(srcTest.options.command))
+            continue;
+
+        RenderApiType renderApi = _getRenderApiFromArgs(srcTest.options.args);
+        if (renderApi == RenderApiType::Unknown)
+            continue;
+
+        StringBuilder keyBuilder;
+        keyBuilder << RenderApiUtil::getApiName(renderApi) << "|" << srcTest.options.command;
+        String synthKey = keyBuilder.produceString();
+        if (synthesizedKeys.contains(synthKey))
+            continue;
+
+        TestDetails synthDetails;
+        TestOptions& synthOptions = synthDetails.options;
+        synthOptions.command = "COMPILE_TARGET";
+        synthOptions.isSynthesized = true;
+
+        if (auto c = context->categorySet.find("compile-target"))
+        {
+            synthOptions.categories.add(c);
+        }
+
+        synthOptions.args = srcTest.options.args;
+
+        // Add the implicit args that each command handler normally appends.
+        // COMPARE_COMPUTE_EX adds no implicit args (passes nullptr, 0 to
+        // runComputeComparisonImpl), so no branch is needed for it.
+        if (srcTest.options.command == "COMPARE_COMPUTE")
+        {
+            synthOptions.args.add("-slang");
+            synthOptions.args.add("-compute");
+        }
+        else if (srcTest.options.command == "COMPARE_RENDER_COMPUTE")
+        {
+            synthOptions.args.add("-slang");
+            synthOptions.args.add("-gcompute");
+        }
+        else if (srcTest.options.command == "HLSL_COMPUTE")
+        {
+            synthOptions.args.add("--hlsl-rewrite");
+            synthOptions.args.add("-compute");
+        }
+
+        context->setTestRequirements(&synthDetails.requirements);
+        runTest(context, "", "", "", synthOptions);
+        context->setTestRequirements(nullptr);
+
+        ioSynthTests.add(synthDetails);
+        synthesizedKeys.add(synthKey);
+    }
+}
+
 static bool _canIgnore(TestContext* context, const TestDetails& details)
 {
     if (details.options.isEnabled == false)
@@ -4736,28 +6408,6 @@ static String insertSubtestIndex(const String& testName, int index)
 
 // Check if a prefix specifies a subtest index (e.g., "foo.slang.1" or "foo.slang.0")
 // Returns the subtest index if found, or -1 if not a subtest prefix.
-static int getSubtestIndex(const String& prefix, const String& filePath)
-{
-    if (prefix.getLength() <= filePath.getLength() || !prefix.startsWith(filePath))
-        return -1;
-
-    auto suffix = prefix.getUnownedSlice().tail(filePath.getLength());
-    if (suffix.getLength() < 2 || suffix[0] != '.')
-        return -1;
-
-    // Check all remaining chars are digits
-    int index = 0;
-    for (Index i = 1; i < suffix.getLength(); i++)
-    {
-        char c = suffix[i];
-        if (c < '0' || c > '9')
-            return -1;
-        index = index * 10 + (c - '0');
-    }
-
-    return index;
-}
-
 static SlangResult _runTestsOnFile(TestContext* context, String filePath)
 {
     // Gather a list of tests to run
@@ -4831,6 +6481,13 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
         testList.tests.addRange(synthesizedTests);
     }
 
+    if (context->options.synthesizeCompileTargets)
+    {
+        List<TestDetails> compileTargetTests;
+        _calcSynthesizedCompileTargetTests(context, filePath, testList.tests, compileTargetTests);
+        testList.tests.addRange(compileTargetTests);
+    }
+
     // If explicit test order is requested, reorder subtests by prefix order
     List<Index> testOrder;
     for (Index i = 0; i < testList.tests.getCount(); i++)
@@ -4851,20 +6508,8 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
             for (Index i = 0; i < prefixes.getCount(); i++)
             {
                 // Check if prefix matches this specific subtest
-                int prefixSubtest = getSubtestIndex(prefixes[i], filePath);
-                if (prefixSubtest >= 0)
-                {
-                    // Prefix specifies a subtest - check for exact match
-                    if (prefixSubtest == 0 && testIdx == 0)
-                        return i;
-                    if (outputStem == prefixes[i])
-                        return i;
-                }
-                else if (filePath.startsWith(prefixes[i]))
-                {
-                    // Non-specific prefix - matches all subtests in file
+                if (TestToolUtil::entryMatchesSubtest(prefixes[i], filePath, outputStem, testIdx))
                     return i;
-                }
             }
             return prefixes.getCount();
         };
@@ -4878,8 +6523,19 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
     // We have found a test to run!
     for (Index orderIdx = 0; orderIdx < testOrder.getCount(); orderIdx++)
     {
+        // Stop scheduling new tests if too many consecutive failures suggest a systemic issue.
+        if (context->stopSchedulingTests.load())
+            return SLANG_OK;
+
         Index subTestIndex = testOrder[orderIdx];
         auto& testDetails = testList.tests[subTestIndex];
+
+        // When -only-synthesized is set, only run synthesized compile-target tests
+        if (context->options.onlySynthesized &&
+            !(testDetails.options.isSynthesized && testDetails.options.command == "COMPILE_TARGET"))
+        {
+            continue;
+        }
 
         // Check that the test passes our current category mask
         if (!testPassesCategoryMask(context, testDetails.options))
@@ -4906,6 +6562,16 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
 
         const auto& requirements = testDetails.requirements;
 
+        // For synthesized compile-target tests, show the render API name
+        if (testDetails.options.isSynthesized && testDetails.options.command == "COMPILE_TARGET")
+        {
+            RenderApiType renderApi = _getRenderApiFromArgs(testDetails.options.args);
+            if (renderApi != RenderApiType::Unknown)
+            {
+                testName << " (" << RenderApiUtil::getApiName(renderApi) << ")";
+            }
+        }
+
         // Display list of used apis on render test
         if (requirements.usedRenderApiFlags)
         {
@@ -4929,6 +6595,29 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
             testName << ")";
         }
 
+        // Per-subtest exclusion, and it has to happen HERE rather than in
+        // shouldRunTest(): that runs before subtests are expanded, so it can
+        // only see the source path. A synthesized variant such as
+        // `tests/compute/parameter-block.slang.6 syn (llvm)` can crash the
+        // worker outright, which also rules out -expected-failure-list —
+        // that reclassifies a result only after the test returns, and this
+        // one never does. The skip must be pre-dispatch, so it is.
+        if (TestToolUtil::isSubtestExcluded(
+                context->options.excludePrefixes,
+                context->options.skipList,
+                filePath,
+                outputStem,
+                subTestIndex))
+        {
+            if (context->options.verbosity >= VerbosityLevel::Info)
+            {
+                StringBuilder msg;
+                msg << "skipping excluded subtest: " << testName;
+                context->getTestReporter()->message(TestMessageType::Info, msg.produceString());
+            }
+            continue;
+        }
+
         // Check if any prefix is more specific than the file path (has subtest index).
         // If so, filter to only run tests whose outputStem matches the prefix.
         if (context->options.testPrefixes.getCount() > 0)
@@ -4938,32 +6627,15 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
 
             for (auto& p : context->options.testPrefixes)
             {
-                int prefixSubtestIndex = getSubtestIndex(p, filePath);
-                if (prefixSubtestIndex >= 0)
+                // Two separate questions, and only the second is the shared
+                // matching rule: whether the entry NAMES a subtest at all
+                // (which arms the filter), and whether it matches THIS one.
+                if (TestToolUtil::getSubtestIndex(p, filePath) >= 0)
                 {
                     hasSpecificPrefix = true;
-                    // Handle .0 specially - it refers to the first test (no suffix in outputStem)
-                    if (prefixSubtestIndex == 0)
-                    {
-                        if (outputStem == filePath)
-                        {
-                            matchesSpecificPrefix = true;
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        // outputStem must match exactly (e.g., .10 shouldn't match .100)
-                        if (outputStem == p)
-                        {
-                            matchesSpecificPrefix = true;
-                            break;
-                        }
-                    }
                 }
-                else if (filePath.startsWith(p))
+                if (TestToolUtil::entryMatchesSubtest(p, filePath, outputStem, subTestIndex))
                 {
-                    // Non-specific prefix that matches the file - always run
                     matchesSpecificPrefix = true;
                     break;
                 }
@@ -5007,7 +6679,7 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
             {
                 testResult = runTest(context, filePath, outputStem, testName, testDetails.options);
                 if (testResult == TestResult::Fail && !context->options.disableRetries &&
-                    !context->getTestReporter()->m_expectedFailureList.contains(testName))
+                    !context->getTestReporter()->isExpectedFailure(testName))
                 {
                     RefPtr<FileTestInfoImpl> fileTestInfo = new FileTestInfoImpl();
                     fileTestInfo->filePath = filePath;
@@ -5025,10 +6697,13 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
                 {
                     context->getTestReporter()->addResult(testResult);
                 }
+
+                // Track consecutive failures for early abort on systemic issues
+                if (testResult == TestResult::Fail || testResult == TestResult::PendingRetry)
+                    context->reportTestFailure();
+                else if (testResult == TestResult::Pass)
+                    context->reportTestPass();
             }
-
-
-            // Could determine if to continue or not here... based on result
         }
     }
 
@@ -5039,24 +6714,9 @@ static SlangResult _runTestsOnFile(TestContext* context, String filePath)
 static bool endsWithAllowedExtension(TestContext* /*context*/, String filePath)
 {
     char const* allowedExtensions[] = {
-        ".slang",
-        ".hlsl",
-        ".fx",
-        ".glsl",
-        ".vert",
-        ".frag",
-        ".geom",
-        ".tesc",
-        ".tese",
-        ".comp",
-        ".internal",
-        ".ahit",
-        ".chit",
-        ".miss",
-        ".rgen",
-        ".c",
-        ".cpp",
-        ".cu",
+        ".slang.md", ".slang", ".hlsl", ".fx",   ".glsl",     ".vert", ".frag",
+        ".geom",     ".tesc",  ".tese", ".comp", ".internal", ".ahit", ".chit",
+        ".miss",     ".rgen",  ".c",    ".cpp",  ".cu",
     };
 
     for (auto allowedExtension : allowedExtensions)
@@ -5120,7 +6780,7 @@ static bool shouldRunTest(TestContext* context, String filePath)
         }
         // Also match if the prefix specifies a subtest index
         // (e.g., prefix "foo.slang.1" should include file "foo.slang")
-        if (getSubtestIndex(p, filePath) >= 0)
+        if (TestToolUtil::getSubtestIndex(p, filePath) >= 0)
         {
             return true;
         }
@@ -5167,12 +6827,14 @@ void runTestsInParallel(TestContext* context, int count, const F& f)
     auto threadFunc = [&](int threadId)
     {
         TestReporter reporter;
-        reporter.init(context->options.outputMode, context->options.expectedFailureList, true);
+        reporter.init(context->options, true);
         TestReporter::SuiteScope suiteScope(&reporter, "tests");
         context->setThreadIndex(threadId);
         context->setTestReporter(&reporter);
         do
         {
+            if (context->stopSchedulingTests.load())
+                break;
             int index = consumePtr.fetch_add(1);
             if (index >= count)
                 break;
@@ -5242,7 +6904,7 @@ void runTestsInDirectory(TestContext* context)
                     return i;
                 }
                 // Also match subtest prefixes (e.g., "foo.slang.1" matches file "foo.slang")
-                if (getSubtestIndex(prefixes[i], filePath) >= 0)
+                if (TestToolUtil::getSubtestIndex(prefixes[i], filePath) >= 0)
                 {
                     return i;
                 }
@@ -5367,16 +7029,17 @@ static SlangResult runUnitTestModule(
         return SLANG_FAIL;
 
     renderer_test::CoreDebugCallback coreDebugCallback;
-    renderer_test::CoreToRHIDebugBridge rhiDebugBridge;
-    rhiDebugBridge.setCoreCallback(&coreDebugCallback);
 
     UnitTestContext unitTestContext;
     unitTestContext.slangGlobalSession = context->getSession();
     unitTestContext.workDirectory = "";
-    unitTestContext.enabledApis = context->options.enabledApis;
+    // Intersect with probed available APIs so unit tests skip instead of fail
+    // when the required device type is not present on the current machine.
+    unitTestContext.enabledApis =
+        context->options.enabledApis & _getAvailableRenderApiFlags(context);
     unitTestContext.enableDebugLayers = context->options.enableDebugLayers;
     unitTestContext.executableDirectory = context->exeDirectoryPath.getBuffer();
-    unitTestContext.debugCallback = &rhiDebugBridge;
+    unitTestContext.debugCallback = nullptr;
 
     auto testCount = testModule->getTestCount();
 
@@ -5395,9 +7058,8 @@ static SlangResult runUnitTestModule(
         auto testFunc = testModule->getTestFunc(i);
         auto testName = testModule->getTestName(i);
 
-        StringBuilder filePath;
-        filePath << moduleName << "/" << testName << ".internal";
-        auto command = filePath.produceString();
+        auto command =
+            makeUnitTestKey(UnownedStringSlice(moduleName), UnownedStringSlice(testName));
 
         if (shouldRunTest(context, command))
         {
@@ -5424,7 +7086,7 @@ static SlangResult runUnitTestModule(
             spawnType == SpawnType::UseFullyIsolatedTestServer)
         {
             TestServerProtocol::ExecuteUnitTestArgs args;
-            args.enabledApis = context->options.enabledApis;
+            args.enabledApis = context->options.enabledApis & _getAvailableRenderApiFlags(context);
             args.enableDebugLayers = context->options.enableDebugLayers;
             args.moduleName = moduleName;
             args.testName = test.testName;
@@ -5449,7 +7111,12 @@ static SlangResult runUnitTestModule(
                 // If the rpc failed, output an error message
                 if (SLANG_FAILED(rpcRes))
                 {
+                    // The call never reached the test, so this is not a verdict about it. Tell the
+                    // reporter, which needs to know a retry that skips the test is a real answer
+                    // here rather than a skipped failure.
+                    testResult = TestResult::Fail;
                     reporter->message(TestMessageType::RunError, "rpc failed");
+                    reporter->noteDispatchFailure(options.command);
                 }
 
                 // Check for VVL errors in unit tests
@@ -5469,8 +7136,14 @@ static SlangResult runUnitTestModule(
 
                 // If the test failed and it is not an expected failure, add it to the list of
                 // failed unit tests so that we can retry.
+                // The expected-failure list is keyed by the reporter key, not the bare test
+                // name, so the key is built by makeUnitTestKey() rather than chosen here. That
+                // matters because choosing wrong has no visible symptom -- the lookup just never
+                // matches, and the only cost is the pointless retry this gate exists to avoid.
                 if (isFailed && !context->isRetry && !context->options.disableRetries &&
-                    !context->getTestReporter()->m_expectedFailureList.contains(test.testName))
+                    !context->getTestReporter()->isExpectedFailure(makeUnitTestKey(
+                        UnownedStringSlice(moduleName),
+                        test.testName.getUnownedSlice())))
                 {
                     std::lock_guard lock(context->mutexFailedTests);
                     context->failedUnitTests.add(test.command);
@@ -5494,9 +7167,15 @@ static SlangResult runUnitTestModule(
 
             // Clear any previous debug messages
             coreDebugCallback.clear();
+            auto rhiDebugBridge = renderer_test::createRetainedCoreToRHIDebugBridge();
+            unitTestContext.debugCallback = rhiDebugBridge.Ptr();
+            renderer_test::ScopedCoreDebugCallback scopedDebugCallback(
+                *rhiDebugBridge,
+                &coreDebugCallback);
 
             try
             {
+                slang_replayMarker(test.testName.getBuffer());
                 test.testFunc(&unitTestContext);
 
                 // Check for VVL errors after test completion
@@ -5543,7 +7222,18 @@ static SlangResult runUnitTestModule(
             runUnitTest(t);
     }
 
-    testModule->destroy();
+    // Note `testModule->destroy()` is deliberately not called here. The registry it would empty has
+    // process lifetime and is filled in once, by the module's load-time static constructors, so
+    // this function must leave it intact for the retry pass to enumerate. (The test server, which
+    // holds the same kind of module, releases its own copy from its destructor at shutdown.)
+    //
+    // No unit test guards this: the cross-pass dlopen / static-constructor path it turns on cannot
+    // be driven from an in-process SLANG_UNIT_TEST, so a real two-pass run under CI is the only
+    // positive check. What does exist is a backstop -- reinstating the call would leave every
+    // unit-test deferral unredeemed, and `TestReporter::reconcilePendingRetries()` would then count
+    // them as failures. So the regression surfaces as red CI rather than as the silent green it
+    // used to be, but only because that safety net is there. Do not "tidy up" the missing
+    // destroy() on the assumption the unit tests cover it.
     return SLANG_OK;
 }
 
@@ -5585,6 +7275,8 @@ SlangResult innerMain(int argc, char** argv)
 
     auto sharedLibraryCategory = categorySet.add("shared-library", fullTestCategory);
 
+    categorySet.add("compile-target", fullTestCategory);
+
 #if SLANG_WINDOWS_FAMILY
     auto windowsCategory = categorySet.add("windows", fullTestCategory);
 #endif
@@ -5605,12 +7297,13 @@ SlangResult innerMain(int argc, char** argv)
     // All following values are initialized to '0', so null.
     TestCategory* passThroughCategories[SLANG_PASS_THROUGH_COUNT_OF] = {nullptr};
 
-    // Work out what backends/pass-thrus are available
+    // Work out what backends/pass-thrus are available. This has to run before Options::parse below
+    // because `-category`/`-exclude <backend-name>` resolves against the categories registered
+    // here. The "Supported backends:" line, however, is informational and gated on verbosity, which
+    // is only known after the parse, so we accumulate it here and print it once options are parsed.
+    StringBuilder supportedBackends;
     {
         SlangSession* session = context.getSession();
-
-        auto out = StdWriters::getOut();
-        out.print("Supported backends:");
 
         for (int i = 0; i < SLANG_PASS_THROUGH_COUNT_OF; ++i)
         {
@@ -5633,11 +7326,13 @@ SlangResult innerMain(int argc, char** argv)
                 SLANG_ASSERT(passThroughCategories[i] == nullptr);
                 passThroughCategories[i] = categorySet.add(buf.getBuffer() + 1, fullTestCategory);
 
-                out.write(buf.getBuffer(), buf.getLength());
+                // Each token keeps its leading space (the `+ 1` above strips it only for the
+                // category name), so the joined line reads "Supported backends: a b". CI greps the
+                // literal "Supported backends: " (with the trailing space), so this is
+                // load-bearing.
+                supportedBackends << buf;
             }
         }
-
-        out.print("\n");
     }
 
     {
@@ -5648,6 +7343,11 @@ SlangResult innerMain(int argc, char** argv)
         const auto hostCallableCompiler = session->getDownstreamCompilerForTransition(
             SLANG_CPP_SOURCE,
             SLANG_SHADER_HOST_CALLABLE);
+
+        if (hasLlvm)
+        {
+            SLANG_RETURN_ON_FAIL(context.locateLLVMFileCheck());
+        }
 
         if (hasLlvm && hostCallableCompiler == SLANG_PASS_THROUGH_LLVM && SLANG_PROCESSOR_X86)
         {
@@ -5685,6 +7385,13 @@ SlangResult innerMain(int argc, char** argv)
 
     Options& options = context.options;
 
+    // CI greps this at default (Info) verbosity, so suppress it only below Info (e.g. `-v
+    // failure`).
+    if (options.verbosity >= VerbosityLevel::Info)
+    {
+        StdWriters::getOut().print("Supported backends:%s\n", supportedBackends.getBuffer());
+    }
+
     context.setMaxTestRunnerThreadCount(options.serverCount);
 
     // Set up the prelude/s
@@ -5712,9 +7419,8 @@ SlangResult innerMain(int argc, char** argv)
     {
         // Create a TestReporter since _getAvailableRenderApiFlags may use it in verbose mode
         TestReporter reporter;
-        SLANG_RETURN_ON_FAIL(reporter.init(options.outputMode, options.expectedFailureList));
+        SLANG_RETURN_ON_FAIL(reporter.init(options));
         context.setTestReporter(&reporter);
-        reporter.m_verbosity = options.verbosity;
 
         _getAvailableRenderApiFlags(&context);
 
@@ -5798,13 +7504,9 @@ SlangResult innerMain(int argc, char** argv)
     {
         // Setup the reporter
         TestReporter reporter;
-        SLANG_RETURN_ON_FAIL(reporter.init(options.outputMode, options.expectedFailureList));
+        SLANG_RETURN_ON_FAIL(reporter.init(options));
 
         context.setTestReporter(&reporter);
-
-        reporter.m_dumpOutputOnFailure = options.dumpOutputOnFailure;
-        reporter.m_verbosity = options.verbosity;
-        reporter.m_hideIgnored = options.hideIgnored;
 
         {
             TestReporter::SuiteScope suiteScope(&reporter, "tests");
@@ -5856,7 +7558,31 @@ SlangResult innerMain(int argc, char** argv)
         // If we have a couple failed tests, they maybe intermittent failures due to parallel
         // excution or driver instability. We can try running them again. Debug build has more
         // instability at this moment, so we allow more retries.
-        if (!context.options.disableRetries)
+        if (context.stopSchedulingTests.load())
+        {
+            fprintf(
+                stderr,
+                "\n*** Stopped scheduling new tests after too many consecutive failures.\n"
+                "*** This usually indicates a systemic issue such as a GPU driver crash.\n"
+                "*** Skipping retries for %d failed tests.\n\n",
+                (int)context.failedFileTests.getCount());
+            fflush(stderr);
+
+            // Skipping the retries is right; dropping the results is not. A test deferred for
+            // retry has only been recorded as "pending retry", which is a placeholder rather
+            // than a verdict, and the retry loop below is what normally turns it into one. On
+            // this branch that loop never runs, so before this the tests vanished:
+            // m_failedTestCount stayed 0, didAllSucceed() returned true, and slang-test exited
+            // 0 announcing "0% of tests passed (0/0)".
+            //
+            // The deferred tests still reach the totals: reconcilePendingRetries() below
+            // turns every unredeemed deferral into a failure, which is the general form of
+            // the rule this branch used to apply for itself. What it cannot supply is the
+            // `aborted` term in the exit code -- an abort tripped on a path that deferred
+            // nothing leaves reconcile with nothing to fail, and the run would exit 0 again.
+        }
+
+        if (!context.options.disableRetries && !context.stopSchedulingTests.load())
         {
 #if _DEBUG
             static constexpr int kFailedTestLimitForRetry = 100;
@@ -5891,25 +7617,50 @@ SlangResult innerMain(int argc, char** argv)
                     "Too many failed tests for retry(%d) - setting all to failed\n",
                     (int)context.failedFileTests.getCount());
                 fflush(stdout);
-                for (auto& test : context.failedFileTests)
-                {
-                    FileTestInfoImpl* fileTestInfo = static_cast<FileTestInfoImpl*>(test.Ptr());
-                    TestReporter::SuiteScope suiteScope(&reporter, "tests");
-                    TestReporter::TestScope scope(&reporter, fileTestInfo->testName);
-                    reporter.addResult(TestResult::Fail);
-                }
+                // Left to reconcilePendingRetries() below, as on the abort branch above.
             }
         }
+
+        // Every retry pass has now run, so any test whose result is still deferred is never going
+        // to get one. Turn those into failures before they reach the summary.
+        //
+        // The position matters and no unit test can hold it: the reporter tests call
+        // reconcilePendingRetries() directly, so moving this above the retry loop -- where it would
+        // count deferrals the retry was about to redeem -- or dropping it entirely would not fail
+        // any of them. It has to run after the last retry and before outputSummary().
+        reporter.reconcilePendingRetries();
 
         reporter.outputSummary();
 
         cleanupRenderTestDeviceCache(context);
-        return reporter.didAllSucceed() ? SLANG_OK : SLANG_FAIL;
+
+        // An abort is a failure in its own right, whatever ended up recorded.
+        //
+        // Deliberately belt-and-braces, and not independently testable: reconcilePendingRetries()
+        // converts every deferral, so any abort reachable today also leaves recorded failures and
+        // would exit non-zero without this term. It is kept because the two facts are independent
+        // -- one is "some tests failed", the other is "we stopped running tests" -- and only the
+        // second is true of a run that abandoned its work. A future change that downgrades or
+        // redeems those failures (an expected-failure list covering them, say) would restore the
+        // exit-0 hole this PR exists to close, and this term is what would still catch it.
+        const bool aborted = context.stopSchedulingTests.load();
+        return (reporter.didAllSucceed() && !aborted) ? SLANG_OK : SLANG_FAIL;
     }
 }
 
 int main(int argc, char** argv)
 {
+#if SLANG_UNIX_FAMILY
+    // Ignore SIGPIPE so that writing to a broken pipe (e.g. a crashed test-server)
+    // returns EPIPE instead of killing this process (exit code 141).
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+#if SLANG_IGNORE_ABORT_MSG && defined(_MSC_VER)
+    // Suppress the modal abort() dialog in unattended/LLM-driven builds.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
+
     // Fallback: run without cleanup if context initialization fails
     SlangResult res = innerMain(argc, argv);
     slang::shutdown();

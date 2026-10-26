@@ -88,9 +88,28 @@ void validateVectorsAndMatrices(
     DiagnosticSink* sink,
     TargetRequest* targetRequest);
 
+/// Reject mutable globals whose linked types require unsupported storage.
+///
+/// `module` must be linked and at the pipeline checkpoint after `specializeModule` and before
+/// `legalizeResourceTypes`. The operation checks mutable `static` variables declared at file or
+/// namespace scope and mutable uniform-parameter shadows synthesized for `-Gec`; AST-to-IR lowering
+/// marks both with `IRFileOrNamespaceScopeMutableVarDecoration`. Returns `false` after diagnosing a
+/// marked variable whose linked type contains an opaque value for which per-invocation resource
+/// replacement is unavailable, or an unsized array stored by value.
+bool validateMutableGlobalVariableTypes(IRModule* module, DiagnosticSink* sink);
+
 bool validateStructuredBufferResourceTypes(
     IRModule* module,
     DiagnosticSink* sink,
     TargetRequest* targetRequest);
+
+// Process kIROp_AssumeAddress instructions. When validate is true, checks that
+// getRootAddr(addr) is not a function-local variable (kIROp_Var) holding a
+// plain value, and emits an error if it is. Vars whose stored type is a pointer,
+// pointer-like resource (e.g. ConstantBuffer), structured buffer, or
+// byte-address buffer are exempt because those always refer to device memory.
+// Always replaces each AssumeAddress(x) with x so backend passes never see the
+// opcode.
+void validateAndRemoveAssumeAddress(IRModule* module, bool validate, DiagnosticSink* sink);
 
 } // namespace Slang

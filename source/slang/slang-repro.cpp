@@ -1,15 +1,17 @@
 // slang-repro.cpp
 #include "slang-repro.h"
 
-#include "../compiler-core/slang-artifact-desc-util.h"
-#include "../compiler-core/slang-artifact-util.h"
-#include "../compiler-core/slang-source-loc.h"
-#include "../core/slang-castable.h"
-#include "../core/slang-math.h"
-#include "../core/slang-stream.h"
-#include "../core/slang-text-io.h"
-#include "../core/slang-type-text-util.h"
+#include "compiler-core/slang-artifact-desc-util.h"
+#include "compiler-core/slang-artifact-util.h"
+#include "compiler-core/slang-source-loc.h"
+#include "core/slang-blob.h"
+#include "core/slang-castable.h"
+#include "core/slang-math.h"
+#include "core/slang-stream.h"
+#include "core/slang-text-io.h"
+#include "core/slang-type-text-util.h"
 #include "slang-options.h"
+#include "slang-repro-validator.h"
 #include "slang-rich-diagnostics.h"
 
 namespace Slang
@@ -64,7 +66,7 @@ static StableHashCode32 _calcTypeHash()
     return getStableHashCode32((const char*)&sizes, sizeof(sizes));
 }
 
-static StableHashCode32 _getTypeHash()
+/* static */ StableHashCode32 ReproUtil::getTypeHash()
 {
     static StableHashCode32 s_hash = _calcTypeHash();
     return s_hash;
@@ -380,6 +382,7 @@ static String _scrubName(const String& in)
         dst->optimizationLevel = linkage->m_optionSet.getOptimizationLevel();
         dst->containerFormat = request->m_containerFormat;
         dst->passThroughMode = request->m_passThrough;
+        dst->legacyAllowGLSLInput = request->getLegacyAllowGLSLInput();
 
         dst->useUnknownImageFormatAsDefault =
             linkage->m_optionSet.getBoolOption(CompilerOptionName::DefaultImageFormatUnknown);
@@ -546,6 +549,8 @@ static String _scrubName(const String& in)
             TranslationUnitRequestState& dstTranslationUnit = base[dstTranslationUnits[i]];
 
             dstTranslationUnit.language = srcTranslationUnit->sourceLanguage;
+            dstTranslationUnit.sourceLanguageExplicitlyRequested =
+                srcTranslationUnit->sourceLanguageExplicitlyRequested;
             dstTranslationUnit.moduleName = moduleName;
             dstTranslationUnit.sourceFiles = dstSourceFiles;
             dstTranslationUnit.preprocessorDefinitions = defines;
@@ -773,13 +778,25 @@ struct LoadContext
                 pathInfo.uniqueIdentity = m_base->asRaw(file->uniqueIdentity)->getSlice();
             }
 
-            dstFile = new SourceFile(m_sourceManager, pathInfo, blob->getBufferSize());
-            dstFile->setContents(blob);
+            // Every load path runs the state through `isReproStateValid`
+            // first, and the validator rejects any source-file entry whose
+            // file has no serialized contents (see `validateSourceFileState`
+            // in slang-repro-validator.cpp), so by the time we get here the
+            // blob always exists. Assert that producer-side invariant rather
+            // than silently tolerating a shape the validator forbids.
+            SLANG_RELEASE_ASSERT(blob);
+
+            // Create through the manager's factory so the file is registered in
+            // its owned-files list and freed with the manager. A bare
+            // `new SourceFile` paired with only `addSourceFile` below would be
+            // indexed for lookup but never deleted, since the manager's
+            // destructor only frees the files it created.
+            dstFile = m_sourceManager->createSourceFileWithBlob(pathInfo, blob);
 
             // Add to map
             m_sourceFileMap.add(sourceFile, dstFile);
 
-            // Add to manager
+            // Add to manager's unique-identity lookup
             m_sourceManager->addSourceFile(pathInfo.uniqueIdentity, dstFile);
         }
         return dstFile;
@@ -874,6 +891,11 @@ struct LoadContext
     ISlangFileSystem* replaceFileSystem,
     ComPtr<ISlangFileSystemExt>& outFileSystem)
 {
+    if (!requestState)
+    {
+        return SLANG_FAIL;
+    }
+
     LoadContext context(nullptr, replaceFileSystem, &base);
 
     CacheFileSystem* cacheFileSystem = new CacheFileSystem(nullptr);
@@ -932,6 +954,11 @@ struct LoadContext
     ISlangFileSystem* optionalFileSystem,
     EndToEndCompileRequest* request)
 {
+    if (!requestState || !request)
+    {
+        return SLANG_FAIL;
+    }
+
     auto externalRequest = asExternal(request);
 
     auto linkage = request->getLinkage();
@@ -960,6 +987,7 @@ struct LoadContext
         externalRequest->setOutputContainerFormat(
             SlangContainerFormat(requestState->containerFormat));
         externalRequest->setPassThrough(SlangPassThrough(request->m_passThrough));
+        request->setLegacyAllowGLSLInput(requestState->legacyAllowGLSLInput);
 
         linkage->m_optionSet.set(
             CompilerOptionName::DefaultImageFormatUnknown,
@@ -1050,6 +1078,8 @@ struct LoadContext
             SLANG_ASSERT(index == i);
 
             TranslationUnitRequest* dstTranslationUnit = dstTranslationUnits[i];
+            dstTranslationUnit->sourceLanguageExplicitlyRequested =
+                srcTranslationUnit.sourceLanguageExplicitlyRequested;
 
             context.loadDefines(
                 srcTranslationUnit.preprocessorDefinitions,
@@ -1075,7 +1105,7 @@ struct LoadContext
             {
                 // Create the source file
                 SourceFile* sourceFile =
-                    context.getSourceFile(base.asRaw(base.asRaw(srcSourceFiles[i])));
+                    context.getSourceFile(base.asRaw(base.asRaw(srcSourceFiles[j])));
 
                 // Create the artifact
                 auto sourceArtifact = ArtifactUtil::createArtifact(
@@ -1175,7 +1205,7 @@ struct LoadContext
 
     Header header;
     header.m_semanticVersion = g_semanticVersion;
-    header.m_typeHash = _getTypeHash();
+    header.m_typeHash = getTypeHash();
 
     cursor.addData(header);
     cursor.addUnownedData(container.getData(), container.getDataCount());
@@ -1193,7 +1223,14 @@ struct LoadContext
     return saveState(request, stream);
 }
 
-/* static */ SlangResult ReproUtil::loadState(
+static SlangResult _loadStateToList(Stream* stream, DiagnosticSink* sink, List<uint8_t>& outBuffer);
+static SlangResult _loadStateToList(
+    const uint8_t* data,
+    size_t dataSize,
+    DiagnosticSink* sink,
+    List<uint8_t>& outBuffer);
+
+static SlangResult _loadStateToList(
     const String& filename,
     DiagnosticSink* sink,
     List<uint8_t>& outBuffer)
@@ -1201,13 +1238,10 @@ struct LoadContext
     RefPtr<FileStream> stream = new FileStream;
     SLANG_RETURN_ON_FAIL(
         stream->init(filename, FileMode::Open, FileAccess::Read, FileShare::ReadWrite));
-    return loadState(stream, sink, outBuffer);
+    return _loadStateToList(stream, sink, outBuffer);
 }
 
-/* static */ SlangResult ReproUtil::loadState(
-    Stream* stream,
-    DiagnosticSink* sink,
-    List<uint8_t>& outBuffer)
+static SlangResult _loadStateToList(Stream* stream, DiagnosticSink* sink, List<uint8_t>& outBuffer)
 {
     List<Byte> streamData;
     {
@@ -1219,10 +1253,10 @@ struct LoadContext
         }
     }
 
-    return loadState(streamData.getBuffer(), streamData.getCount(), sink, outBuffer);
+    return _loadStateToList(streamData.getBuffer(), streamData.getCount(), sink, outBuffer);
 }
 
-/* static */ SlangResult ReproUtil::loadState(
+static SlangResult _loadStateToList(
     const uint8_t* data,
     size_t dataSize,
     DiagnosticSink* sink,
@@ -1234,13 +1268,13 @@ struct LoadContext
         sink->diagnose(Diagnostics::UnableToReadRiff{});
         return SLANG_FAIL;
     }
-    if (rootChunk->getType() != kSlangStateFileFourCC)
+    if (rootChunk->getType() != ReproUtil::kSlangStateFileFourCC)
     {
         sink->diagnose(Diagnostics::ExpectingSlangRiffContainer{});
         return SLANG_FAIL;
     }
 
-    auto dataChunk = rootChunk->findDataChunk(kSlangStateDataFourCC);
+    auto dataChunk = rootChunk->findDataChunk(ReproUtil::kSlangStateDataFourCC);
     if (!dataChunk)
     {
         sink->diagnose(Diagnostics::ExpectingSlangRiffContainer{});
@@ -1249,7 +1283,7 @@ struct LoadContext
 
     MemoryReader reader(dataChunk->getPayload(), dataChunk->getPayloadSize());
 
-    Header header;
+    ReproUtil::Header header;
     {
         auto result = reader.read(header);
         if (SLANG_FAILED(result))
@@ -1259,11 +1293,11 @@ struct LoadContext
         }
     }
 
-    if (!g_semanticVersion.isBackwardsCompatibleWith(header.m_semanticVersion))
+    if (!ReproUtil::g_semanticVersion.isBackwardsCompatibleWith(header.m_semanticVersion))
     {
         StringBuilder headerBuf, currentBuf;
         header.m_semanticVersion.append(headerBuf);
-        g_semanticVersion.append(currentBuf);
+        ReproUtil::g_semanticVersion.append(currentBuf);
 
         sink->diagnose(Diagnostics::IncompatibleRiffSemanticVersion{
             .actualVersion = headerBuf,
@@ -1271,7 +1305,7 @@ struct LoadContext
         return SLANG_FAIL;
     }
 
-    if (header.m_typeHash != _getTypeHash())
+    if (header.m_typeHash != ReproUtil::getTypeHash())
     {
         sink->diagnose(Diagnostics::RiffHashMismatch{});
         return SLANG_FAIL;
@@ -1280,21 +1314,68 @@ struct LoadContext
     auto remainingSize = reader.getRemainingSize();
     outBuffer.setCount(remainingSize);
 
+    if (remainingSize)
     {
-        auto result = reader.read(&outBuffer[0], remainingSize);
-        if (SLANG_FAILED(result))
+        auto readResult = reader.read(outBuffer.getBuffer(), remainingSize);
+        if (SLANG_FAILED(readResult))
         {
+            outBuffer.clear();
             sink->diagnose(Diagnostics::ExpectingSlangRiffContainer{});
-            return result;
+            return readResult;
         }
+    }
+
+    if (!isReproStateValid(outBuffer))
+    {
+        outBuffer.clear();
+        sink->diagnose(Diagnostics::InvalidReproState{});
+        return SLANG_FAIL;
     }
 
     return SLANG_OK;
 }
 
-/* static */ ReproUtil::RequestState* ReproUtil::getRequest(const List<uint8_t>& buffer)
+static SlangResult _loadStateToBlob(
+    const uint8_t* data,
+    size_t dataSize,
+    DiagnosticSink* sink,
+    ISlangBlob** outBlob)
 {
-    return (ReproUtil::RequestState*)(buffer.getBuffer() + kStartOffset);
+    if (!outBlob)
+        return SLANG_FAIL;
+
+    *outBlob = nullptr;
+
+    List<uint8_t> buffer;
+    SLANG_RETURN_ON_FAIL(_loadStateToList(data, dataSize, sink, buffer));
+
+    *outBlob = ListBlob::moveCreate(buffer).detach();
+    return SLANG_OK;
+}
+
+/* static */ SlangResult ReproUtil::loadState(
+    const uint8_t* data,
+    size_t dataSize,
+    DiagnosticSink* sink,
+    ISlangBlob** outBlob)
+{
+    return _loadStateToBlob(data, dataSize, sink, outBlob);
+}
+
+static bool _hasRequestStateRoot(const void* data, size_t size)
+{
+    return data && size >= kStartOffset && size - kStartOffset >= sizeof(ReproUtil::RequestState);
+}
+
+/* static */ const ReproUtil::RequestState* ReproUtil::getRequest(const void* data, size_t size)
+{
+    if (!_hasRequestStateRoot(data, size))
+    {
+        return nullptr;
+    }
+
+    return reinterpret_cast<const ReproUtil::RequestState*>(
+        static_cast<const uint8_t*>(data) + kStartOffset);
 }
 
 /* static */ SlangResult ReproUtil::calcDirectoryPathFromFilename(
@@ -1325,12 +1406,13 @@ struct LoadContext
     DiagnosticSink* sink)
 {
     List<uint8_t> buffer;
-    SLANG_RETURN_ON_FAIL(ReproUtil::loadState(filename, sink, buffer));
+    SLANG_RETURN_ON_FAIL(_loadStateToList(filename, sink, buffer));
 
     MemoryOffsetBase base;
     base.set(buffer.getBuffer(), buffer.getCount());
 
-    RequestState* requestState = ReproUtil::getRequest(buffer);
+    RequestState* requestState =
+        const_cast<RequestState*>(ReproUtil::getRequest(buffer.getBuffer(), buffer.getCount()));
 
     String dirPath;
     SLANG_RETURN_ON_FAIL(ReproUtil::calcDirectoryPathFromFilename(filename, dirPath));
@@ -1556,8 +1638,17 @@ static SlangResult _calcCommandLine(
 
     _calcPreprocessorDefines(base, requestState->preprocessorDefinitions, cmd);
 
+    if (requestState->legacyAllowGLSLInput)
+    {
+        // The compatibility state is request-local and is therefore absent from the serialized
+        // linkage options above. Preserve it explicitly in an extracted command line just as the
+        // binary replay path does.
+        cmd.addArg("-allow-glsl");
+    }
+
     {
         const auto& srcTranslationUnits = requestState->translationUnits;
+        SourceLanguage commandLineLanguage = SourceLanguage::Unknown;
 
         for (Index i = 0; i < srcTranslationUnits.getCount(); ++i)
         {
@@ -1565,6 +1656,38 @@ static SlangResult _calcCommandLine(
 
             _calcPreprocessorDefines(base, srcTranslationUnit.preprocessorDefinitions, cmd);
 
+            SourceLanguage languageToWrite = SourceLanguage::Unknown;
+            if (!requestState->legacyAllowGLSLInput)
+            {
+                languageToWrite = srcTranslationUnit.sourceLanguageExplicitlyRequested;
+
+                // `-lang` remains active for later command-line inputs. If an explicitly selected
+                // translation unit precedes an inferred one, write the latter's effective language
+                // to prevent the earlier selection from changing its parser mode. This necessarily
+                // makes that one extracted-command-line input explicit; the binary repro retains
+                // the original provenance exactly.
+                if (languageToWrite == SourceLanguage::Unknown &&
+                    commandLineLanguage != SourceLanguage::Unknown)
+                {
+                    languageToWrite = srcTranslationUnit.language;
+                }
+            }
+
+            if (languageToWrite != SourceLanguage::Unknown)
+            {
+                auto languageName = NameValueUtil::findName(
+                    TypeTextUtil::getLanguageInfos(),
+                    ValueInt(languageToWrite));
+                SLANG_RELEASE_ASSERT(languageName.getLength() != 0);
+
+                // Keep `-lang` adjacent to this translation unit's source paths. The command-line
+                // parser consumes those paths as explicit-language inputs, which reproduces a
+                // request such as `-lang glsl shader.slang` instead of re-inferring Slang from the
+                // serialized path.
+                cmd.addArg("-lang");
+                cmd.addArg(languageName);
+                commandLineLanguage = languageToWrite;
+            }
 
 #if 0
             if (srcTranslationUnit.moduleName)
@@ -1577,7 +1700,7 @@ static SlangResult _calcCommandLine(
 
             for (Index j = 0; j < srcSourceFiles.getCount(); ++j)
             {
-                SourceFileState* sourceFile = base.asRaw(base.asRaw(srcSourceFiles[i]));
+                SourceFileState* sourceFile = base.asRaw(base.asRaw(srcSourceFiles[j]));
                 OffsetString* path = base[sourceFile->foundPath];
 
                 if (path)
@@ -1622,6 +1745,11 @@ static SlangResult _calcCommandLine(
     RequestState* requestState,
     ISlangMutableFileSystem* fileSystem)
 {
+    if (!requestState || !fileSystem)
+    {
+        return SLANG_FAIL;
+    }
+
     StringBuilder builder;
 
     builder << "[command-line]\n";

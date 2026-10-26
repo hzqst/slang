@@ -1,6 +1,18 @@
 #ifdef SLANG_IN_SPIRV_EMIT_CONTEXT
 
-// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.100.asciidoc#DebugCompilationUnit
+// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.asciidoc#DebugInfoNone
+template<typename T>
+SpvInst* emitOpDebugInfoNone(
+    SpvInstParent* parent,
+    IRInst* inst,
+    const T& idResultType,
+    SpvInst* set)
+{
+    static_assert(isSingular<T>);
+    return emitInst(parent, inst, SpvOpExtInst, idResultType, kResultID, set, SpvWord(0));
+}
+
+// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.asciidoc#DebugCompilationUnit
 template<typename T>
 SpvInst* emitOpDebugCompilationUnit(
     SpvInstParent* parent,
@@ -27,7 +39,7 @@ SpvInst* emitOpDebugCompilationUnit(
         language);
 }
 
-// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.100.asciidoc#DebugSource
+// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.asciidoc#DebugSource
 template<typename T>
 SpvInst* emitOpDebugSource(
     SpvInstParent* parent,
@@ -73,7 +85,7 @@ SpvInst* emitOpDebugSourceContinued(
     return emitInst(parent, inst, SpvOpExtInst, idResultType, kResultID, set, SpvWord(102), text);
 }
 
-// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.100.asciidoc#DebugLine
+// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.asciidoc#DebugLine
 template<typename T>
 SpvInst* emitOpDebugLine(
     SpvInstParent* parent,
@@ -125,7 +137,7 @@ SpvInst* emitOpDebugEntryPoint(
         args);
 }
 
-// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.100.asciidoc#DebugFunction
+// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.asciidoc#DebugFunction
 template<typename T>
 SpvInst* emitOpDebugFunction(
     SpvInstParent* parent,
@@ -184,6 +196,33 @@ SpvInst* emitOpDebugFunctionDefinition(
         spvFunc);
 }
 
+// https://github.com/KhronosGroup/SPIRV-Registry/blob/main/nonsemantic/NonSemantic.Shader.DebugInfo.asciidoc#DebugLexicalBlock
+template<typename T>
+SpvInst* emitOpDebugLexicalBlock(
+    SpvInstParent* parent,
+    IRInst* inst,
+    const T& idResultType,
+    SpvInst* set,
+    IRInst* source,
+    IRInst* line,
+    IRInst* col,
+    SpvInst* scope)
+{
+    static_assert(isSingular<T>);
+    return emitInst(
+        parent,
+        inst,
+        SpvOpExtInst,
+        idResultType,
+        kResultID,
+        set,
+        SpvWord(21),
+        source,
+        line,
+        col,
+        scope);
+}
+
 template<typename T, typename Ts>
 SpvInst* emitOpDebugTypeFunction(
     SpvInstParent* parent,
@@ -222,7 +261,7 @@ SpvInst* emitOpDebugTypeComposite(
     IRInst* col,
     SpvInst* scope,
     IRInst* linkageName,
-    IRInst* size,
+    SpvInst* size,
     IRInst* flags,
     const Ts& members)
 {
@@ -618,7 +657,7 @@ SpvInst* emitOpDebugValue(
     IRInst* inst,
     const T& idResultType,
     SpvInst* set,
-    IRInst* localVar,
+    SpvInst* localVar,
     IRInst* value,
     SpvInst* expression,
     const Ts& indices)

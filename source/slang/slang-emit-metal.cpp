@@ -1,63 +1,16 @@
 // slang-emit-metal.cpp
 #include "slang-emit-metal.h"
 
-#include "../core/slang-writer.h"
+#include "core/slang-type-text-util.h"
+#include "core/slang-writer.h"
 #include "slang-emit-source-writer.h"
 #include "slang-ir-entry-point-decorations.h"
 #include "slang-ir-util.h"
-#include "slang-mangled-lexer.h"
 #include "slang-rich-diagnostics.h"
 
-#include <assert.h>
 
 namespace Slang
 {
-
-static const char* kMetalBuiltinPreludeMatrixCompMult = R"(
-template<typename T, int A, int B>
-matrix<T,A,B> _slang_matrixCompMult(matrix<T,A,B> m1, matrix<T,A,B> m2)
-{
-    matrix<T,A,B> result;
-    for (int i = 0; i < A; i++)
-        result[i] = m1[i] * m2[i];
-    return result;
-}
-)";
-
-static const char* kMetalBuiltinPreludeMatrixReshape = R"(
-template<int A, int B, typename T, int N, int M>
-matrix<T,A,B> _slang_matrixReshape(matrix<T,N,M> m)
-{
-    matrix<T,A,B> result = T(0);
-    for (int i = 0; i < min(A,N); i++)
-        for (int j = 0; j < min(B,M); j++)
-            result[i] = m[i][j];
-    return result;
-}
-)";
-
-static const char* kMetalBuiltinPreludeVectorReshape = R"(
-template<int A, typename T, int N>
-vec<T,A> _slang_vectorReshape(vec<T,N> v)
-{
-    vec<T,A> result = T(0);
-    for (int i = 0; i < min(A,N); i++)
-        result[i] = v[i];
-    return result;
-}
-)";
-
-static const char* kMetalBuiltinPreludeMatrixFmod = R"(
-template<typename T, int A, int B>
-matrix<T,A,B> _slang_matrixFmod(matrix<T,A,B> m1, matrix<T,A,B> m2)
-{
-    matrix<T,A,B> result;
-    for (int i = 0; i < A; i++)
-        result[i] = fmod(m1[i], m2[i]);
-    return result;
-}
-)";
-
 
 void MetalSourceEmitter::_emitHLSLDecorationSingleString(
     const char* name,
@@ -179,22 +132,49 @@ void MetalSourceEmitter::_emitHLSLTextureType(IRTextureTypeBase* texType)
     m_writer->emit(">");
 }
 
+// Return the resource type of a `DescriptorHandle<T>`, or `type` itself otherwise.
+// A handle is bindless on Metal and has T's layout, so binding attributes are
+// chosen from T.
+static IRType* unwrapDescriptorHandle(IRType* type)
+{
+    if (auto handleType = as<IRDescriptorHandleType>(type))
+        return handleType->getResourceType();
+    return type;
+}
+
 void MetalSourceEmitter::emitFuncParamLayoutImpl(IRInst* param)
 {
     auto layoutDecoration = param->findDecoration<IRLayoutDecoration>();
     if (!layoutDecoration)
+    {
+        if (param->findDecoration<IRTargetSystemValueDecoration>())
+            maybeEmitSystemSemantic(param);
         return;
+    }
     auto layout = as<IRVarLayout>(layoutDecoration->getLayout());
     if (!layout)
         return;
+
+    IRType* paramType = unwrapDescriptorHandle(param->getDataType());
+
+    // MSL accepts a fixed-size array of textures or samplers as an entry-point
+    // argument and binds it to consecutive slots from one base index (MSL 4.1
+    // section 2.12.1), so the texture and sampler cases test the element type
+    // of such an array. We unwrap only one sized array level, because the
+    // element of an MSL resource array must itself be a texture or sampler and
+    // an unsized array has no direct argument form. Nested and unsized arrays
+    // get no attribute: neither has a correct direct spelling in MSL.
+    IRType* textureOrSamplerType = paramType;
+    if (auto arrayType = as<IRArrayType>(paramType))
+        textureOrSamplerType = unwrapDescriptorHandle(arrayType->getElementType());
 
     for (auto rr : layout->getOffsetAttrs())
     {
         switch (rr->getResourceKind())
         {
         case LayoutResourceKind::MetalTexture:
-            if (as<IRTextureTypeBase>(param->getDataType()) ||
-                as<IRTextureBufferType>(param->getDataType()))
+            if (as<IRTextureTypeBase>(textureOrSamplerType) ||
+                as<IRTextureBufferType>(textureOrSamplerType))
             {
                 m_writer->emit(" [[texture(");
                 m_writer->emit(rr->getOffset());
@@ -202,11 +182,13 @@ void MetalSourceEmitter::emitFuncParamLayoutImpl(IRInst* param)
             }
             break;
         case LayoutResourceKind::MetalBuffer:
-            if (as<IRPtrTypeBase>(param->getDataType()) ||
-                as<IRHLSLStructuredBufferTypeBase>(param->getDataType()) ||
-                as<IRByteAddressBufferTypeBase>(param->getDataType()) ||
-                as<IRUniformParameterGroupType>(param->getDataType()) ||
-                as<IRRaytracingAccelerationStructureType>(param->getDataType()))
+            // MSL has no direct kernel-argument form for an array of buffers, so
+            // we test the whole parameter type and leave buffer arrays unbound
+            // until they are routed through an argument buffer (#12291).
+            if (as<IRPtrTypeBase>(paramType) || as<IRHLSLStructuredBufferTypeBase>(paramType) ||
+                as<IRByteAddressBufferTypeBase>(paramType) ||
+                as<IRUniformParameterGroupType>(paramType) ||
+                as<IRRaytracingAccelerationStructureType>(paramType))
             {
                 m_writer->emit(" [[buffer(");
                 m_writer->emit(rr->getOffset());
@@ -214,7 +196,7 @@ void MetalSourceEmitter::emitFuncParamLayoutImpl(IRInst* param)
             }
             break;
         case LayoutResourceKind::SamplerState:
-            if (as<IRSamplerStateTypeBase>(param->getDataType()))
+            if (as<IRSamplerStateTypeBase>(textureOrSamplerType))
             {
                 m_writer->emit(" [[sampler(");
                 m_writer->emit(rr->getOffset());
@@ -236,6 +218,17 @@ void MetalSourceEmitter::emitFuncParamLayoutImpl(IRInst* param)
     }
 }
 
+void MetalSourceEmitter::emitTempModifiers(IRInst* temp)
+{
+    // Metal has no `precise` keyword; drop it and warn.
+    if (temp->findDecoration<IRPreciseDecoration>())
+    {
+        getSink()->diagnose(Diagnostics::PreciseQualifierUnsupportedOnTarget{
+            .target = TypeTextUtil::getCompileTargetName(SlangCompileTarget(getTarget())),
+            .location = temp->sourceLoc});
+    }
+}
+
 void MetalSourceEmitter::emitParameterGroupImpl(
     IRGlobalParam* varDecl,
     IRUniformParameterGroupType* type)
@@ -249,6 +242,24 @@ void MetalSourceEmitter::emitEntryPointAttributesImpl(
 {
     auto stage = entryPointDecor->getProfile().getStage();
 
+    const auto emitRequiredThreadsPerThreadgroup = [&]()
+    {
+        if (getTargetCaps().implies(CapabilityAtom::metallib_4_0))
+        {
+            Int sizeAlongAxis[kThreadGroupAxisCount];
+            getComputeThreadGroupSize(irFunc, sizeAlongAxis);
+
+            m_writer->emit("[[required_threads_per_threadgroup(");
+            for (int ii = 0; ii < kThreadGroupAxisCount; ++ii)
+            {
+                if (ii != 0)
+                    m_writer->emit(", ");
+                m_writer->emit(sizeAlongAxis[ii]);
+            }
+            m_writer->emit(")]]\n");
+        }
+    };
+
     switch (stage)
     {
     case Stage::Fragment:
@@ -258,12 +269,15 @@ void MetalSourceEmitter::emitEntryPointAttributesImpl(
         m_writer->emit("[[vertex]] ");
         break;
     case Stage::Compute:
+        emitRequiredThreadsPerThreadgroup();
         m_writer->emit("[[kernel]] ");
         break;
     case Stage::Mesh:
+        emitRequiredThreadsPerThreadgroup();
         m_writer->emit("[[mesh]] ");
         break;
     case Stage::Amplification:
+        emitRequiredThreadsPerThreadgroup();
         m_writer->emit("[[object]] ");
         break;
     default:
@@ -447,6 +461,12 @@ bool MetalSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
     {
     case kIROp_Discard:
         m_writer->emit("discard_fragment();\n");
+        return true;
+    case kIROp_SubpassLoad:
+        SLANG_DIAGNOSE_UNEXPECTED(
+            getSink(),
+            inst,
+            "SubpassLoad should have been lowered before Metal emission");
         return true;
     case kIROp_MetalAtomicCast:
         {
@@ -690,6 +710,33 @@ bool MetalSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
             m_writer->emit("}\n");
             return true;
         }
+    case kIROp_CoopMatMulAdd:
+        {
+            auto coopMatMulAdd = cast<IRCoopMatMulAdd>(inst);
+            if (auto satLit = as<IRBoolLit>(coopMatMulAdd->getSaturatingAccumulation()))
+            {
+                if (satLit->getValue())
+                {
+                    getSink()->diagnose(Diagnostics::Unimplemented{
+                        .feature = "saturating accumulation for Metal cooperative matrices "
+                                   "(simdgroup_matrix)",
+                        .location = inst->sourceLoc});
+                    return false;
+                }
+            }
+            emitType(inst->getDataType(), getName(inst));
+            m_writer->emit(";\n");
+            m_writer->emit("simdgroup_multiply_accumulate(");
+            m_writer->emit(getName(inst));
+            m_writer->emit(", ");
+            emitOperand(coopMatMulAdd->getMatA(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(coopMatMulAdd->getMatB(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitOperand(coopMatMulAdd->getMatC(), getInfo(EmitOp::General));
+            m_writer->emit(");\n");
+            return true;
+        }
     }
     return false;
 }
@@ -698,6 +745,18 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
 {
     switch (inst->getOp())
     {
+    case kIROp_MakeArray:
+    case kIROp_MakeArrayFromElement:
+        {
+            // Metal spells an array as `metal::array<T,N>`, a struct wrapping a `T[N]` member, so
+            // its initializer needs two brace levels — the struct and its member array — whereas
+            // the base emitter emits one and relies on brace-elision, which is ambiguous for nested
+            // arrays (same shape and handling as the C++ `FixedArray` target).
+            m_writer->emit("{ ");
+            defaultEmitInstExpr(inst, inOuterPrec);
+            m_writer->emit(" }");
+            return true;
+        }
     case kIROp_MakeVector:
     case kIROp_MakeMatrix:
     case kIROp_MakeVectorFromScalar:
@@ -747,12 +806,19 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
         {
             if (as<IRMatrixType>(inst->getOperand(0)->getDataType()))
             {
-                // Metal does not support negate operator on matrices,
-                // we should emit "(matrix(0) - op0)" instead.
+                // Metal has no unary '-' on matrices, so lower matrix negation to
+                // "(matrix(0) - op0)". The explicit parentheses wrap the whole subtraction, so its
+                // outer context is effectively lowest-precedence: pass EmitOp::General (not the
+                // incoming outerPrec) and emit op0 as the subtraction's right-hand side. This wraps
+                // an operand that binds no tighter than '-' -- the additive "m1 + m2" (its
+                // left-associative RHS, at equal precedence) -- but not a tighter operand or an
+                // atomic.
                 m_writer->emit("(");
                 emitType(inst->getDataType());
                 m_writer->emit("(0) - ");
-                emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+                emitOperand(
+                    inst->getOperand(0),
+                    rightSide(getInfo(EmitOp::General), getInfo(EmitOp::Sub)));
                 m_writer->emit(")");
                 return true;
             }
@@ -813,6 +879,32 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
             m_writer->emit(")");
             return true;
         }
+    case kIROp_CastDescriptorHandleToUInt64:
+        {
+            // Metal: DescriptorHandle is a pointer; emit C-style cast to ulong.
+            // Precedence-wrapped like the kIROp_BitCast case below (#12732).
+            EmitOpInfo outerPrec = inOuterPrec;
+            bool needClose = maybeEmitParens(outerPrec, getInfo(EmitOp::Prefix));
+            m_writer->emit("(ulong)(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            m_writer->emit(")");
+            maybeCloseParens(needClose);
+            return true;
+        }
+    case kIROp_CastUInt64ToDescriptorHandle:
+        {
+            // Metal: cast integer back to pointer type.
+            // Precedence-wrapped like the kIROp_BitCast case below (#12732).
+            EmitOpInfo outerPrec = inOuterPrec;
+            bool needClose = maybeEmitParens(outerPrec, getInfo(EmitOp::Prefix));
+            m_writer->emit("(");
+            emitType(inst->getDataType());
+            m_writer->emit(")(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            m_writer->emit(")");
+            maybeCloseParens(needClose);
+            return true;
+        }
     case kIROp_BitCast:
         {
             auto toType = inst->getDataType();
@@ -825,12 +917,18 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
 
             if (toIsPointer || fromIsPointer)
             {
-                // C-style cast for pointer conversions
+                // C-style cast for pointer conversions. A cast is a prefix expression
+                // and binds looser than a postfix member access, so wrap it by
+                // precedence; otherwise `(T*)p->field` binds `->` to `p`, not the cast
+                // result, and Metal rejects it (#12732).
+                EmitOpInfo outerPrec = inOuterPrec;
+                bool needClose = maybeEmitParens(outerPrec, getInfo(EmitOp::Prefix));
                 m_writer->emit("(");
                 emitType(toType);
                 m_writer->emit(")(");
                 emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
                 m_writer->emit(")");
+                maybeCloseParens(needClose);
             }
             else
             {
@@ -853,6 +951,29 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
 
             m_writer->emit(buf);
 
+            return true;
+        }
+    case kIROp_Printf:
+        {
+            // Metal has no `printf`; its equivalent is the MSL 3.2 shader logging facility. Of the
+            // severity levels `log` is the one whose `MTLLogLevelNotice` survives the widest range
+            // of host `MTLLogState` configurations.
+            ensurePrelude(kMetalBuiltinPreludeLogging);
+            m_extensionTracker->requireMetalLanguageVersion(SemanticVersion(3, 2));
+            m_extensionTracker->requireLogging();
+            m_writer->emit("os_log_default.log(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            if (inst->getOperandCount() > 1)
+            {
+                List<IRInst*> args;
+                collectFlattenedVariadicOperands(inst, 1, args);
+                for (auto arg : args)
+                {
+                    m_writer->emit(", ");
+                    emitOperand(arg, getInfo(EmitOp::General));
+                }
+            }
+            m_writer->emit(")");
             return true;
         }
     case kIROp_ByteAddressBufferLoad:
@@ -977,21 +1098,30 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
     case kIROp_MetalSetIndices:
         {
             auto setIndices = as<IRMetalSetIndices>(inst);
-            const auto indices = as<IRVectorType>(setIndices->getElementValue()->getDataType());
-            UInt numIndices = as<IRIntLit>(indices->getElementCount())->getValue();
-            for (UInt i = 0; i < numIndices; ++i)
+            auto value = setIndices->getElementValue();
+            // Scalar for point topology, uint2/uint3 for lines/triangles.
+            auto vectorType = as<IRVectorType>(value->getDataType());
+            SLANG_ASSERT(vectorType || as<IRBasicType>(value->getDataType()));
+            IRIntegerValue numIndices = vectorType ? getIntVal(vectorType->getElementCount()) : 1;
+            for (IRIntegerValue i = 0; i < numIndices; ++i)
             {
                 m_writer->emit("_slang_mesh.set_index(");
-                emitOperand(setIndices->getIndex(), getInfo(EmitOp::General));
+                emitOperand(
+                    setIndices->getIndex(),
+                    leftSide(getInfo(EmitOp::General), getInfo(EmitOp::Mul)));
                 m_writer->emit("*");
-                m_writer->emitUInt64(numIndices);
+                m_writer->emitInt64(numIndices);
                 m_writer->emit("+");
-                m_writer->emitUInt64(i);
-                m_writer->emit(",(");
-                emitOperand(setIndices->getElementValue(), getInfo(EmitOp::General));
-                m_writer->emit(")[");
-                m_writer->emitUInt64(i);
-                m_writer->emit("]);\n");
+                m_writer->emitInt64(i);
+                m_writer->emit(",");
+                emitOperand(value, leftSide(getInfo(EmitOp::General), getInfo(EmitOp::Postfix)));
+                if (vectorType)
+                {
+                    m_writer->emit("[");
+                    m_writer->emitInt64(i);
+                    m_writer->emit("]");
+                }
+                m_writer->emit(");\n");
             }
             return true;
         }
@@ -1000,6 +1130,12 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
             m_writer->emit("nullptr");
             return true;
         }
+    case kIROp_SubpassLoad:
+        SLANG_DIAGNOSE_UNEXPECTED(
+            getSink(),
+            inst,
+            "SubpassLoad should have been lowered before Metal emission");
+        return true;
     default:
         break;
     }
@@ -1082,8 +1218,15 @@ void MetalSourceEmitter::emitSwitchDecorationsImpl(IRSwitch* switchInst)
 
 void MetalSourceEmitter::emitFuncDecorationImpl(IRDecoration* decoration)
 {
-    // Does not apply to metal.
-    SLANG_UNUSED(decoration);
+    switch (decoration->getOp())
+    {
+    case kIROp_NoInlineDecoration:
+        m_writer->emit("__attribute__((noinline))\n");
+        break;
+
+    default:
+        break;
+    }
 }
 
 void MetalSourceEmitter::emitSimpleValueImpl(IRInst* inst)
@@ -1114,6 +1257,31 @@ void MetalSourceEmitter::emitSimpleValueImpl(IRInst* inst)
             default:
                 break;
             }
+
+            // Suffix finite half/float literals so MSL doesn't type a bare decimal
+            // as `double` (which breaks `as_type<ushort>(h)`, #11837). NaN/Inf and
+            // Double stay bare; non-finite half/float is a known remaining gap.
+            if (auto basicType = as<IRBasicType>(inst->getDataType()))
+            {
+                const char* suffix = nullptr;
+                switch (basicType->getBaseType())
+                {
+                case BaseType::Half:
+                    suffix = "h";
+                    break;
+                case BaseType::Float:
+                    suffix = "f";
+                    break;
+                default:
+                    break;
+                }
+                if (suffix)
+                {
+                    m_writer->emit(constantInst->value.floatVal);
+                    m_writer->emit(suffix);
+                    return;
+                }
+            }
             break;
         }
 
@@ -1127,6 +1295,32 @@ void MetalSourceEmitter::emitSimpleValueImpl(IRInst* inst)
 void MetalSourceEmitter::emitParamTypeImpl(IRType* type, String const& name)
 {
     emitType(type, name);
+}
+
+void MetalSourceEmitter::_validateCoopMatrixType(IRCoopMatrixType* coopType)
+{
+    auto rows = getIntVal(coopType->getRowCount());
+    auto cols = getIntVal(coopType->getColumnCount());
+    if (rows != 8 || cols != 8)
+    {
+        getSink()->diagnose(Diagnostics::Unimplemented{
+            .feature = "Metal cooperative matrices (simdgroup_matrix) only support 8x8 dimensions",
+            .location = coopType->sourceLoc});
+    }
+    auto scope = getIntVal(coopType->getScope());
+    if (scope != (IRIntegerValue)MemoryScope::Subgroup)
+    {
+        getSink()->diagnose(Diagnostics::Unimplemented{
+            .feature = "Metal cooperative matrices (simdgroup_matrix) only support Subgroup scope",
+            .location = coopType->sourceLoc});
+    }
+    auto elementType = coopType->getElementType();
+    if (elementType->getOp() != kIROp_HalfType && elementType->getOp() != kIROp_FloatType)
+    {
+        getSink()->diagnose(Diagnostics::Unimplemented{
+            .feature = "Metal cooperative matrices only support half and float element types",
+            .location = coopType->sourceLoc});
+    }
 }
 
 void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
@@ -1185,6 +1379,15 @@ void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
                 getIntVal(vecType->getElementCount()));
             return;
         }
+    case kIROp_MetalPackedVectorType:
+        {
+            auto packedVecType = (IRMetalPackedVectorType*)type;
+            m_writer->emit("packed_");
+            emitVectorTypeNameImpl(
+                packedVecType->getElementType(),
+                getIntVal(packedVecType->getElementCount()));
+            return;
+        }
     case kIROp_MatrixType:
         {
             auto matType = (IRMatrixType*)type;
@@ -1232,7 +1435,9 @@ void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
     case kIROp_BorrowInParamType:
         {
             auto ptrType = cast<IRPtrTypeBase>(type);
-            if (type->getOp() == kIROp_BorrowInParamType)
+            if (type->getOp() == kIROp_BorrowInParamType ||
+                (type->getOp() == kIROp_RefParamType &&
+                 ptrType->getAccessQualifier() == AccessQualifier::Read))
             {
                 m_writer->emit("const ");
             }
@@ -1287,6 +1492,27 @@ void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
             m_writer->emit(">");
             return;
         }
+    case kIROp_CoopMatrixType:
+        {
+            auto coopType = as<IRCoopMatrixType>(type);
+            _validateCoopMatrixType(coopType);
+            // Metal's simdgroup_matrix<T, Cols, Rows> uses Cols, Rows order
+            m_writer->emit("simdgroup_matrix<");
+            emitType(coopType->getElementType());
+            m_writer->emit(", ");
+            emitVal(coopType->getColumnCount(), getInfo(EmitOp::General));
+            m_writer->emit(", ");
+            emitVal(coopType->getRowCount(), getInfo(EmitOp::General));
+            m_writer->emit(">");
+            ensurePrelude(kMetalBuiltinPreludeSimdgroupMatrixOps);
+            return;
+        }
+    case kIROp_SubpassInputType:
+        SLANG_DIAGNOSE_UNEXPECTED(
+            getSink(),
+            type,
+            "SubpassInputType should have been lowered before Metal emission");
+        return;
     default:
         break;
     }
@@ -1314,7 +1540,8 @@ void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
         m_writer->emit(" device*");
         return;
     }
-    else if (const auto untypedBufferType = as<IRUntypedBufferResourceType>(type))
+    else if (const auto untypedBufferType = as<IRUntypedBufferResourceType>(type);
+             untypedBufferType)
     {
         switch (type->getOp())
         {

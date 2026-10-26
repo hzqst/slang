@@ -4,28 +4,32 @@
 # Requires driver 580.65.06 or newer
 #
 # Used by:
+# - .github/workflows/ci-rhi-test-container.yml
 # - .github/workflows/ci-slang-build-container.yml
 # - .github/workflows/ci-slang-test-container.yml
-# - .github/workflows/copilot-setup-steps.yml
+# - .github/workflows/cmake-options-build-container.yml
+# - extras/ci-gpu-stress-loop.py
 #
 # Build and push:
-#   docker build -f docker/linux-gpu-ci.Dockerfile -t ghcr.io/shader-slang/slang-linux-gpu-ci:v1.3.0 .
-#   docker push ghcr.io/shader-slang/slang-linux-gpu-ci:v1.3.0
+#   docker build -f docker/linux-gpu-ci.Dockerfile -t ghcr.io/shader-slang/slang-linux-gpu-ci:v1.7.0 .
+#   docker push ghcr.io/shader-slang/slang-linux-gpu-ci:v1.7.0
 #
 # IMPORTANT: After pushing a new version, update all references in:
+#   - .github/workflows/ci-rhi-test-container.yml
 #   - .github/workflows/ci-slang-build-container.yml
 #   - .github/workflows/ci-slang-test-container.yml
-#   - .github/workflows/ci-slangpy-tests-container.yml
+#   - .github/workflows/cmake-options-build-container.yml
+#   - extras/ci-gpu-stress-loop.py
 #
 # Find all references:
-#   grep -rn "ghcr.io/shader-slang/slang-linux-gpu-ci" .github/workflows/
+#   grep -rn "ghcr.io/shader-slang/slang-linux-gpu-ci" .github/workflows/ extras/ci-gpu-stress-loop.py
 #
 # The check-container-consistency.yml workflow will verify all references match.
 
 FROM nvidia/cuda:13.0.1-devel-ubuntu22.04
 
-# Install essential tools required for GitHub Actions and Copilot
-# - curl: for downloading Copilot runtime and dependencies
+# Install essential tools required for GitHub Actions
+# - curl: for downloading dependencies
 # - wget: for downloading CMake and other tools
 # - git: for repository operations and submodules
 # - tar, gzip: for archive extraction
@@ -40,6 +44,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install build dependencies
+# Note: Vulkan headers, spirv-tools, and glslang come from the Vulkan SDK tarball below.
+# Do NOT install libgl1-mesa-dev — it pulls in mesa-vulkan-drivers and libLLVM-15,
+# which cause concurrent Vulkan initialization crashes in test-servers (see #10618).
 RUN apt-get update && apt-get install -y \
     build-essential \
     ninja-build \
@@ -52,27 +59,31 @@ RUN apt-get update && apt-get install -y \
     libxrandr-dev \
     libxinerama-dev \
     libxi-dev \
-    libgl1-mesa-dev \
-    libvulkan-dev \
-    spirv-tools \
-    glslang-tools \
+    gdb \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Vulkan SDK 1.4.321.1 from tarball (apt packages discontinued after 1.4.313)
-# Using tarball to get the fixed validation layers that resolve cooperative vector issues
-ENV VULKAN_SDK=/opt/vulkan-sdk/1.4.321.1/x86_64
+# Install Vulkan SDK 1.4.350.0 from tarball (apt packages discontinued after 1.4.313).
+# This is the first SDK containing the validation-layer fix for VUID 10904 (see #13148).
+ENV VULKAN_SDK=/opt/vulkan-sdk/1.4.350.0/x86_64
 ENV PATH="${VULKAN_SDK}/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${VULKAN_SDK}/lib:${LD_LIBRARY_PATH}"
+# SDK 1.4.350 moved the loader under lib/VulkanLoader/lib. Keep the general SDK
+# library directory as well for validation layers and the other SDK components.
+ENV LD_LIBRARY_PATH="${VULKAN_SDK}/lib/VulkanLoader/lib:${VULKAN_SDK}/lib:${LD_LIBRARY_PATH}"
 ENV VK_LAYER_PATH="${VULKAN_SDK}/share/vulkan/explicit_layer.d"
 
-RUN wget -q https://sdk.lunarg.com/sdk/download/1.4.321.1/linux/vulkansdk-linux-x86_64-1.4.321.1.tar.xz && \
-    tar -xf vulkansdk-linux-x86_64-1.4.321.1.tar.xz && \
+RUN wget -q https://sdk.lunarg.com/sdk/download/1.4.350.0/linux/vulkansdk-linux-x86_64-1.4.350.0.tar.xz && \
+    echo "b65f068ab36263559da49d7cacd7e7b9df23824ca8b68ccc522a2b06f5725df2  vulkansdk-linux-x86_64-1.4.350.0.tar.xz" | sha256sum -c - && \
+    tar -xf vulkansdk-linux-x86_64-1.4.350.0.tar.xz && \
     mkdir -p /opt/vulkan-sdk && \
-    mv 1.4.321.1 /opt/vulkan-sdk/ && \
-    rm -rf vulkansdk-linux-x86_64-1.4.321.1.tar.xz
+    mv 1.4.350.0 /opt/vulkan-sdk/ && \
+    rm -rf vulkansdk-linux-x86_64-1.4.350.0.tar.xz && \
+    printf '%s\n' "${VULKAN_SDK}/lib/VulkanLoader/lib" "${VULKAN_SDK}/lib" \
+        > /etc/ld.so.conf.d/vulkan-sdk.conf && \
+    ldconfig
 
 # Install runtime libraries for test execution
-RUN apt-get update && apt-get install -y \
+# Use --no-install-recommends to avoid pulling in mesa-vulkan-drivers (see #10618).
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-6 \
     libxext6 \
     libegl1 \
@@ -90,9 +101,6 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v3.30.0/cmake-3.3
 # Install environment info script
 COPY docker/print-env-info.sh /usr/local/bin/print-env-info
 RUN chmod +x /usr/local/bin/print-env-info
-
-# Git configuration for container workflows
-RUN git config --global --add safe.directory '*'
 
 # Verify installations
 RUN echo "=== Installed Tools ===" && \

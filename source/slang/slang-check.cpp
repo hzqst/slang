@@ -5,7 +5,7 @@
 // checking that don't cleanly land in one of the more
 // specialized `slang-check-*` files.
 
-#include "../core/slang-type-text-util.h"
+#include "core/slang-type-text-util.h"
 #include "slang-check-impl.h"
 #include "slang-rich-diagnostics.h"
 
@@ -80,6 +80,9 @@ void Session::_setSharedLibraryLoader(ISlangSharedLibraryLoader* loader)
 
 void Session::resetDownstreamCompiler(PassThroughMode type)
 {
+    // The downstream compiler table is shared session state and may be reset concurrently.
+    std::lock_guard<std::recursive_mutex> lock(m_downstreamCompilerMutex);
+
     // Mark as initialized
     m_downstreamCompilerInitialized &= ~(1 << int(type));
     m_downstreamCompilers[int(type)].setNull();
@@ -89,6 +92,10 @@ IDownstreamCompiler* Session::getOrLoadDownstreamCompiler(
     PassThroughMode type,
     DiagnosticSink* sink)
 {
+    // Lazy downstream compiler loading mutates shared state, and GenericCCpp can re-enter
+    // this routine while probing specific C/C++ compilers.
+    std::lock_guard<std::recursive_mutex> lock(m_downstreamCompilerMutex);
+
     if (m_downstreamCompilerInitialized & (1 << int(type)))
     {
         return m_downstreamCompilers[int(type)];
@@ -192,16 +199,17 @@ void checkTranslationUnit(
 
     visitor.checkModule(translationUnit->getModuleDecl());
 
-    translationUnit->getModule()->_collectShaderParams();
+    translationUnit->getModule()->_collectShaderParams(translationUnit->compileRequest->getSink());
 }
 
 void SemanticsVisitor::dispatchStmt(Stmt* stmt, SemanticsContext const& context)
 {
     SemanticsStmtVisitor visitor(context);
-    try
+    SLANG_EXCEPTION_TRY
     {
         visitor.dispatch(stmt);
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const AbortCompilationException&)
     {
         throw;
@@ -211,15 +219,17 @@ void SemanticsVisitor::dispatchStmt(Stmt* stmt, SemanticsContext const& context)
         getSink()->noteInternalErrorLoc(stmt->loc);
         throw;
     }
+#endif
 }
 
 Expr* SemanticsVisitor::dispatchExpr(Expr* expr, SemanticsContext const& context)
 {
     SemanticsExprVisitor visitor(context);
-    try
+    SLANG_EXCEPTION_TRY
     {
         return visitor.dispatch(expr);
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const AbortCompilationException&)
     {
         throw;
@@ -229,6 +239,7 @@ Expr* SemanticsVisitor::dispatchExpr(Expr* expr, SemanticsContext const& context
         getSink()->noteInternalErrorLoc(expr->loc);
         throw;
     }
+#endif
 }
 
 ASTBuilder* semanticsVisitorGetASTBuilder(SemanticsVisitor* sv)

@@ -37,9 +37,9 @@ GroupSharedPtr<T> paramGroupShared<T : __BuiltinIntegerType>(out groupshared T[1
 [numthreads(1, 1, 1)]
 void computeMain(int id : SV_DispatchThreadID)
 {
+    // A mutable structured-buffer element is a device-memory lvalue, so taking its
+    // address is allowed (shader-slang/slang#12581).
     int* ptr1 = __getAddress(bufferStorage[id.x]);
-//diag:         ^^^^^^^^^^^^ invalid __getAddress usage
-//diag:         ^^^^^^^^^^^^ '__getAddress' only supports groupshared variables and members of groupshared/device memory.
 
     int[100]* ptr2 = __getAddress(bufferGroupShared);
 //diag:              ^^^^^^^^^^^^ type mismatch in expression

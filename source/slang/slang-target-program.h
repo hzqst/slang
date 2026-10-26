@@ -7,11 +7,13 @@
 // linked program/binary and/or its entry points.
 //
 
-#include "../core/slang-smart-pointer.h"
+#include "core/slang-smart-pointer.h"
 #include "slang-hlsl-to-vulkan-layout-options.h"
 #include "slang-ir.h"
 #include "slang-linkable.h"
 #include "slang-target.h"
+
+#include <mutex>
 
 namespace Slang
 {
@@ -44,20 +46,14 @@ public:
     ///
     /// If this is the first time the layout has been
     /// requested, report any errors that arise during
-    /// layout to the given `sink`.
+    /// layout to the given `sink`. Returns null if layout
+    /// reported errors, on this request or an earlier one.
     ///
     ProgramLayout* getOrCreateLayout(DiagnosticSink* sink);
 
-    /// Get the layout for the program on the target.
+    /// Get the existing layout for the program on the target, if already created.
     ///
-    /// This routine assumes that `getOrCreateLayout`
-    /// has already been called previously.
-    ///
-    ProgramLayout* getExistingLayout()
-    {
-        SLANG_ASSERT(m_layout);
-        return m_layout;
-    }
+    ProgramLayout* getExistingLayout() { return m_layout; }
 
     /// Get the compiled code for an entry point on the target.
     ///
@@ -68,7 +64,12 @@ public:
     IArtifact* getOrCreateEntryPointResult(Int entryPointIndex, DiagnosticSink* sink);
     IArtifact* getOrCreateWholeProgramResult(DiagnosticSink* sink);
 
-    IArtifact* getExistingWholeProgramResult() { return m_wholeProgramResult; }
+    IArtifact* getExistingWholeProgramResult()
+    {
+        // These accessors can race a worker thread publishing the cached whole-program result.
+        std::lock_guard<std::mutex> lock(m_resultCacheMutex);
+        return m_wholeProgramResult;
+    }
     /// Get the compiled code for an entry point on the target.
     ///
     /// This routine assumes that `getOrCreateEntryPointResult`
@@ -76,6 +77,10 @@ public:
     ///
     IArtifact* getExistingEntryPointResult(Int entryPointIndex)
     {
+        // Guard both the cache read and the bounds check because the array is resized lazily.
+        std::lock_guard<std::mutex> lock(m_resultCacheMutex);
+        if (entryPointIndex < 0 || entryPointIndex >= m_entryPointResults.getCount())
+            return nullptr;
         return m_entryPointResults[entryPointIndex];
     }
 
@@ -114,6 +119,13 @@ public:
 private:
     RefPtr<IRModule> createIRModuleForLayout(DiagnosticSink* sink);
 
+    /// Seed this program's options with the session's and then the target's `DownstreamArgs`.
+    /// The constructor's `overrideWith` of the program's own options then appends the program's
+    /// entries, so Slang combines session, target and program arguments in that order, without
+    /// any of them merged. `DownstreamArgs` is level-local (see
+    /// `CompilerOptionSet::isLevelLocal`), so the levels are combined only here.
+    void composeDownstreamArgs();
+
     // The program being compiled or laid out
     ComponentType* m_program;
 
@@ -123,7 +135,12 @@ private:
     // The computed layout, if it has been generated yet
     RefPtr<ProgramLayout> m_layout;
 
+    // Whether generating `m_layout` reported errors
+    bool m_layoutHasErrors = false;
+
     CompilerOptionSet m_optionSet;
+    // Parallel backend emission shares these lazy result caches across threads.
+    mutable std::mutex m_resultCacheMutex;
 
     // Generated compile results for each entry point
     // in the parent `Program` (indexing matches

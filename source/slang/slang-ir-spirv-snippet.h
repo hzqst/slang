@@ -1,12 +1,14 @@
 // slang-ir-spirv-legalize.h
 #pragma once
-#include "../core/slang-basic.h"
+#include "core/slang-basic.h"
 #include "spirv/unified1/spirv.h"
 
 namespace Slang
 {
 
 struct SPIRVCoreGrammarInfo;
+class DiagnosticSink;
+class SourceLoc;
 
 //
 // [2.2: Terms]
@@ -76,15 +78,17 @@ struct SpvSnippet : public RefObject
         UInt2,
     };
 
+    static const int kMaxASMConstantValues = 4;
+
     struct ASMConstant
     {
         ASMType type;
-        SpvWord intValues[4];
-        float floatValues[4];
+        SpvWord intValues[kMaxASMConstantValues];
+        float floatValues[kMaxASMConstantValues];
         HashCode getHashCode() const
         {
             HashCode result = (HashCode)type;
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < kMaxASMConstantValues; i++)
             {
                 switch (type)
                 {
@@ -142,7 +146,9 @@ struct SpvSnippet : public RefObject
 
     static RefPtr<SpvSnippet> parse(
         const SPIRVCoreGrammarInfo& spirvGrammar,
-        UnownedStringSlice definition);
+        UnownedStringSlice definition,
+        SourceLoc sourceLoc,
+        DiagnosticSink* sink);
 };
 
 

@@ -3,7 +3,7 @@
 #ifndef SLANG_AST_PRINT_H
 #define SLANG_AST_PRINT_H
 
-#include "../core/slang-range.h"
+#include "core/slang-range.h"
 #include "slang-ast-all.h"
 
 namespace Slang
@@ -139,8 +139,13 @@ public:
     /// parameters)
     void addOverridableDeclPath(const DeclRef<Decl>& declRef);
 
-    /// Add just the parameters from a declaration.
-    /// Will output the generic parameters (if it's a generic) in <> before the parameters ()
+    /// Add a declaration's parameters and any trailing qualifier for its receiver parameter.
+    ///
+    /// Prints generic parameters in <> for a generic declaration, or ordinary parameters in ()
+    /// for a callable declaration.
+    /// For a generic function, a written trailing qualifier follows <> even though the ordinary
+    /// parameter list is omitted. Receiver parameter mode attributes and dialect defaults are
+    /// not displayed.
     void addDeclParams(const DeclRef<Decl>& declRef, List<Range<Index>>* outParamRange = nullptr);
 
     /// Add a prefix that describes the kind of declaration
@@ -157,6 +162,13 @@ public:
     void addGenericParams(
         const DeclRef<GenericDecl>& genericDeclRef,
         List<Slang::Range<Index>>* outParamRanges = nullptr);
+
+    /// Append a human-readable rendering of a generic `where`-clause constraint
+    /// declaration, matching Slang surface syntax so diagnostics echo what the
+    /// user wrote: subtype `T : I`, equality `T == X`, coercion `To(From)`, or
+    /// non-empty pack `nonempty(P)`. Falls back to the declaration's name for
+    /// any other constraint kind.
+    void addGenericConstraint(Decl* constraintDecl);
 
     /// Get the specified part type. Returns empty slice if not found
     UnownedStringSlice getPartSlice(Part::Type partType) const;
@@ -185,6 +197,11 @@ public:
 
     static String getDeclSignatureString(const LookupResultItem& item, ASTBuilder* astBuilder);
     static String getDeclSignatureString(DeclRef<Decl> declRef, ASTBuilder* astBuilder);
+
+    /// Render a generic `where`-clause constraint declaration to a string via
+    /// `addGenericConstraint`. Used by diagnostics that name an unsatisfied
+    /// constraint.
+    static String getGenericConstraintString(Decl* constraintDecl, ASTBuilder* astBuilder);
 
 protected:
     void _addDeclPathRec(const DeclRef<Decl>& declRef, Index depth);

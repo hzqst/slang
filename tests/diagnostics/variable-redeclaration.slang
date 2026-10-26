@@ -15,9 +15,6 @@ static int gA;
 static Texture2D gA;
 //diag:          ^^ conflicting declaration
 //diag:          ^^ declaration of 'gA' conflicts with existing declaration
-//diag:          ^^ global variable cannot have opaque type
-//diag:          ^^ global variable cannot have opaque type.
-//diag:          ^^ do you intend to define a `uniform` parameter instead?
 
 // Local variables
 
@@ -55,11 +52,11 @@ struct S
 //diag:^ conflicting declaration
 //diag:^ declaration of 'f' conflicts with existing declaration
 //diag:^ see previous declaration of 'f'
+//diag:^ some of the above errors may have been produced while synthesizing method '$init' of 'S'
 {
 	int f;
 /*diag:
      ^ see previous declaration of 'f'
-     ^ ambiguous reference to 'f'
      ^ ambiguous reference to 'f'
      ^ candidate: int S.f
      ^ candidate: int S.f
@@ -68,7 +65,6 @@ struct S
 //diag:^ conflicting declaration
 //diag:^ declaration of 'f' conflicts with existing declaration
 //diag:^ candidate: float S.f
-//diag:^ ambiguous reference to 'f'
 //diag:^ ambiguous reference to 'f'
 //diag:^ candidate: float S.f
 }
@@ -88,7 +84,6 @@ int testParameterRedeclaration(
 {
 	return size;
 /*diag:
-        ^^^^ ambiguous reference to 'size'
         ^^^^ ambiguous reference to 'size'
 */
 }

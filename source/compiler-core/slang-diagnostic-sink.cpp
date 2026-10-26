@@ -1,11 +1,11 @@
 // slang-diagnostic-sink.cpp
 #include "slang-diagnostic-sink.h"
 
-#include "../compiler-core/slang-rich-diagnostics-render.h"
-#include "../core/slang-char-util.h"
-#include "../core/slang-dictionary.h"
-#include "../core/slang-memory-arena.h"
-#include "../core/slang-string-util.h"
+#include "compiler-core/slang-rich-diagnostics-render.h"
+#include "core/slang-char-util.h"
+#include "core/slang-dictionary.h"
+#include "core/slang-memory-arena.h"
+#include "core/slang-string-util.h"
 #include "slang-core-diagnostics.h"
 #include "slang-name-convention-util.h"
 #include "slang-name.h"
@@ -671,7 +671,8 @@ bool DiagnosticSink::diagnoseRichImpl(
             getSourceLocationLexer(),
             sourceManager,
             {.enableTerminalColors = shouldEnableTerminalColors(),
-             .enableUnicode = shouldEnableUnicode()},
+             .enableUnicode = shouldEnableUnicode(),
+             .format = getDiagnosticFormat()},
             effectiveDiagnostic);
     }
 
@@ -744,6 +745,13 @@ Severity DiagnosticSink::getEffectiveMessageSeverity(
         // Override the current severity, but don't allow lowering it if it's Error or Fatal
         if (effectiveSeverity < Severity::Error || *pSeverityOverride >= effectiveSeverity)
             effectiveSeverity = *pSeverityOverride;
+    }
+    else if (effectiveSeverity == Severity::Warning && !isWarningLevelEnabled(info.level))
+    {
+        // The warning belongs to an opt-in group (-Wall/-Wextra/-Wpedantic) that has not been
+        // enabled, so it is suppressed. An explicit per-id override (-W<name>/-Wno-<name>) takes
+        // precedence over this group gating, which is why it lives in the `else` branch.
+        effectiveSeverity = Severity::Disable;
     }
 
     if (isFlagSet(Flag::TreatWarningsAsErrors) && effectiveSeverity == Severity::Warning)
@@ -828,8 +836,12 @@ void DiagnosticSink::overrideDiagnosticSeverity(
     {
         SLANG_ASSERT(info->id == diagnosticId);
 
-        // If the override is the same as the default, we can just remove the override
-        if (info->severity == overrideSeverity)
+        // If the override is the same as the default, we can just remove the override -- but only
+        // for the always-on Default group. For a warning in an opt-in group (-Wall/-Wextra/
+        // -Wpedantic), an explicit override back to its nominal Warning severity is meaningful: it
+        // force-enables the warning even though its group is not enabled, so the override must be
+        // kept (an absent override would let group gating suppress it).
+        if (info->severity == overrideSeverity && info->level == WarningLevel::Default)
         {
             m_severityOverrides.remove(diagnosticId);
             return;
@@ -952,29 +964,33 @@ void outputExceptionDiagnostic(
     DiagnosticSink& sink,
     slang::IBlob** outDiagnostics)
 {
-    try
+    SLANG_EXCEPTION_TRY
     {
         sink.diagnoseRaw(Severity::Internal, exception.Message.getUnownedSlice());
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const AbortCompilationException&)
     {
         // Catch and ignore the AbortCompilationException that diagnoseRaw throws
         // for Internal severity to prevent exception leak from loadModule
     }
+#endif
     sink.getBlobIfNeeded(outDiagnostics);
 }
 
 void outputExceptionDiagnostic(DiagnosticSink& sink, slang::IBlob** outDiagnostics)
 {
-    try
+    SLANG_EXCEPTION_TRY
     {
         sink.diagnoseRaw(Severity::Fatal, "An unknown exception occurred");
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const AbortCompilationException&)
     {
         // Catch and ignore the AbortCompilationException that diagnoseRaw throws
         // for Fatal severity to prevent exception leak from loadModule
     }
+#endif
     sink.getBlobIfNeeded(outDiagnostics);
 }
 

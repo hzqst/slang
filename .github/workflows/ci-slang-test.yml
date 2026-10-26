@@ -18,10 +18,6 @@ on:
       runs-on:
         required: true
         type: string
-      test-category:
-        required: false
-        type: string
-        default: smoke
       full-gpu-tests:
         required: false
         type: boolean
@@ -39,17 +35,76 @@ on:
         type: string
         default: ""
         description: "Optional suffix for artifact name (e.g., '-cuda')"
+      cpu-only:
+        required: false
+        type: boolean
+        default: false
+        description: "Restrict slang-test to CPU and LLVM backends via -api cpu+llvm"
+      slang-user-skills:
+        required: false
+        type: boolean
+        default: false
+        description: "Validate the bundled Slang user skills and their examples"
+      gpu-api-only:
+        required: false
+        type: boolean
+        default: false
+        description: "Restrict slang-test to GPU APIs (vk+cuda+dx11+dx12+mtl+wgpu) while retaining no-API tests needed by multi-step workflows"
+      gpu-tier:
+        required: false
+        type: string
+        default: ""
+        description: "GPU tier label (e.g., 't4', 'sm80plus'). Used to apply tier-specific skip lists."
+      run-via-glsl:
+        required: true
+        type: boolean
+        description: "Run the via-glsl pass on pull requests."
 
 jobs:
   test-slang:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      # Ensure Git Bash tools are in PATH for Windows.
+      # Needed by pre-setup Bash steps before common-test-setup adds them.
+      - name: Add Git Bash to PATH (Windows)
+        if: inputs.os == 'windows'
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\\Program Files\\Git\\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\\Program Files\\Git\\usr\\bin"
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: "false"
+          fetch-depth: "1"
+
+      - name: Clean inherited checkout state
+        run: |
+          # Remove stale files and stale submodule worktrees inherited by self-hosted runners.
+          git submodule deinit --all --force
+          git clean -ffdx
+          git reset --hard HEAD
+
+      - name: Checkout OptiX headers
+        if: (inputs.full-gpu-tests || inputs.gpu-api-only) && inputs.os != 'macos'
+        run: |
+          git submodule sync -- external/optix-dev
+          git submodule update --init --depth=1 external/optix-dev
+
+      - name: Checkout Slang user skills
+        if: inputs.slang-user-skills
+        run: |
+          git submodule sync -- external/slang-user-skills
+          git submodule update --init --depth=1 external/slang-user-skills
+
+      - name: Test user-skills package verifier
+        if: inputs.slang-user-skills
+        run: python3 extras/tests/test_verify_user_skills_package.py
 
       - name: Common Test Setup
         uses: ./.github/actions/common-test-setup
@@ -59,23 +114,85 @@ jobs:
           platform: ${{ inputs.platform }}
           config: ${{ inputs.config }}
           artifact-suffix: ${{ inputs.artifact-suffix }}
+          cpu-only: ${{ inputs.cpu-only }}
+
+      - name: Validate Slang user-skill examples
+        if: inputs.slang-user-skills
+        run: >-
+          python3 external/slang-user-skills/scripts/validate-examples.py
+          --slangc "$bin_dir/slangc"
+
+      # slang-test's CUDA pass-through compiles through NVRTC, so the
+      # offline (non-NVRTC) branch of the prelude is never compiled by the
+      # test suite. Compile it here: the guarded regressions are type
+      # errors, so compiling is the whole test. -std pins the language
+      # mode against toolkit-default drift. -arch pins compute_80: the
+      # fixture enables the half/bf16/fp8 prelude sections, whose
+      # intrinsics need __CUDA_ARCH__ >= 530 (fp16) / 800 (bf16); nvcc's
+      # default sm_52 has neither. Compile-only, so any arch works.
+      - name: Compile offline (non-NVRTC) CUDA prelude test
+        if: inputs.os == 'windows' && inputs.full-gpu-tests
+        run: >-
+          nvcc -std=c++17 -arch=compute_80 -c tests/cuda/cuda-prelude-vec1-make.cu
+          -I prelude -o "${{ runner.temp }}/cuda-prelude-vec1-make.obj"
 
       - name: Test Slang
         run: |
+          # Fail fast on mutually exclusive inputs — both would accumulate
+          # -api filters and produce an empty test partition.
+          if [[ "${{ inputs.cpu-only }}" == "true" && "${{ inputs.gpu-api-only }}" == "true" ]]; then
+            echo "::error::cpu-only and gpu-api-only are mutually exclusive"
+            exit 1
+          fi
+
+          # SPIR-V emission / validation don't need a GPU — keep on all tiers.
           export SLANG_RUN_SPIRV_VALIDATION=1
           export SLANG_USE_SPV_SOURCE_LANGUAGE_UNKNOWN=1
-          if [ "${{ inputs.enable-debug-layers }}" == "true" ]; then
+          # Vulkan runtime validation needs a Vulkan device; skip on CPU tier.
+          if [[ "${{ inputs.cpu-only }}" != "true" && "${{ inputs.enable-debug-layers }}" == "true" ]]; then
             export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
           fi
+          # Force AVX-512 off in slang-llvm's JIT TargetMachine. We have observed
+          # intermittent illegal-instruction failures on both GitHub-hosted and
+          # GCP VMs, indicating that LLVM's host-detection path can mis-report
+          # AVX-512 support on virtual machines generally. Apply the workaround
+          # to every test tier so JIT-emitted kmovd / vmovss-with-mask instructions
+          # cannot fault when the reported features exceed the host capabilities
+          # (#11062).
+          # Drop this once the LLVM 22 bump (#11017) fixes the underlying
+          # detection.
+          export SLANG_DISABLE_AVX512=1
           # Build common slang-test arguments
           slang_test_args=(
-            "-category" "${{ inputs.test-category }}"
             "-expected-failure-list" "tests/expected-failure-github.txt"
             "-skip-reference-image-generation"
             "-show-adapter-info"
-            "-ignore-abort-msg"
             "-enable-debug-layers" "${{ inputs.enable-debug-layers }}"
           )
+
+          # slang-test accepts only a single -api option (a later one silently
+          # overrides an earlier one), so select exactly one expression.
+          # "-api all" is equivalent to the default (all APIs enabled).
+          if [[ "${{ inputs.cpu-only }}" == "true" ]]; then
+            # Restrict to CPU / LLVM backends; tests requiring any GPU API get
+            # ignored by the test filter rather than run-and-failed.
+            api_expr="cpu+llvm"
+          elif [[ "${{ inputs.os }}" == "macos" ]]; then
+            # Metal is the only GPU API on macOS; restrict to it. (cpu)/(llvm)
+            # tests are skipped here and covered by the CPU-only tier, while
+            # no-API tests still run because their requiredFlags==0.
+            api_expr="mtl"
+          elif [[ "${{ inputs.gpu-api-only }}" == "true" ]]; then
+            # Restrict to GPU APIs so (cpu) / (llvm) tests are skipped.
+            # Intentionally NOT using -api-only: no-API tests still need to run
+            # because COMPILE directives in multi-step compile→dispatch tests
+            # have requiredFlags==0 and would be skipped, breaking the dispatch.
+            api_expr="vk+cuda+dx11+dx12+mtl+wgpu"
+          else
+            api_expr="all"
+          fi
+
+          slang_test_args+=("-api" "$api_expr")
 
           # Add test server arguments only if server count > 1
           if [ "${{ inputs.server-count }}" -gt 1 ]; then
@@ -88,8 +205,15 @@ jobs:
             slang_test_args+=("-expected-failure-list" "tests/expected-failure-no-gpu.txt")
           fi
 
-          # Add Linux GPU expected failure list for CUDA builds (Tesla T4 driver limitations)
-          if [[ "${{ inputs.artifact-suffix }}" == "-cuda" ]]; then
+          # Add known failures on Linux regardless GPU presence
+          if [[ "${{ inputs.os }}" == "linux" ]]; then
+            slang_test_args+=("-expected-failure-list" "tests/expected-failure-linux.txt")
+          fi
+
+
+          # T4 runners cannot execute SM 8.0+ cooperative matrix / neural tests
+          if [[ "${{ inputs.gpu-tier }}" == "t4" ]]; then
+            slang_test_args+=("-skip-list" "tests/skip-list-gpu-t4.txt")
             slang_test_args+=("-expected-failure-list" "tests/expected-failure-linux-gpu.txt")
           fi
 
@@ -98,8 +222,25 @@ jobs:
             slang_test_args+=("-skip-list" "tests/skip-list-debug.txt")
           fi
 
-          # Execute slang-test with all arguments
+          # Execute slang-test with all arguments. Print the fully-resolved
+          # command first so the CI log shows exactly which arguments were used
+          # (the conditional logic above only shows the source, not the result).
+          printf '+ %q' "$bin_dir/slang-test"
+          printf ' %q' "${slang_test_args[@]}"
+          printf '\n'
+
           "$bin_dir/slang-test" "${slang_test_args[@]}"
+
+      - name: Check slang-test worktree cleanliness
+        if: always()
+        run: |
+          status="$(git status --short --untracked-files=all -- . ':(exclude)github_artifact/**')"
+          if [[ -n "$status" ]]; then
+            echo "::error::slang-test left generated or modified files in the worktree"
+            printf '%s\n' "$status"
+            exit 1
+          fi
+
       - name: Run Slang examples
         # Run examples on release for pull requests, and not on merge_group, to reduce CI load.
         if: inputs.full-gpu-tests && inputs.config == 'release' && github.event_name == 'pull_request'
@@ -114,244 +255,39 @@ jobs:
         run: |
           PATH=$bin_dir:$PATH tools/slangc-test/test.sh
       - name: Test Slang via glsl
-        # Run GLSL backend tests on release for pull requests, and not on merge_group, to reduce CI load.
-        if: inputs.os != 'macos' && inputs.full-gpu-tests && inputs.config == 'release' && github.event_name == 'pull_request'
+        # Run GLSL backend tests for pull requests, and not on merge_group, to reduce CI load.
+        if: inputs.os != 'macos' && inputs.full-gpu-tests && inputs.run-via-glsl && github.event_name == 'pull_request'
         run: |
           export SLANG_RUN_SPIRV_VALIDATION=1
           export SLANG_USE_SPV_SOURCE_LANGUAGE_UNKNOWN=1
-          "$bin_dir/slang-test" \
-            -use-test-server \
-            -server-count ${{ inputs.server-count }} \
-            -category ${{ inputs.test-category }} \
-            -emit-spirv-via-glsl \
-            -ignore-abort-msg \
-            -api vk \
-            -expected-failure-list tests/expected-failure-via-glsl.txt \
+          via_glsl_args=(
+            -use-test-server
+            -server-count ${{ inputs.server-count }}
+            -emit-spirv-via-glsl
+            -api vk
+            -expected-failure-list tests/expected-failure-via-glsl.txt
             -skip-reference-image-generation
-
-  # Run slang-rhi tests when:
-  # 1. full-gpu-tests is enabled AND
-  # 2. Either it's a pull request OR config is release
-  # This is to reduce the CI load but do some check on pull requests.
-  # expensive slang-rhi tests are excluded with -tce option, because they are not relevant for Slang.
-  test-slang-rhi:
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 30
-    if: inputs.full-gpu-tests && (github.event_name == 'pull_request' || inputs.config == 'release')
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          fetch-depth: "1"
-
-      - name: Common Test Setup
-        uses: ./.github/actions/common-test-setup
-        with:
-          os: ${{ inputs.os }}
-          compiler: ${{ inputs.compiler }}
-          platform: ${{ inputs.platform }}
-          config: ${{ inputs.config }}
-          artifact-suffix: ${{ inputs.artifact-suffix }}
-
-      - name: Run slang-rhi tests
-        run: |
-          export SLANG_RHI_EXCLUDE_TESTS="md-clear*,cmd-copy*,cmd-upload*,fence*,staging-heap*,texture-create*"
-          "$bin_dir/slang-rhi-tests" -check-devices -tce="$SLANG_RHI_EXCLUDE_TESTS"
-
-      - name: Run slang-rhi tests (OptiX 8.0)
-        if: inputs.os == 'windows' || inputs.os == 'linux'
-        run: |
-          "$bin_dir/slang-rhi-tests" -check-devices -optix-version=80000 -tc="ray-tracing-*.cuda"
-
-      - name: Run slang-rhi tests (OptiX 8.1)
-        if: inputs.os == 'windows' || inputs.os == 'linux'
-        run: |
-          "$bin_dir/slang-rhi-tests" -check-devices -optix-version=80100 -tc="ray-tracing-*.cuda"
-
-  # Run slangpy tests and examples when:
-  # 1. full-gpu-tests is enabled AND
-  # 2. Either it's a pull request OR config is release
-  # This is to reduce the CI load but do some check on pull requests.
-  # Includes both slangpy pytest tests and slangpy-samples examples.
-  test-slangpy:
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 60
-    if: inputs.full-gpu-tests && (github.event_name == 'pull_request' || inputs.config == 'release')
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Common Test Setup
-        uses: ./.github/actions/common-test-setup
-        with:
-          os: ${{ inputs.os }}
-          compiler: ${{ inputs.compiler }}
-          platform: ${{ inputs.platform }}
-          config: ${{ inputs.config }}
-          artifact-suffix: ${{ inputs.artifact-suffix }}
-
-      - name: Setup Python
-        if: ${{ runner.environment != 'self-hosted' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Run slangpy tests
-        run: |
-          python --version
-          echo "Cleaning up existing installations and installing slangpy..."
-
-          # Try to uninstall existing slangpy
-          python -m pip uninstall -y slangpy || echo "slangpy not found or already removed"
-
-          # Install slangpy
-          python -m pip install --verbose slangpy --user
-
-          # Get site packages directory
-          SITE_PACKAGES=$(python -c "import slangpy; import os; print(os.path.dirname(os.path.dirname(slangpy.__file__)))" | tail -n 1)
-          echo "Site packages directory: $SITE_PACKAGES"
-          echo "bin_dir location: $bin_dir"
-          echo "lib_dir location: $lib_dir"
-
-          #
-          # THIS IS A HUGE HACK, the latest slangpy release hardcoded this
-          # directory when looking for slangc. We should remove the offending
-          # code from slangpy and just put slangc into PATH here. The offending
-          # code is find_slangc() in
-          # slangpy/tests/device/test_precompiled_modules.py
-          #
-          # See https://github.com/shader-slang/slangpy/issues/696
-          #
-          SLANGC_TARGET_DIR="$SITE_PACKAGES/build/pip/_deps/slang-src/bin"
-          mkdir -p "$SLANGC_TARGET_DIR"
-          # Copy slangc binary to the expected location
-          if [[ "${{ inputs.os }}" == "windows" ]]; then
-              cp -v "$bin_dir/slangc.exe" "$SLANGC_TARGET_DIR/"
-          else
-              cp -v "$bin_dir/slangc" "$SLANGC_TARGET_DIR/"
-              chmod +x "$SLANGC_TARGET_DIR/slangc"
+          )
+          if [[ "${{ inputs.gpu-tier }}" == "t4" ]]; then
+            via_glsl_args+=("-skip-list" "tests/skip-list-gpu-t4.txt")
           fi
-
-          # Copy library files
-          if [[ "${{ inputs.os }}" == "windows" ]]; then
-            cp -v "$bin_dir"/slang*.dll "$SITE_PACKAGES/slangpy/" || { echo "Failed to copy library files"; exit 1; }
-          else
-
-            # This is kind of awkward because the version numbers might be
-            # different between the old libslang-compiler and the new one, so
-            # we need to make sure we overwrite the old one. This logic also
-            # tries to avoid making assumptions about filename extension due to
-            # differences in macos and Linux conventions.
-
-            # There should only be one libslang-compiler library present; the
-            # one that slangpy linked to.
-            OLD_SLANGLIB=$(find "$SITE_PACKAGES/slangpy/" -type f -name "libslang-compiler.*")
-            echo "old slang library location: $OLD_SLANGLIB"
-
-            # Find the new libslang-compiler library via developer symlink
-            # filename. This is unlikely to still be a symlink since it went
-            # through artifactory, but in practice symlink or not shouldn't
-            # matter, since we copy the rest of the libraries over.
-            NEW_SLANGLIB=$(find "$lib_dir" -name "libslang-compiler.*" ! -name "*.*.*")
-            echo "new slang library location: $NEW_SLANGLIB"
-
-            cp "$NEW_SLANGLIB" "$OLD_SLANGLIB" || { echo "Failed to copy main library file"; exit 1; }
-
-            # Copy the rest of the library files
-            cp "$lib_dir"/libslang*.* "$SITE_PACKAGES/slangpy/" || { echo "Failed to copy library files"; exit 1; }
+          # Skip most neural tests in debug builds to reduce CI time
+          if [[ "${{ inputs.config }}" == "debug" ]]; then
+            via_glsl_args+=("-skip-list" "tests/skip-list-debug.txt")
           fi
+          printf '+ %q' "$bin_dir/slang-test"
+          printf ' %q' "${via_glsl_args[@]}"
+          printf '\n'
 
-          echo "Listing files in slangpy directory..."
-          ls -la "$SITE_PACKAGES/slangpy/"
+          "$bin_dir/slang-test" "${via_glsl_args[@]}"
 
-          # Export SITE_PACKAGES for use in slangpy-samples step
-          echo "SITE_PACKAGES=$SITE_PACKAGES" >> $GITHUB_ENV
-
-          echo "Installing python packages..."
-          curl -fsSL https://raw.githubusercontent.com/shader-slang/slangpy/main/requirements-dev.txt -o requirements-dev.txt
-          python -m pip install -r requirements-dev.txt --user
-          python -m pip install pytest-github-actions-annotate-failures --user
-          python -m pip install pytest-xdist --user
-
-          echo "Running pytest on slangpy tests..."
-          export PYTHONPATH="$SITE_PACKAGES"
-          export SLANG_RUN_SPIRV_VALIDATION=1
-
-          # First attempt: run with parallel execution
-          if python -m pytest "$SITE_PACKAGES/slangpy/tests" -ra -n auto --maxprocesses=3
-          then
-            echo "All tests passed on first attempt."
-          else
-            echo ""
-            echo "========================================"
-            echo "Some tests failed. Re-running failed tests sequentially..."
-            echo "========================================"
-            echo ""
-            # Re-run only the failed tests without parallelism (-n 0 disables xdist)
-            #   --lf, --last-failed   Rerun only the tests that failed at the last run
-            #   -n 0                  Rerun the tests sequentially
-            python -m pytest "$SITE_PACKAGES/slangpy/tests" -ra -n 0 --lf
-          fi
-
-      - name: Clone slangpy-samples
-        # Skip on macOS debug due to intermittent failures in test_toy_restir
-        if: ${{ !(inputs.os == 'macos' && inputs.config == 'debug') }}
+      - name: Check via-glsl slang-test worktree cleanliness
+        # Run GLSL backend tests for pull requests, and not on merge_group, to reduce CI load.
+        if: always() && inputs.os != 'macos' && inputs.full-gpu-tests && inputs.run-via-glsl && github.event_name == 'pull_request'
         run: |
-          # Clone slangpy-samples and checkout the tag matching the installed
-          # slangpy version. This ensures compatibility between the slangpy
-          # release and the samples. Falls back to main if no matching tag exists.
-          echo "Cloning slangpy-samples repository..."
-
-          # Detect installed slangpy version
-          SLANGPY_VERSION=$(python -c "import slangpy; print(slangpy.__version__)" 2>/dev/null || echo "unknown")
-          echo "Installed slangpy version: $SLANGPY_VERSION"
-
-          # Try to clone specific version tag directly, fallback to main if it fails
-          if [ "$SLANGPY_VERSION" != "unknown" ]; then
-            if git clone --branch "v${SLANGPY_VERSION}" --depth 1 https://github.com/shader-slang/slangpy-samples.git 2>/dev/null; then
-              echo "Successfully cloned version tag v${SLANGPY_VERSION}"
-            else
-              echo "Warning: No matching tag found for v${SLANGPY_VERSION}, cloning main branch"
-              git clone --depth 1 https://github.com/shader-slang/slangpy-samples.git
-            fi
-          else
-            echo "Warning: Could not detect slangpy version, cloning main branch"
-            git clone --depth 1 https://github.com/shader-slang/slangpy-samples.git
-          fi
-
-      - name: Install slangpy-samples dependencies
-        # Skip on macOS debug due to intermittent failures in test_toy_restir
-        if: ${{ !(inputs.os == 'macos' && inputs.config == 'debug') }}
-        run: |
-          echo "Installing slangpy-samples dependencies..."
-          python -m pip install -r slangpy-samples/requirements.txt --user
-
-      - name: Run slangpy-samples tests
-        # Skip on macOS debug due to intermittent failures in test_toy_restir
-        # Skip test_check_urls because URL checking is not required for slang CI
-        if: ${{ !(inputs.os == 'macos' && inputs.config == 'debug') }}
-        run: |
-          echo "Running slangpy-samples tests..."
-          export SLANG_RUN_SPIRV_VALIDATION=1
-
-          if python -m pytest "slangpy-samples/tests" -n 4 -k "not test_check_urls"
-          then
-            echo "All tests passed on first attempt."
-          else
-            echo ""
-            echo "========================================"
-            echo "Some tests failed. Re-running failed tests sequentially..."
-            echo "========================================"
-            echo ""
-            # Re-run only the failed tests without parallelism (-n 0 disables xdist)
-            #   --lf, --last-failed   Rerun only the tests that failed at the last run
-            #   -n 0                  Rerun the tests sequentially
-            python -m pytest "slangpy-samples/tests" -n 0 --lf -k "not test_check_urls"
+          status="$(git status --short --untracked-files=all -- . ':(exclude)github_artifact/**')"
+          if [[ -n "$status" ]]; then
+            echo "::error::slang-test left generated or modified files in the worktree"
+            printf '%s\n' "$status"
+            exit 1
           fi

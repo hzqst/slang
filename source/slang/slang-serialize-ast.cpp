@@ -10,7 +10,6 @@
 #include "slang-parser.h"
 #include "slang-rich-diagnostics.h"
 #include "slang-serialize-fossil.h"
-#include "slang-serialize-riff.h"
 
 //
 #include "slang-serialize-ast.cpp.fiddle"
@@ -412,7 +411,9 @@ struct ContainerDeclDirectMemberDeclsInfo
 %   "TryClauseType",
 %   "DeclVisibility",
 %   "BuiltinRequirementKind",
+%   "BuiltinOperationKind",
 %   "ImageFormat",
+%   "ParamPassingMode",
 %   "PreferRecomputeAttribute::SideEffectBehavior",
 %   "TreatAsDifferentiableExpr::Flavor",
 %   "LogicOperatorShortCircuitExpr::Flavor",
@@ -491,6 +492,7 @@ SLANG_DECLARE_FOSSILIZED_AS($T, FossilUInt);
 %
 %astStructTypes = {
 %   Slang.QualType,
+%   Slang.ParamInfo,
 %   Slang.SPIRVAsmOperand,
 %   Slang.DeclAssociation,
 %   Slang.NameLoc,
@@ -1660,6 +1662,10 @@ void ASTSerialReadContext::_assignGenericParameterIndices(GenericDecl* genericDe
         {
             typeParam->parameterIndex = parameterCounter++;
         }
+        else if (auto valPackParam = as<GenericValuePackParamDecl>(m))
+        {
+            valPackParam->parameterIndex = parameterCounter++;
+        }
         else if (auto valParam = as<GenericValueParamDecl>(m))
         {
             valParam->parameterIndex = parameterCounter++;
@@ -1900,8 +1906,8 @@ void writeSerializedModuleAST(
         // (which is more or less just a pair of pointers, to the two
         // values described above).
         //
-        Fossil::SerialWriter writer(blobBuilder);
         ASTSerialWriteContext context(moduleDecl, sourceLocWriter);
+        Fossil::SerialWriter writer(blobBuilder);
         ASTSerialWriteContext::ASTSerializer serializer(&writer, &context);
 
         // Once we have our `serializer`, we can finally invoke

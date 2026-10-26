@@ -54,6 +54,7 @@ struct RequiredLoweringPassSet
     bool debugInfo;
     bool resultType;
     bool optionalType;
+    bool conditionalType;
     bool enumType;
     bool combinedTextureSamplers;
     bool reinterpret;
@@ -67,14 +68,31 @@ struct RequiredLoweringPassSet
     bool meshOutput;
     bool higherOrderFunc;
     bool globalVaryingVar;
+
+    /// Whether linked IR contains a SPIR-V ray-location operand that requires object resolution.
+    bool rayTracingLocationOperand = false;
     bool glslSSBO;
     bool byteAddressBuffer;
     bool dynamicResource;
     bool dynamicResourceHeap;
+    bool untypedResourceHandle;
     bool resolveVaryingInputRef;
     bool specializeStageSwitch;
     bool missingReturn;
     bool nonVectorCompositeSelect;
+    bool matrixSwizzleStore;
+    bool coverageTracing;
+    bool barrierFlagValidation;
+    bool appendConsumeStructuredBuffer;
+    bool taggedUnion;
+    bool assumeAddress;
+    bool untaggedUnion;
+    bool tagOps;
+    bool tagType;
+    bool lValueCast;
+    bool sumVectorMatrix;
+    bool lateRequireCapability;
+    bool unresolvedMatrixLayout;
 };
 
 /// A context for code generation in the compiler back-end
@@ -175,6 +193,8 @@ public:
     bool shouldDumpIR();
     bool shouldReportCheckpointIntermediates();
     bool shouldReportDynamicDispatchSites();
+    bool shouldTraceCoverage();
+    bool shouldTraceAnyCoverage();
 
     bool shouldTrackLiveness();
 

@@ -3,6 +3,7 @@
 #include "slang-ir-clone.h"
 #include "slang-ir-insts.h"
 #include "slang-ir-layout.h"
+#include "slang-ir-legalize-matrix-types.h"
 #include "slang-ir-util.h"
 #include "slang-ir.h"
 
@@ -22,6 +23,11 @@
 ///   `ParameterBlock<Foo>`, then we should translate it to
 ///   `struct Foo_pb { Texture2D.Handle member; }` and `ParameterBlock<Foo_pb>`, so that
 ///    the resource legalization pass won't hoist the texture out of the parameter block.
+/// - In Metal, pointer types in buffer pointee types are lowered to UIntPtr:
+///   all pointers in storage buffers (the buffer itself adds a level of
+///   indirection), and multi-level pointers (e.g. `int**`) in all buffer
+///   kinds. This runs as a separate late invocation so that address-space
+///   specialization sees real pointer types.
 ///
 /// We use the terms "physical", "storage", or "lowered" types to refer to types that
 /// are legal to use as buffer elements. In contrast, the terms "original" or "logical"
@@ -328,6 +334,48 @@ struct BufferElementTypeLoweringPolicy : public RefObject
     /// StorageType that may have explicit layout. This is currently true for all targets except
     /// SPIRV.
     virtual bool canUseStorageTypeInLocalVar() { return true; }
+
+    /// Discovery filter: returns true if the given buffer element type
+    /// may contain fields that this policy wants to lower.
+    ///
+    /// IMPORTANT: A false return that should have been true is a silent
+    /// correctness bug — the buffer retains its original element type
+    /// and the target compiler may reject it. When in doubt, return true.
+    ///
+    /// False positives are safe: processModule computes the lowered type
+    /// via getLoweredTypeInfo and compares it to the original. If they match
+    /// (no fields were actually changed by lowerLeafLogicalType), the buffer
+    /// is silently skipped with no behavioral effect.
+    ///
+    /// This is called by processModule on the top-level element type of
+    /// each buffer or pointer global (ConstantBuffer<T>, StructuredBuffer<T>,
+    /// UserPointer T*, etc.).
+    ///
+    /// Implementations should look through composite types that can contain
+    /// lowerable leaf types by value — arrays and structs. They do NOT need
+    /// to look through pointer pointees: pointer-to-struct cases (e.g.
+    /// `Inner*` where `Inner` has lowerable fields) are discovered by
+    /// processModule through separate `IRPtrTypeBase` global processing,
+    /// which extracts the pointee struct as its own element type.
+    ///
+    /// The base-class default covers the historical set of lowerable leaf
+    /// types (struct, matrix, array, bool). Override to discover additional
+    /// leaf types.
+    virtual bool needsElementLowering(IRType* elementType)
+    {
+        return as<IRStructType>(elementType) || as<IRMatrixType>(elementType) ||
+               as<IRArrayType>(elementType) || as<IRBoolType>(elementType);
+    }
+
+    /// Controls whether a pass invocation re-processes types that a prior
+    /// invocation already decorated with [PhysicalType]. This is a pass-level
+    /// policy decision, not a type-level predicate — it governs the
+    /// relationship between multiple invocations of lowerBufferElementTypeToStorageType.
+    ///
+    /// The default (true) skips already-processed types to avoid double-lowering.
+    /// Override to false when running a late pass that needs to further lower
+    /// fields in types that were already partially processed by an earlier run.
+    virtual bool shouldSkipPhysicalTypes() { return true; }
 };
 
 BufferElementTypeLoweringPolicy* getBufferElementTypeLoweringPolicy(
@@ -336,8 +384,6 @@ BufferElementTypeLoweringPolicy* getBufferElementTypeLoweringPolicy(
     BufferElementTypeLoweringOptions options);
 
 TypeLoweringConfig getTypeLoweringConfigForBuffer(TargetProgram* target, IRType* bufferType);
-
-IROp getOpFromTypeLayoutRules(IRTypeLayoutRuleName ruleName);
 
 IRInst* ConversionMethod::apply(IRBuilder& builder, IRType* resultType, IRInst* operandAddr)
 {
@@ -469,6 +515,7 @@ struct LoweredElementTypeContext
     };
     // Specialized functions that takes storage-typed pointers instead of logical-typed pointers.
     Dictionary<SpecializationKey, IRFunc*> specializedFuncs;
+    Dictionary<IRFunc*, List<IRFunc*>> specializedFuncsByOriginal;
 
     LoweredElementTypeContext(TargetProgram* target, BufferElementTypeLoweringOptions inOptions)
         : target(target), options(inOptions)
@@ -704,7 +751,7 @@ struct LoweredElementTypeContext
                     loweredInnerTypeInfo.loweredType,
                     arrayType->getElementCount(),
                     needExplicitLayout ? builder.getIntValue(
-                                             builder.getIntType(),
+                                             builder.getUIntType(),
                                              elementSizeAlignment.getStride())
                                        : nullptr);
                 builder.createStructField(loweredType, structKey, innerArrayType);
@@ -730,7 +777,7 @@ struct LoweredElementTypeContext
                     loweredInnerTypeInfo.loweredType,
                     nullptr,
                     needExplicitLayout ? builder.getIntValue(
-                                             builder.getIntType(),
+                                             builder.getUIntType(),
                                              elementSizeAlignment.getStride())
                                        : nullptr);
                 maybeAddPhysicalTypeDecoration(builder, innerArrayType, config);
@@ -1495,14 +1542,15 @@ struct LoweredElementTypeContext
             for (Index c = 0; c < callWorkList.getCount(); c++)
             {
                 auto call = callWorkList[c];
-                auto calleeFunc = as<IRGlobalValueWithParams>(call->getCallee());
+                auto calleeFunc = cast<IRFunc>(call->getCallee());
                 // We compute the func type for the specialized func based on the arguments
                 // provided, and check the specialization cache to reuse existing specialization
                 // when possible.
-                List<IRInst*> oldParams;
-                for (auto param : calleeFunc->getParams())
-                    oldParams.add(param);
-                SLANG_ASSERT(oldParams.getCount() == (Index)call->getArgCount());
+                List<IRType*> oldParamTypes;
+                for (auto paramType : calleeFunc->getDataType()->getParamTypes())
+                    oldParamTypes.add(paramType);
+
+                SLANG_ASSERT(oldParamTypes.getCount() == (Index)call->getArgCount());
 
                 ShortList<IRType*> paramTypes;
                 ShortList<IRInst*> newArgs;
@@ -1511,7 +1559,7 @@ struct LoweredElementTypeContext
                     auto arg = call->getArg(i);
                     if (auto castArg = as<IRCastStorageToLogical>(arg))
                     {
-                        auto oldParamPtrType = oldParams[i]->getDataType();
+                        auto oldParamPtrType = oldParamTypes[i];
                         auto storageValueType = tryGetPointedToOrBufferElementType(
                             &builder,
                             castArg->getOperand(0)->getDataType());
@@ -1536,11 +1584,12 @@ struct LoweredElementTypeContext
                         newArgs.add(arg);
                     }
                 }
+
                 auto specializedFuncType = builder.getFuncType(
                     (UInt)paramTypes.getCount(),
                     paramTypes.getArrayView().getBuffer(),
                     call->getDataType());
-                auto key = SpecializationKey{(IRFunc*)calleeFunc, specializedFuncType};
+                auto key = SpecializationKey{calleeFunc, specializedFuncType};
                 IRFunc* specializedFunc = nullptr;
                 if (!specializedFuncs.tryGetValue(key, specializedFunc))
                 {
@@ -1583,6 +1632,51 @@ struct LoweredElementTypeContext
         IRCloneEnv cloneEnv;
         auto clonedFunc = as<IRFunc>(cloneInst(&cloneEnv, &builder, call->getCallee()));
         List<IRUse*> uses;
+
+        // If our cloned function has uses already, that means it may be calling
+        // itself (is recursive). There are also other potential causes, such as
+        // decorations, but this condition is basically only here to skip
+        // unnecessary extra work on the vast majority of non-recursive cases.
+        // Running the code inside is harmless but useless when the function is
+        // not calling itself.
+        //
+        // In this context, it is actually more correct for the recursive calls
+        // in a cloned function to call the original function instead of the new
+        // clone. First, the cloned function has a different type signature, but
+        // the `cloneInst` retains the old arguments for recursive calls, which
+        // already can cause type mismatches in the IR.
+        //
+        // Second, the CastStorageToLogical insts in the arguments of the
+        // cloned call get recorded in outNewCasts, causing the function call to
+        // the clone to get handled as if it had not been specialized in
+        // `deferStorageToLogicalCasts`. As the cloned function won't be
+        // recorded in `specializedFuncs` yet, it leads to
+        // `createSpecializedFuncThatUseStorageType` being called again for the
+        // clone. This sets up an infinite loop of cloning and specializing.
+        //
+        // By swapping the callees from the cloned function to the original
+        // function, we can fix both issues: we won't get type signature issues
+        // and the function is found in `specializedFuncs` during the next
+        // iteration in `deferStorageToLogicalCasts`.
+        if (clonedFunc->hasUses())
+        {
+            // Replace all self-calls with the original function.
+            cloneEnv.mapOldValToNew.remove(clonedFunc);
+            cloneEnv.mapOldValToNew.add(clonedFunc, call->getCallee());
+            traverseUsers<IRCall>(
+                clonedFunc,
+                [&](IRCall* user)
+                {
+                    // Ensure that the use is specifically as the callee.
+                    if (user->getCallee() == clonedFunc)
+                    {
+                        builder.setInsertBefore(user);
+                        auto newCall = cloneInst(&cloneEnv, &builder, user);
+                        user->replaceUsesWith(newCall);
+                        user->removeAndDeallocate();
+                    }
+                });
+        }
 
         // If a parameter is being translated to storage type,
         // insert a cast to convert it to logical type.
@@ -1627,7 +1721,9 @@ struct LoweredElementTypeContext
                 builder.replaceOperand(use, castedParam);
         }
         clonedFunc->setFullType(specializedFuncType);
-        removeLinkageDecorations(clonedFunc);
+        // Keep track of the specialized functions. This is used to remove
+        // clashing linkage decorations if we need to retain the original too.
+        specializedFuncsByOriginal[(IRFunc*)call->getCallee()].add(clonedFunc);
 
         // Add all `CastStorageToLogical` insts in the cloned func to the worklist
         // for further processing.
@@ -1695,12 +1791,23 @@ struct LoweredElementTypeContext
 
             if (as<IRTextureBufferType>(globalInst))
                 continue;
-            if (!as<IRStructType>(elementType) && !as<IRMatrixType>(elementType) &&
-                !as<IRArrayType>(elementType) && !as<IRBoolType>(elementType))
+
+            // elementType is null when globalInst doesn't match any
+            // buffer or pointer category above.
+            if (!elementType)
+                continue;
+
+            // Ask the policy whether this element type contains fields
+            // it wants to lower. This is a virtual call so that policies
+            // can define their own discovery criteria (e.g., the Metal
+            // pointer policy recurses through structs/arrays looking for
+            // pointer fields, while the base class checks for the
+            // historical set of struct/matrix/array/bool).
+            //
+            if (!leafTypeLoweringPolicy->needsElementLowering(elementType))
                 continue;
             bufferTypeInsts.add(BufferTypeInfo{(IRType*)globalInst, elementType});
         }
-
 
         List<IRCastStorageToLogicalBase*> castInstWorkList;
 
@@ -1709,7 +1816,15 @@ struct LoweredElementTypeContext
             auto bufferType = bufferTypeInfo.bufferType;
             auto elementType = bufferTypeInfo.elementType;
 
-            if (elementType->findDecoration<IRPhysicalTypeDecoration>())
+            // Types already decorated with [PhysicalType] were processed
+            // by an earlier invocation of this pass. Most policies skip
+            // them to avoid double-lowering. Policies that need to
+            // further process already-decorated types override
+            // shouldSkipPhysicalTypes() to false — see the policy's
+            // override for which predecessors it re-processes.
+            //
+            if (elementType->findDecoration<IRPhysicalTypeDecoration>() &&
+                leafTypeLoweringPolicy->shouldSkipPhysicalTypes())
                 continue;
 
             auto config = getTypeLoweringConfigForBuffer(target, bufferType);
@@ -1747,14 +1862,8 @@ struct LoweredElementTypeContext
                     // derived from some other base address. We will let
                     // the later part of the pass to systematically propagate
                     // the cast through them.
-                    switch (user->getOp())
-                    {
-                    case kIROp_FieldAddress:
-                    case kIROp_GetElementPtr:
-                    case kIROp_GetOffsetPtr:
-                    case kIROp_RWStructuredBufferGetElementPtr:
+                    if (isAddressInst(user))
                         return;
-                    }
                     auto ptrVal = use->getUser();
                     setInsertAfterOrdinaryInst(&builder, ptrVal);
                     builder.replaceOperand(use, loweredBufferType);
@@ -1795,6 +1904,23 @@ struct LoweredElementTypeContext
                 continue;
             bufferTypeInst.bufferType->replaceUsesWith(bufferTypeInst.loweredBufferType);
             bufferTypeInst.bufferType->removeAndDeallocate();
+        }
+
+        // Remove linkage decorations from specialized functions if they don't
+        // cleanly replace the original.
+        for (auto& [original, specializations] : specializedFuncsByOriginal)
+        {
+            if (original->hasUses() || specializations.getCount() > 1)
+            {
+                for (auto specialization : specializations)
+                    removeLinkageDecorations(specialization);
+            }
+            else
+            {
+                // Remove original, because the specialized function replaced
+                // it. If we don't remove it, the linkage decorations clash.
+                original->removeAndDeallocate();
+            }
         }
     }
 
@@ -2115,6 +2241,33 @@ struct LoweredElementTypeContext
         }
     }
 
+    /// Return `value` converted to `type`, or `value` itself if it already has that type.
+    static IRInst* castIfNeeded(IRBuilder& builder, IRType* type, IRInst* value)
+    {
+        if (value->getDataType() == type)
+            return value;
+        return builder.emitCast(type, value);
+    }
+
+    /// Return `vector` with its elements converted to `elementType`, element by element.
+    ///
+    /// Storage rows of a matrix can have a different element type than the logical rows: a
+    /// `bool2x3` is stored as rows of `int` on direct SPIR-V, because bool vectors are not valid in
+    /// buffers. A row loaded from storage then converts from `vector<int,3>` to `vector<bool,3>`,
+    /// and a row stored to it converts the other way.
+    static IRInst* castVectorToElementType(IRBuilder& builder, IRType* elementType, IRInst* vector)
+    {
+        auto vectorType = as<IRVectorType>(vector->getDataType());
+        SLANG_ASSERT(vectorType);
+        if (vectorType->getElementType() == elementType)
+            return vector;
+        auto elementCount = getIntVal(vectorType->getElementCount());
+        List<IRInst*> elements;
+        for (IRIntegerValue i = 0; i < elementCount; i++)
+            elements.add(castIfNeeded(builder, elementType, builder.emitElementExtract(vector, i)));
+        return builder.emitMakeVector(builder.getVectorType(elementType, elementCount), elements);
+    }
+
     // Lower all getElementPtr insts of a lowered matrix out of existance.
     void lowerMatrixAddresses(IRModule* module, MatrixAddrWorkItem workItem)
     {
@@ -2133,6 +2286,20 @@ struct LoweredElementTypeContext
             return;
         auto matrixType = as<IRMatrixType>(matrixTypeInfo->originalType);
         auto colCount = getIntVal(matrixType->getColumnCount());
+        // On Metal, matrices in device buffers are stored as arrays of *packed*
+        // vectors rather than ordinary vectors, so whole-row loads/stores need
+        // a conversion between the row vector and its packed-vector storage.
+        IRMetalPackedVectorType* minorPackedType = nullptr;
+        // The element type of the storage rows. It differs from the matrix element type for
+        // `bool`, which is stored as `int` on direct SPIR-V.
+        auto logicalElementType = matrixType->getElementType();
+        auto storageElementType = logicalElementType;
+        if (auto innerArrayType = as<IRArrayTypeBase>(matrixTypeInfo->loweredInnerArrayType))
+        {
+            minorPackedType = as<IRMetalPackedVectorType>(innerArrayType->getElementType());
+            if (auto storageRowType = as<IRVectorType>(innerArrayType->getElementType()))
+                storageElementType = storageRowType->getElementType();
+        }
         traverseUses(
             majorAddr,
             [&](IRUse* use)
@@ -2159,7 +2326,7 @@ struct LoweredElementTypeContext
                                     builder.emitLoad(builder.emitElementAddress(dataPtr, i));
                                 auto element =
                                     builder.emitElementExtract(vector, majorGEP->getIndex());
-                                args.add(element);
+                                args.add(castIfNeeded(builder, logicalElementType, element));
                             }
                             resultInst = builder.emitMakeVector(
                                 builder.getVectorType(
@@ -2172,6 +2339,21 @@ struct LoweredElementTypeContext
                             auto element =
                                 builder.emitElementAddress(dataPtr, majorGEP->getIndex());
                             resultInst = builder.emitLoad(element);
+                            if (minorPackedType)
+                            {
+                                // Convert the loaded packed row to the logical
+                                // row vector (MSL `float3(packed_float3)`).
+                                auto vectorType = as<IRVectorType>(user->getDataType());
+                                SLANG_ASSERT(vectorType);
+                                resultInst = builder.emitMakeVector(vectorType, 1, &resultInst);
+                            }
+                            else
+                            {
+                                resultInst = castVectorToElementType(
+                                    builder,
+                                    logicalElementType,
+                                    resultInst);
+                            }
                         }
                         user->replaceUsesWith(resultInst);
                         user->removeAndDeallocate();
@@ -2195,16 +2377,29 @@ struct LoweredElementTypeContext
                                 auto vectorAddr = builder.emitElementAddress(dataPtr, i);
                                 auto elementAddr =
                                     builder.emitElementAddress(vectorAddr, majorGEP->getIndex());
+                                auto element = builder.emitElementExtract(storeInst->getVal(), i);
                                 builder.emitStore(
                                     elementAddr,
-                                    builder.emitElementExtract(storeInst->getVal(), i));
+                                    castIfNeeded(builder, storageElementType, element));
                             }
+                            user->removeAndDeallocate();
                         }
                         else
                         {
                             auto rowAddr =
                                 builder.emitElementAddress(dataPtr, majorGEP->getIndex());
-                            builder.emitStore(rowAddr, storeInst->getVal());
+                            IRInst* value = storeInst->getVal();
+                            if (minorPackedType)
+                            {
+                                // Convert the logical row vector to its packed
+                                // storage form (MSL `packed_float3(float3)`).
+                                value = builder.emitMakeVector(minorPackedType, 1, &value);
+                            }
+                            else
+                            {
+                                value = castVectorToElementType(builder, storageElementType, value);
+                            }
+                            builder.emitStore(rowAddr, value);
                             user->removeAndDeallocate();
                         }
                         break;
@@ -2226,7 +2421,44 @@ struct LoweredElementTypeContext
                             matrixTypeInfo->loweredInnerStructKey);
                         auto vectorAddr = builder.emitElementAddress(dataPtr, rowIndex);
                         auto elementAddr = builder.emitElementAddress(vectorAddr, colIndex);
-                        gep2->replaceUsesWith(elementAddr);
+                        if (storageElementType == logicalElementType)
+                        {
+                            gep2->replaceUsesWith(elementAddr);
+                        }
+                        else
+                        {
+                            // The address points to an element of the storage type, so each load
+                            // or store through it converts between the storage and logical types.
+                            traverseUses(
+                                gep2,
+                                [&](IRUse* elementUse)
+                                {
+                                    auto elementUser = elementUse->getUser();
+                                    builder.setInsertBefore(elementUser);
+                                    if (elementUser->getOp() == kIROp_Load)
+                                    {
+                                        auto stored = builder.emitLoad(elementAddr);
+                                        elementUser->replaceUsesWith(
+                                            castIfNeeded(builder, logicalElementType, stored));
+                                    }
+                                    else if (elementUser->getOp() == kIROp_Store)
+                                    {
+                                        SLANG_ASSERT(elementUser->getOperand(0) == gep2);
+                                        builder.emitStore(
+                                            elementAddr,
+                                            castIfNeeded(
+                                                builder,
+                                                storageElementType,
+                                                cast<IRStore>(elementUser)->getVal()));
+                                    }
+                                    else
+                                    {
+                                        SLANG_UNREACHABLE("unhandled use of the address of a "
+                                                          "matrix element that needs conversion.");
+                                    }
+                                    elementUser->removeAndDeallocate();
+                                });
+                        }
                         gep2->removeAndDeallocate();
                         break;
                     }
@@ -2250,56 +2482,11 @@ void lowerBufferElementTypeToStorageType(
     context.processModule(module);
 }
 
-IRTypeLayoutRuleName getTypeLayoutRulesFromOp(IROp layoutTypeOp, IRTypeLayoutRuleName defaultLayout)
+static IRTypeLayoutRuleName getTypeLayoutRuleNameFromOpAlways(
+    IROp layoutTypeOp,
+    IRTypeLayoutRuleName defaultLayout)
 {
-    switch (layoutTypeOp)
-    {
-    case kIROp_DefaultBufferLayoutType:
-    case kIROp_DefaultPushConstantBufferLayoutType:
-        return defaultLayout;
-    case kIROp_Std140BufferLayoutType:
-        return IRTypeLayoutRuleName::Std140;
-    case kIROp_Std430BufferLayoutType:
-        return IRTypeLayoutRuleName::Std430;
-    case kIROp_ScalarBufferLayoutType:
-        return IRTypeLayoutRuleName::Natural;
-    case kIROp_CBufferLayoutType:
-        return IRTypeLayoutRuleName::C;
-    case kIROp_D3DConstantBufferLayoutType:
-        return IRTypeLayoutRuleName::D3DConstantBuffer;
-    case kIROp_MetalParameterBlockLayoutType:
-        return IRTypeLayoutRuleName::MetalParameterBlock;
-    case kIROp_CUDABufferLayoutType:
-        return IRTypeLayoutRuleName::CUDA;
-    case kIROp_LLVMBufferLayoutType:
-        return IRTypeLayoutRuleName::LLVM;
-    }
-    return defaultLayout;
-}
-
-IROp getOpFromTypeLayoutRules(IRTypeLayoutRuleName ruleName)
-{
-    switch (ruleName)
-    {
-    case IRTypeLayoutRuleName::Std140:
-        return kIROp_Std140BufferLayoutType;
-    case IRTypeLayoutRuleName::Std430:
-        return kIROp_Std430BufferLayoutType;
-    case IRTypeLayoutRuleName::Natural:
-        return kIROp_ScalarBufferLayoutType;
-    case IRTypeLayoutRuleName::C:
-        return kIROp_CBufferLayoutType;
-    case IRTypeLayoutRuleName::D3DConstantBuffer:
-        return kIROp_D3DConstantBufferLayoutType;
-    case IRTypeLayoutRuleName::MetalParameterBlock:
-        return kIROp_MetalParameterBlockLayoutType;
-    case IRTypeLayoutRuleName::CUDA:
-        return kIROp_CUDABufferLayoutType;
-    case IRTypeLayoutRuleName::LLVM:
-        return kIROp_LLVMBufferLayoutType;
-    default:
-        return kIROp_DefaultBufferLayoutType;
-    }
+    return getTypeLayoutRuleNameFromOp(layoutTypeOp, defaultLayout).value_or(defaultLayout);
 }
 
 IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRType* bufferType)
@@ -2340,7 +2527,9 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
             if (layoutTypeOp != kIROp_DefaultBufferLayoutType &&
                 layoutTypeOp != kIROp_DefaultPushConstantBufferLayoutType)
             {
-                return getTypeLayoutRulesFromOp(layoutTypeOp, IRTypeLayoutRuleName::Natural);
+                return getTypeLayoutRuleNameFromOpAlways(
+                    layoutTypeOp,
+                    IRTypeLayoutRuleName::Natural);
             }
         }
 
@@ -2376,7 +2565,7 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
             auto layoutTypeOp = structBufferType->getDataLayout()
                                     ? structBufferType->getDataLayout()->getOp()
                                     : kIROp_DefaultBufferLayoutType;
-            return getTypeLayoutRulesFromOp(layoutTypeOp, IRTypeLayoutRuleName::Std430);
+            return getTypeLayoutRuleNameFromOpAlways(layoutTypeOp, IRTypeLayoutRuleName::Std430);
         }
     case kIROp_ParameterBlockType:
     case kIROp_ConstantBufferType:
@@ -2396,7 +2585,7 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
             auto defaultTypeOp =
                 isCPUTarget(targetReq) ? IRTypeLayoutRuleName::C : IRTypeLayoutRuleName::Std140;
 
-            return getTypeLayoutRulesFromOp(layoutTypeOp, defaultTypeOp);
+            return getTypeLayoutRuleNameFromOpAlways(layoutTypeOp, defaultTypeOp);
         }
     case kIROp_GLSLShaderStorageBufferType:
         {
@@ -2404,7 +2593,7 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
             auto layoutTypeOp = storageBufferType->getDataLayout()
                                     ? storageBufferType->getDataLayout()->getOp()
                                     : kIROp_Std430BufferLayoutType;
-            return getTypeLayoutRulesFromOp(layoutTypeOp, IRTypeLayoutRuleName::Std430);
+            return getTypeLayoutRuleNameFromOpAlways(layoutTypeOp, IRTypeLayoutRuleName::Std430);
         }
     }
     if (auto ptrType = as<IRPtrTypeBase>(bufferType))
@@ -2413,10 +2602,16 @@ IRTypeLayoutRuleName getTypeLayoutRuleNameForBuffer(TargetProgram* target, IRTyp
                                                      : kIROp_DefaultBufferLayoutType;
 
         IRTypeLayoutRuleName defaultRule = IRTypeLayoutRuleName::Natural;
+        // SPIR-V storage-buffer pointers inherit the same std430 default as
+        // GLSLShaderStorageBuffer when no explicit data layout is attached, so stride
+        // computations match the ArrayStride decorations emitted later.
+        if (target->shouldEmitSPIRVDirectly() &&
+            ptrType->getAddressSpace() == AddressSpace::StorageBuffer)
+            defaultRule = IRTypeLayoutRuleName::Std430;
         if (isCPUTargetViaLLVM(targetReq))
             defaultRule = IRTypeLayoutRuleName::LLVM;
 
-        return getTypeLayoutRulesFromOp(layoutTypeOp, defaultRule);
+        return getTypeLayoutRuleNameFromOpAlways(layoutTypeOp, defaultRule);
     }
     return IRTypeLayoutRuleName::Natural;
 }
@@ -2430,7 +2625,7 @@ IRTypeLayoutRules* getTypeLayoutRuleForBuffer(TargetProgram* target, IRType* buf
 IRType* getTypeLayoutTypeForBuffer(TargetProgram* target, IRBuilder& builder, IRType* bufferType)
 {
     TypeLoweringConfig loweringConfig = getTypeLoweringConfigForBuffer(target, bufferType);
-    IROp layoutOp = getOpFromTypeLayoutRules(loweringConfig.layoutRuleName);
+    IROp layoutOp = getOpFromTypeLayoutRuleName(loweringConfig.layoutRuleName);
     IRType* layoutType =
         as<IRType>(builder.createIntrinsicInst(nullptr, layoutOp, 0, nullptr, nullptr));
     return layoutType;
@@ -2471,9 +2666,14 @@ TypeLoweringConfig getTypeLoweringConfigForBuffer(TargetProgram* target, IRType*
             break;
         }
     }
-
     auto rules = getTypeLayoutRuleNameForBuffer(target, bufferType);
-    return TypeLoweringConfig{addrSpace, rules};
+
+    // Consider an `out bool values[3]`: the Khronos policy must lower `bool` to `int`,
+    // but the resulting wrapper is a stage interface type rather than a memory buffer.
+    // Keep the lowered interface wrapper logical so the SPIR-V emitter does not synthesize
+    // block-style member `Offset` decorations, which Vulkan forbids on stage Input and Output.
+    bool lowerToPhysicalType = addrSpace != AddressSpace::Input;
+    return TypeLoweringConfig{addrSpace, rules, lowerToPhysicalType};
 }
 
 struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
@@ -2497,6 +2697,12 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
 
     virtual bool shouldLowerMatrixType(IRMatrixType* matrixType, TypeLoweringConfig config)
     {
+        // `legalizeMatrixTypes` runs after this pass and rewrites such a matrix into row vectors,
+        // which would drop the layout. Wrapping it in a storage struct here makes the buffer
+        // layout follow the matrix layout, as it does for the other element types.
+        if (isMatrixTypeLegalizedToVectorArray(target, matrixType))
+            return true;
+
         if (getIntVal(matrixType->getLayout()) == defaultMatrixLayout &&
             config.getLayoutRule()->ruleName == IRTypeLayoutRuleName::Natural)
         {
@@ -2505,6 +2711,28 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             return false;
         }
         return true;
+    }
+
+    // Return the scalar type used to store elements of type `elementType` in a lowered matrix.
+    // Targets whose buffers cannot hold some element types (e.g. `bool` in SPIR-V) override this.
+    virtual IRType* getMatrixStorageElementType(IRType* elementType, TypeLoweringConfig config)
+    {
+        SLANG_UNUSED(config);
+        return elementType;
+    }
+
+    // Convert `element`, read from the storage vectors of a lowered `matrixType`, back to the
+    // element type of the matrix. It is the identity unless the storage element type differs from
+    // the matrix element type, e.g. an `int` that stores a `bool` in SPIR-V.
+    static IRInst* castToMatrixElementType(
+        IRBuilder& builder,
+        IRMatrixType* matrixType,
+        IRInst* element)
+    {
+        auto elementType = matrixType->getElementType();
+        if (element->getDataType() == elementType)
+            return element;
+        return builder.emitCast(elementType, element);
     }
 
     IRFunc* createMatrixUnpackFunc(
@@ -2537,7 +2765,8 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                 for (IRIntegerValue r = 0; r < rowCount; r++)
                 {
                     auto element = builder.emitElementExtract(vector, r);
-                    args[(Index)(r * colCount + c)] = element;
+                    args[(Index)(r * colCount + c)] =
+                        castToMatrixElementType(builder, matrixType, element);
                 }
             }
         }
@@ -2549,7 +2778,8 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                 for (IRIntegerValue c = 0; c < colCount; c++)
                 {
                     auto element = builder.emitElementExtract(vector, c);
-                    args[(Index)(r * colCount + c)] = element;
+                    args[(Index)(r * colCount + c)] =
+                        castToMatrixElementType(builder, matrixType, element);
                 }
             }
         }
@@ -2557,6 +2787,19 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
             builder.emitMakeMatrix(matrixType, (UInt)args.getCount(), args.getBuffer());
         builder.emitReturn(result);
         return func;
+    }
+
+    // Convert `element` of a matrix to the element type of the storage vectors `vectorType`. It is
+    // the identity unless the storage element type differs from the matrix element type.
+    static IRInst* castToStorageElementType(
+        IRBuilder& builder,
+        IRVectorType* vectorType,
+        IRInst* element)
+    {
+        auto storageElementType = vectorType->getElementType();
+        if (element->getDataType() == storageElementType)
+            return element;
+        return builder.emitCast(storageElementType, element);
     }
 
     IRFunc* createMatrixPackFunc(
@@ -2600,7 +2843,7 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                 for (IRIntegerValue r = 0; r < rowCount; r++)
                 {
                     auto element = elements[(Index)(r * colCount + c)];
-                    vecArgs.add(element);
+                    vecArgs.add(castToStorageElementType(builder, vectorType, element));
                 }
                 // Fill in default values for remaining elements in the vector.
                 for (IRIntegerValue r = rowCount; r < getIntVal(vectorType->getElementCount()); r++)
@@ -2622,7 +2865,7 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                 for (IRIntegerValue c = 0; c < colCount; c++)
                 {
                     auto element = elements[(Index)(r * colCount + c)];
-                    vecArgs.add(element);
+                    vecArgs.add(castToStorageElementType(builder, vectorType, element));
                 }
                 // Fill in default values for remaining elements in the vector.
                 for (IRIntegerValue c = colCount; c < getIntVal(vectorType->getElementCount()); c++)
@@ -2693,7 +2936,9 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                     getIntVal(vectorSize)));
             }
 
-            auto vectorType = builder.getVectorType(matrixType->getElementType(), vectorSize);
+            auto vectorType = builder.getVectorType(
+                getMatrixStorageElementType(matrixType->getElementType(), config),
+                vectorSize);
             IRSizeAndAlignment elementSizeAlignment;
             getSizeAndAlignment(
                 target->getTargetReq(),
@@ -2707,7 +2952,7 @@ struct DefaultBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
                 vectorType,
                 isColMajor ? matrixType->getColumnCount() : matrixType->getRowCount(),
                 needExplicitLayout
-                    ? builder.getIntValue(builder.getIntType(), elementSizeAlignment.getStride())
+                    ? builder.getIntValue(builder.getUIntType(), elementSizeAlignment.getStride())
                     : nullptr);
             builder.createStructField(loweredType, structKey, arrayType);
 
@@ -2744,6 +2989,12 @@ struct KhronosTargetBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLo
 
     virtual bool shouldLowerMatrixType(IRMatrixType* matrixType, TypeLoweringConfig config) override
     {
+        // A matrix that `legalizeMatrixTypes` turns into row vectors is always lowered, on every
+        // target. It is not an `OpTypeMatrix` candidate (the matrix types of these targets have
+        // floating-point elements), so nothing else can keep its layout.
+        if (isMatrixTypeLegalizedToVectorArray(target, matrixType))
+            return true;
+
         // For spirv, we generally want to lower all matrix types, because SPIRV does not support
         // specifying matrix layout/stride if the matrix type is used in places other than
         // defining a struct field. This means that if a matrix is used to define a varying
@@ -2777,6 +3028,39 @@ struct KhronosTargetBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLo
         return target->shouldEmitSPIRVDirectly() && config.addressSpace != AddressSpace::Input;
     }
 
+    // Return the integer type that stores a `bool` in a buffer. Bool is an abstract type in SPIRV,
+    // so it is stored as a signed integer with the size that the layout rule gives `bool`.
+    IRType* getBoolStorageType(IRBuilder& builder, TypeLoweringConfig config)
+    {
+        IRSizeAndAlignment boolSizeAndAlignment;
+        if (getSizeAndAlignment(
+                target->getTargetReq(),
+                config.getLayoutRule(),
+                builder.getBoolType(),
+                &boolSizeAndAlignment) == SLANG_OK)
+        {
+            IntInfo ii;
+            ii.width = boolSizeAndAlignment.size * 8;
+            ii.isSigned = true;
+            return builder.getType(getIntTypeOpFromInfo(ii));
+        }
+        // Just in case that fails for some reason, just use an int.
+        return builder.getIntType();
+    }
+
+    IRType* getMatrixStorageElementType(IRType* elementType, TypeLoweringConfig config) override
+    {
+        if (target->shouldEmitSPIRVDirectly() && as<IRBoolType>(elementType))
+        {
+            IRBuilder builder(elementType);
+            builder.setInsertBefore(elementType);
+            return getBoolStorageType(builder, config);
+        }
+        return DefaultBufferElementTypeLoweringPolicy::getMatrixStorageElementType(
+            elementType,
+            config);
+    }
+
     LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
     {
         if (target->shouldEmitSPIRVDirectly())
@@ -2798,26 +3082,7 @@ struct KhronosTargetBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLo
 
                     if (as<IRBoolType>(scalarType))
                     {
-                        // Bool is an abstract type in SPIRV, so we need to lower them into an int.
-
-                        // Find an integer type of the correct size for the current layout rule.
-                        IRSizeAndAlignment boolSizeAndAlignment;
-                        if (getSizeAndAlignment(
-                                target->getTargetReq(),
-                                config.getLayoutRule(),
-                                scalarType,
-                                &boolSizeAndAlignment) == SLANG_OK)
-                        {
-                            IntInfo ii;
-                            ii.width = boolSizeAndAlignment.size * 8;
-                            ii.isSigned = true;
-                            info.loweredType = builder.getType(getIntTypeOpFromInfo(ii));
-                        }
-                        else
-                        {
-                            // Just in case that fails for some reason, just use an int.
-                            info.loweredType = builder.getIntType();
-                        }
+                        info.loweredType = getBoolStorageType(builder, config);
 
                         if (vectorType)
                             info.loweredType = builder.getVectorType(
@@ -2833,6 +3098,284 @@ struct KhronosTargetBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLo
                 break;
             }
         }
+        return DefaultBufferElementTypeLoweringPolicy::lowerLeafLogicalType(type, config);
+    }
+};
+
+// Metal device buffers use natural (scalar-aligned, tightly packed) layout —
+// the layout `getTypeLayoutRuleNameForBuffer` already declares for them. MSL
+// vector types are aligned to a power-of-two multiple of their element size
+// (e.g. `float3` has size and alignment 16) and so cannot express natural
+// layout, so this policy lowers vectors in such buffers to packed vectors
+// (MSL `packed_T<N>`, e.g. `packed_float3`: 12 bytes, 4-byte alignment) and
+// matrices to structs of packed-vector arrays. Constant buffers and argument
+// buffers (Uniform address space) keep the native Metal layout, which is what
+// reflection reports for them.
+struct MetalBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPolicy
+{
+    MetalBufferElementTypeLoweringPolicy(
+        TargetProgram* inTarget,
+        BufferElementTypeLoweringOptions inOptions)
+        : DefaultBufferElementTypeLoweringPolicy(inTarget, inOptions)
+    {
+    }
+
+    // Discover top-level vector buffer elements for lowering; the base class's
+    // set (struct/matrix/array/bool) does not include bare vectors. The actual
+    // decision is `needsPackedVectorStorage`, shared with vector fields found
+    // inside lowered composites.
+    bool needsElementLowering(IRType* elementType) override
+    {
+        if (auto vectorType = as<IRVectorType>(elementType))
+        {
+            return needsPackedVectorStorage(vectorType);
+        }
+        return DefaultBufferElementTypeLoweringPolicy::needsElementLowering(elementType);
+    }
+
+    // Decide whether a buffer with this config uses packed vector storage.
+    // Only device-memory buffers laid out with natural rules do: constant
+    // and argument buffers (Uniform address space) keep the native MSL
+    // layout reflection reports, and an explicit non-natural data layout
+    // (e.g. `Std140DataLayout`) opts out via the rule-name check.
+    bool usesPackedVectorStorage(TypeLoweringConfig config)
+    {
+        if (config.layoutRuleName != IRTypeLayoutRuleName::Natural)
+            return false;
+        switch (config.addressSpace)
+        {
+        case AddressSpace::StorageBuffer:
+        case AddressSpace::UserPointer:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // The single classification deciding whether a vector uses packed storage,
+    // for both top-level elements and leaves inside composites. Every
+    // multi-element vector does, because natural layout guarantees only the
+    // element's alignment (so a `float4` may sit at offset 4 or be bound at a
+    // 4-byte-aligned base), which no native MSL vector type can express. This
+    // includes `bool` vectors: MSL `bool` is a 1-byte storage type, so a
+    // `bool3` is padded to 4 bytes natively but `packed_bool3` is exactly 3.
+    static bool needsPackedVectorStorage(IRVectorType* vectorType)
+    {
+        auto countInst = as<IRIntLit>(vectorType->getElementCount());
+        if (!countInst)
+            return false;
+        return getIntVal(countInst) > 1;
+    }
+
+    // Return a [ForceInline] function that converts a packed-vector storage
+    // value (by address) back to the logical vector. MSL constructs a vector
+    // directly from a packed vector, so this is a single conversion:
+    // `float3 unpackVector(ref packed_float3 p) { return float3(p); }`
+    IRFunc* createVectorUnpackFunc(
+        IRVectorType* vectorType,
+        IRMetalPackedVectorType* packedVectorType)
+    {
+        IRBuilder builder(packedVectorType);
+        builder.setInsertAfter(packedVectorType);
+        auto func = builder.createFunc();
+        auto refPackedType = builder.getRefParamType(packedVectorType, AddressSpace::Generic);
+        auto funcType = builder.getFuncType(1, (IRType**)&refPackedType, vectorType);
+        func->setFullType(funcType);
+        builder.addNameHintDecoration(func, UnownedStringSlice("__unpackVector"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+
+        auto packedParamRef = builder.emitParam(refPackedType);
+        auto packedParam = builder.emitLoad(packedParamRef);
+        auto result = builder.emitMakeVector(vectorType, 1, &packedParam);
+        builder.emitReturn(result);
+        return func;
+    }
+
+    // Return a [ForceInline] function that converts a logical vector to its
+    // packed-vector storage form (written through the out parameter). MSL
+    // constructs a packed vector directly from a vector, so this is a single
+    // conversion:
+    // `void packVector(out packed_float3 p, float3 v) { p = packed_float3(v); }`
+    IRFunc* createVectorPackFunc(
+        IRVectorType* vectorType,
+        IRMetalPackedVectorType* packedVectorType)
+    {
+        IRBuilder builder(packedVectorType);
+        builder.setInsertAfter(packedVectorType);
+        auto func = builder.createFunc();
+        auto outPackedType = builder.getRefParamType(packedVectorType, AddressSpace::Generic);
+        IRType* paramTypes[] = {outPackedType, vectorType};
+        auto funcType = builder.getFuncType(2, paramTypes, builder.getVoidType());
+        func->setFullType(funcType);
+        builder.addNameHintDecoration(func, UnownedStringSlice("__packVector"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+
+        auto outParam = builder.emitParam(outPackedType);
+        IRInst* originalParam = builder.emitParam(vectorType);
+        auto packedVal = builder.emitMakeVector(packedVectorType, 1, &originalParam);
+        builder.emitStore(outParam, packedVal);
+        builder.emitReturn();
+        return func;
+    }
+
+    IRFunc* createMatrixPackFuncForPackedRows(
+        IRMatrixType* matrixType,
+        IRStructType* structType,
+        IRMetalPackedVectorType* minorPackedType,
+        IRArrayType* majorArrayType)
+    {
+        IRBuilder builder(structType);
+        builder.setInsertAfter(structType);
+        auto func = builder.createFunc();
+        auto outStructType = builder.getRefParamType(structType, AddressSpace::Generic);
+        IRType* paramTypes[] = {outStructType, matrixType};
+        auto funcType = builder.getFuncType(2, paramTypes, builder.getVoidType());
+        func->setFullType(funcType);
+        builder.addNameHintDecoration(func, UnownedStringSlice("__packMatrix"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+        auto rowCount = getIntVal(matrixType->getRowCount());
+        auto colCount = getIntVal(matrixType->getColumnCount());
+        auto outParam = builder.emitParam(outStructType);
+        auto originalParam = builder.emitParam(matrixType);
+        List<IRInst*> elements;
+        elements.setCount((Index)(rowCount * colCount));
+        for (IRIntegerValue r = 0; r < rowCount; r++)
+        {
+            auto vector = builder.emitElementExtract(originalParam, r);
+            for (IRIntegerValue c = 0; c < colCount; c++)
+                elements[(Index)(r * colCount + c)] = builder.emitElementExtract(vector, c);
+        }
+        bool isColMajor = getIntVal(matrixType->getLayout()) == SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
+        auto majorCount = isColMajor ? colCount : rowCount;
+        auto minorCount = isColMajor ? rowCount : colCount;
+        List<IRInst*> minorVectors;
+        for (IRIntegerValue i = 0; i < majorCount; i++)
+        {
+            List<IRInst*> minorArgs;
+            for (IRIntegerValue j = 0; j < minorCount; j++)
+            {
+                auto element = isColMajor ? elements[(Index)(j * colCount + i)]
+                                          : elements[(Index)(i * colCount + j)];
+                minorArgs.add(element);
+            }
+            minorVectors.add(builder.emitMakeVector(
+                minorPackedType,
+                (UInt)minorArgs.getCount(),
+                minorArgs.getBuffer()));
+        }
+        auto majorArray = builder.emitMakeArray(
+            majorArrayType,
+            (UInt)minorVectors.getCount(),
+            minorVectors.getBuffer());
+        auto result = builder.emitMakeStruct(structType, 1, &majorArray);
+        builder.emitStore(outParam, result);
+        builder.emitReturn();
+        return func;
+    }
+
+    LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
+    {
+        if (usesPackedVectorStorage(config))
+        {
+            bool needExplicitLayout = config.lowerToPhysicalType;
+            if (auto vectorType = as<IRVectorType>(type))
+            {
+                if (needsPackedVectorStorage(vectorType))
+                {
+                    IRBuilder builder(type);
+                    builder.setInsertAfter(type);
+                    LoweredElementTypeInfo info = {};
+                    info.originalType = type;
+
+                    // A packed vector (MSL `packed_float3` etc.) has exactly
+                    // the natural layout: element alignment, no padding. No
+                    // explicit stride is needed — the type implies its layout.
+                    auto packedType = builder.getMetalPackedVectorType(
+                        vectorType->getElementType(),
+                        vectorType->getElementCount());
+                    maybeAddPhysicalTypeDecoration(builder, packedType, config);
+
+                    info.loweredType = packedType;
+                    info.convertLoweredToOriginal = createVectorUnpackFunc(vectorType, packedType);
+                    info.convertOriginalToLowered = createVectorPackFunc(vectorType, packedType);
+                    return info;
+                }
+            }
+            else if (auto matrixType = as<IRMatrixType>(type))
+            {
+                bool isColMajor =
+                    getIntVal(matrixType->getLayout()) == SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
+                auto minorCount = isColMajor ? getIntVal(matrixType->getRowCount())
+                                             : getIntVal(matrixType->getColumnCount());
+                auto majorCount = isColMajor ? getIntVal(matrixType->getColumnCount())
+                                             : getIntVal(matrixType->getRowCount());
+                if (minorCount > 1)
+                {
+                    IRBuilder builder(type);
+                    builder.setInsertAfter(type);
+                    LoweredElementTypeInfo info = {};
+                    info.originalType = type;
+
+                    auto loweredType = builder.createStructType();
+                    maybeAddPhysicalTypeDecoration(builder, loweredType, config);
+
+                    StringBuilder nameSB;
+                    nameSB << "_MatrixStorage_";
+                    getTypeNameHint(nameSB, matrixType->getElementType());
+                    nameSB << getIntVal(matrixType->getRowCount()) << "x"
+                           << getIntVal(matrixType->getColumnCount());
+                    if (isColMajor)
+                        nameSB << "_ColMajor";
+                    if (!needExplicitLayout)
+                        nameSB << "_logical";
+                    nameSB << getLayoutName(config.layoutRuleName);
+                    builder.addNameHintDecoration(
+                        loweredType,
+                        nameSB.produceString().getUnownedSlice());
+                    auto structKey = builder.createStructKey();
+                    builder.addNameHintDecoration(structKey, UnownedStringSlice("data"));
+
+                    // Rows (or columns, for column-major layout) are stored as
+                    // packed vectors, whose stride is the natural one.
+                    auto minorPackedType = builder.getMetalPackedVectorType(
+                        matrixType->getElementType(),
+                        builder.getIntValue(builder.getIntType(), minorCount));
+                    IRSizeAndAlignment minorSizeAlignment;
+                    getSizeAndAlignment(
+                        target->getTargetReq(),
+                        config.getLayoutRule(),
+                        minorPackedType,
+                        &minorSizeAlignment);
+                    auto majorArrayType = builder.getArrayType(
+                        minorPackedType,
+                        builder.getIntValue(builder.getIntType(), majorCount),
+                        needExplicitLayout ? builder.getIntValue(
+                                                 builder.getIntType(),
+                                                 minorSizeAlignment.getStride())
+                                           : nullptr);
+                    builder.createStructField(loweredType, structKey, majorArrayType);
+
+                    info.loweredType = loweredType;
+                    info.loweredInnerArrayType = majorArrayType;
+                    info.loweredInnerStructKey = structKey;
+                    info.convertLoweredToOriginal =
+                        createMatrixUnpackFunc(matrixType, loweredType, structKey);
+                    info.convertOriginalToLowered = createMatrixPackFuncForPackedRows(
+                        matrixType,
+                        loweredType,
+                        minorPackedType,
+                        majorArrayType);
+                    return info;
+                }
+            }
+        }
+
         return DefaultBufferElementTypeLoweringPolicy::lowerLeafLogicalType(type, config);
     }
 };
@@ -2903,6 +3446,144 @@ struct LLVMBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPol
     }
 };
 
+// Metal rejects pointer-to-pointer in buffer pointee types. This policy
+// lowers pointer fields to UIntPtr (emits as `ulong` — a pointer-sized
+// integer that communicates the value holds an address, unlike UInt64
+// which could be confused with plain data by future optimization passes).
+//
+// Inherits directly from BufferElementTypeLoweringPolicy rather than
+// DefaultBufferElementTypeLoweringPolicy. This policy only handles
+// pointer-to-UIntPtr lowering; matrix, bool, and other leaf-type
+// lowering was already completed by the earlier invocation of this
+// pass, so the identity fallback in lowerLeafLogicalType is
+// intentionally correct for all non-pointer leaf types.
+//
+// Two address-space rules:
+//   - StorageBuffer (RWStructuredBuffer<T*>): lower ALL pointers, because
+//     the buffer binding itself is a device*, making any T* element into
+//     device T* device* — which Metal rejects.
+//   - Uniform/Constant (ConstantBuffer<S>): lower only multi-level (T**)
+//     fields. Single-level T* is valid as `device int*` inside a
+//     `constant MyStruct*` binding — Metal accepts one level of pointer
+//     indirection in buffer-bound structs.
+//
+// Note: top-level `uniform T**` globals are packed into a GlobalParams
+// struct inside a ConstantBuffer, so the multi-level rule fires through
+// the ConstantBuffer element-type path — they do not go through the
+// IRPtrTypeBase discovery path as bare pointers.
+struct MetalPointerBufferElementTypeLoweringPolicy : BufferElementTypeLoweringPolicy
+{
+
+    // Conservative over-approximation: returns true if the element type
+    // contains ANY pointer (including single-level). The actual lowering
+    // decision is narrower (lowerLeafLogicalType uses the address-space
+    // rule to skip single-level pointers in non-StorageBuffer contexts).
+    // False positives are safe for Natural layout (the framework detects
+    // identity and skips), but not free for non-Natural layout — see TODO.
+    //
+    // Recursion through arrays/structs is needed because processModule
+    // asks about the TOP-LEVEL element type (e.g. the struct), not
+    // individual fields. We must drill in to detect nested pointers.
+    //
+    // TODO: False positives are NOT free for already-[PhysicalType]-
+    // decorated types (re-processed via shouldSkipPhysicalTypes = false).
+    // When all field lowerings are identity, the non-Natural layout
+    // rule in getLoweredTypeInfoImpl still forces creation of a
+    // structurally new type, triggering unnecessary pack/unpack helper
+    // generation. Output is correct after simplification, but it's
+    // wasteful IR churn. Fixing this requires needsElementLowering to
+    // be address-space-aware (shared base-class signature change),
+    // since the discovery filter can't currently distinguish
+    // StorageBuffer (lower all pointers) from Uniform/Constant (lower
+    // only multi-level). In practice this triggers for ParameterBlock
+    // structs with single-level pointers in Uniform/Constant context.
+    // The extra helpers are eliminated by simplifyNonSSAIR — the cost
+    // is compile-time IR churn only, no runtime impact.
+    bool needsElementLowering(IRType* elementType) override
+    {
+        // We match IRPtrType specifically, not IRPtrTypeBase (which
+        // also includes IRRefType). Metal's device T* device*
+        // restriction applies to address-taking pointers; references
+        // are not stored as data in buffer element types.
+        if (as<IRPtrType>(elementType))
+            return true;
+        if (auto arrType = as<IRArrayTypeBase>(elementType))
+            return needsElementLowering((IRType*)arrType->getElementType());
+        if (auto structType = as<IRStructType>(elementType))
+        {
+            for (auto field : structType->getFields())
+                if (needsElementLowering(field->getFieldType()))
+                    return true;
+        }
+        // All other leaf types (scalars, vectors, DescriptorHandle after
+        // MetalParameterBlock lowering, etc.) do not contain pointers
+        // and correctly fall through.
+        return false;
+    }
+
+    // Both the early MetalParameterBlock pass (resource -> DescriptorHandle
+    // in ParameterBlocks) and the main Default pass (matrix/bool lowering
+    // in all buffer types) decorate their output types with [PhysicalType].
+    // Pointer fields were left untouched by both — IRPtrType is not a
+    // resource type, and the default policy's lowerLeafLogicalType does
+    // not lower pointers. We must re-process these types to lower their
+    // pointer fields.
+    bool shouldSkipPhysicalTypes() override { return false; }
+
+    LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
+    {
+        // The invariant: lower any pointer field that would produce a
+        // pointer-to-pointer type in Metal output. The two rules below
+        // are its decomposition by source of the extra indirection.
+        //
+        if (auto ptrType = as<IRPtrType>(type))
+        {
+            // Two independent rules determine whether this pointer
+            // field needs lowering. Either one is sufficient.
+            //
+            bool needsLowering = false;
+
+            // StorageBuffer rule: the buffer binding itself is a
+            // device*, so any T* element becomes device T* device*
+            // which Metal rejects. Lower all pointers regardless
+            // of depth.
+            //
+            if (config.addressSpace == AddressSpace::StorageBuffer)
+                needsLowering = true;
+
+            // Multi-level rule: if the pointee is itself a pointer
+            // (T** or deeper), the type is invalid in any buffer
+            // context. Single-level T* is fine in Uniform/Constant
+            // because Metal accepts one level of indirection in
+            // buffer-bound structs.
+            //
+            if (as<IRPtrType>(ptrType->getValueType()))
+                needsLowering = true;
+
+            if (needsLowering)
+            {
+                LoweredElementTypeInfo info;
+                info.originalType = type;
+                IRBuilder builder(type);
+                info.loweredType = builder.getType(kIROp_UIntPtrType);
+                info.convertLoweredToOriginal = kIROp_CastIntToPtr;
+                info.convertOriginalToLowered = kIROp_CastPtrToInt;
+                return info;
+            }
+        }
+
+        // Not a pointer, or a single-level pointer in a non-StorageBuffer
+        // context (which Metal allows). Identity: loweredType == originalType
+        // tells the framework no conversion is needed. Conversion methods
+        // are left default-constructed (unused when types match).
+        //
+        LoweredElementTypeInfo info;
+        info.originalType = type;
+        info.loweredType = type;
+        return info;
+    }
+};
+
 BufferElementTypeLoweringPolicy* getBufferElementTypeLoweringPolicy(
     BufferElementTypeLoweringPolicyKind kind,
     TargetProgram* target,
@@ -2914,8 +3595,12 @@ BufferElementTypeLoweringPolicy* getBufferElementTypeLoweringPolicy(
         return new DefaultBufferElementTypeLoweringPolicy(target, options);
     case BufferElementTypeLoweringPolicyKind::KhronosTarget:
         return new KhronosTargetBufferElementTypeLoweringPolicy(target, options);
+    case BufferElementTypeLoweringPolicyKind::Metal:
+        return new MetalBufferElementTypeLoweringPolicy(target, options);
     case BufferElementTypeLoweringPolicyKind::MetalParameterBlock:
         return new MetalParameterBlockElementTypeLoweringPolicy(target, options);
+    case BufferElementTypeLoweringPolicyKind::MetalPointerLowering:
+        return new MetalPointerBufferElementTypeLoweringPolicy();
     case BufferElementTypeLoweringPolicyKind::WGSL:
         return new WGSLBufferElementTypeLoweringPolicy(target, options);
     case BufferElementTypeLoweringPolicyKind::LLVM:

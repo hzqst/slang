@@ -11,12 +11,12 @@
 // of the compiler, and operates as logical transformation from one stream of tokens
 // to another.
 
-#include "../compiler-core/slang-lexer.h"
+#include "compiler-core/slang-lexer.h"
+#include "core/slang-type-text-util.h"
 #include "slang-compiler.h"
 #include "slang-diagnostics.h"
 #include "slang-rich-diagnostics.h"
 
-#include <assert.h>
 
 namespace Slang
 {
@@ -1191,6 +1191,13 @@ struct WarningStateTracker : SourceWarningStateTrackerBase
     Dictionary<int, WarningTimeline> mapDiagnosticIdToTimeline = {};
     List<SourceLoc> stack = {};
 
+    // Running absolute-location counter, persisted across the separate `preprocessSource`
+    // passes that share this tracker (each `__include`d file is preprocessed in its own
+    // pass with a fresh `Preprocessor`). Persisting it keeps the timeline's absolute-location
+    // axis globally monotonic across files, instead of every pass restarting from 0 and
+    // colliding in the shared timeline (shader-slang/slang#11473).
+    SourceLoc::RawValue persistedAbsoluteSourceLocCounter = 0;
+
     WarningStateTracker(SourceManager* sourceManager = nullptr)
         : sourceManager(sourceManager)
     {
@@ -1313,8 +1320,8 @@ struct Preprocessor
     /// Stores the initiating macro source location.
     SourceLoc initiatingMacroSourceLoc;
 
-    /// Detected source language.
-    SourceLanguage language = SourceLanguage::Unknown;
+    /// Source language and directive location discovered in the source text.
+    SourceLanguageDirective sourceLanguageDirective;
 
     SlangLanguageVersion languageVersion = SLANG_LANGUAGE_VERSION_UNKNOWN;
 
@@ -1864,6 +1871,10 @@ void ExpansionInputStream::_maybeBeginMacroInvocation()
                                 .expected = int(paramCount),
                                 .got = int(argCount),
                                 .location = leftParen.loc});
+                        // The invocation was never pushed onto the input stream
+                        // stack (which owns and eventually deletes its streams),
+                        // so it must be freed here.
+                        delete invocation;
                         return;
                     }
                 }
@@ -1882,6 +1893,9 @@ void ExpansionInputStream::_maybeBeginMacroInvocation()
                                 .expected = int(requiredArgCount),
                                 .got = int(argCount),
                                 .location = leftParen.loc});
+                        // See the non-variadic mismatch above: not pushed, so
+                        // freed here.
+                        delete invocation;
                         return;
                     }
                 }
@@ -4201,7 +4215,7 @@ static void HandleLineDirective(PreprocessorDirectiveContext* context)
         break;
 
     case TokenType::StringLiteral:
-        file = getStringLiteralTokenValue(AdvanceToken(context));
+        file = getStringLiteralTokenValue(AdvanceToken(context), GetSink(context));
         break;
 
     case TokenType::IntegerLiteral:
@@ -4484,6 +4498,63 @@ static void HandleExtensionDirective(PreprocessorDirectiveContext* context)
     SkipToEndOfLine(context);
 }
 
+/// Try to record a language directive in this source segment.
+///
+/// Preserving the first location lets the translation-unit layer combine independently
+/// preprocessed source segments while still reporting both sides of a conflict.
+/// `slangLanguageVersion` is meaningful only for Slang. The return value is true when the
+/// directive agrees with the first selection and the caller may commit its version-specific state;
+/// false means a diagnostic was emitted and the first selection must remain in force.
+///
+/// Consider a source segment containing `#version 450` followed by `#language slang 2026`. The
+/// first directive records GLSL. The second emits `ConflictingSourceLanguageDirectives`, returns
+/// false, and leaves GLSL as the segment's selection so preprocessing cannot change grammars
+/// partway through one source file.
+///
+/// `_applySourceLanguageDirective` diagnoses the same conflict across primary files, while
+/// `Linkage::findAndIncludeFile` handles directives discovered by a semantic `__include`.
+static bool _tryApplySourceLanguageDirective(
+    PreprocessorDirectiveContext* context,
+    SourceLanguage language,
+    SlangLanguageVersion slangLanguageVersion = SLANG_LANGUAGE_VERSION_UNKNOWN)
+{
+    auto& directive = context->m_preprocessor->sourceLanguageDirective;
+    if (directive.language == SourceLanguage::Unknown)
+    {
+        directive.language = language;
+        directive.location = GetDirectiveLoc(context);
+        directive.slangLanguageVersion = slangLanguageVersion;
+        return true;
+    }
+    if (directive.language != language)
+    {
+        // A translation unit needs one effective source language before parsing starts. Preserve
+        // the first content-level selection so a later conflicting directive cannot silently
+        // change how only part of the input is parsed.
+        GetSink(context)->diagnose(Diagnostics::ConflictingSourceLanguageDirectives{
+            .location = GetDirectiveLoc(context),
+            .firstLocation = directive.location});
+        return false;
+    }
+
+    if (language != SourceLanguage::Slang)
+        return true;
+
+    // Every accepted Slang directive is created by `HandleLanguageDirective` after it has parsed a
+    // valid version. Make that producer contract explicit before comparing the first and current
+    // directives; GLSL reaches the early return above and intentionally carries no Slang version.
+    SLANG_RELEASE_ASSERT(slangLanguageVersion != SLANG_LANGUAGE_VERSION_UNKNOWN);
+    SLANG_RELEASE_ASSERT(directive.slangLanguageVersion != SLANG_LANGUAGE_VERSION_UNKNOWN);
+    if (directive.slangLanguageVersion != slangLanguageVersion)
+    {
+        GetSink(context)->diagnose(Diagnostics::ConflictingSlangLanguageVersionDirectives{
+            .location = GetDirectiveLoc(context),
+            .firstLocation = directive.location});
+        return false;
+    }
+    return true;
+}
+
 static void HandleVersionDirective(PreprocessorDirectiveContext* context)
 {
     int version = SLANG_LANGUAGE_VERSION_UNKNOWN;
@@ -4502,7 +4573,7 @@ static void HandleVersionDirective(PreprocessorDirectiveContext* context)
 
     if (isValidGLSLVersion(version))
     {
-        context->m_preprocessor->language = SourceLanguage::GLSL;
+        _tryApplySourceLanguageDirective(context, SourceLanguage::GLSL);
     }
     else
     {
@@ -4512,59 +4583,93 @@ static void HandleVersionDirective(PreprocessorDirectiveContext* context)
     }
 }
 
+// Handle language directive. The syntax is:
+//
+//     "#lang" ["slang"] <version>
+//
+// or
+//
+//     "#language" ["slang"] <version>
 static void HandleLanguageDirective(PreprocessorDirectiveContext* context)
 {
-    int version = SLANG_LANGUAGE_VERSION_UNKNOWN;
-    switch (PeekTokenType(context))
+    bool languageSpecified = false;
+    bool hasVersionToken = false;
+    Token versionToken{};
+
+    if (PeekTokenType(context) == TokenType::Identifier)
     {
-    case TokenType::IntegerLiteral:
-        version = stringToInt(AdvanceToken(context).getContent());
-        break;
-    case TokenType::Identifier:
+        // start by parsing the language (optional)
+        auto token = AdvanceToken(context);
+        if (token.getContent().caseInsensitiveEquals(toSlice("slang")))
         {
-            auto token = AdvanceToken(context);
-            if (token.getContent().caseInsensitiveEquals(toSlice("slang")))
-            {
-                context->m_preprocessor->language = SourceLanguage::Slang;
-                token = AdvanceToken(context);
-            }
-            else if (token.getContent() == "glsl")
-            {
-                context->m_preprocessor->language = SourceLanguage::GLSL;
-                token = AdvanceToken(context);
-            }
-            if (token.getContent() == "latest")
-                version = SLANG_LANGUAGE_VERSION_LATEST;
-            else if (token.getContent() == "legacy")
-                version = SLANG_LANGUAGE_VERSION_LEGACY;
-            else if (token.type == TokenType::IntegerLiteral)
-                version = stringToInt(token.getContent());
-            else
-            {
-                GetSink(context)->diagnose(Diagnostics::UnknownLanguage{
-                    .language = token.getContent(),
-                    .location = GetDirectiveLoc(context)});
-            }
+            token = AdvanceToken(context);
+            languageSpecified = true;
         }
-        break;
-    default:
+
+        // set language version token
+        versionToken = token;
+        hasVersionToken = true;
+    }
+    else if (PeekTokenType(context) == TokenType::IntegerLiteral)
+    {
+        versionToken = AdvanceToken(context);
+        hasVersionToken = true;
+    }
+    else
+    {
         GetSink(context)->diagnose(
             Diagnostics::ExpectedIntegralVersionNumber{.location = GetDirectiveLoc(context)});
-        break;
     }
 
     SkipToEndOfLine(context);
 
-    if (isValidSlangLanguageVersion(version))
+    if (hasVersionToken)
     {
-        context->m_preprocessor->language = SourceLanguage::Slang;
-        context->m_preprocessor->languageVersion = (SlangLanguageVersion)version;
-    }
-    else
-    {
-        GetSink(context)->diagnose(Diagnostics::UnknownLanguageVersion{
-            .version = String(version),
-            .location = GetDirectiveLoc(context)});
+        // Note: Returns SLANG_LANGUAGE_VERSION_UNKNOWN if the language version
+        // is not found.
+        int version = TypeTextUtil::findLanguageVersion(versionToken.getContent());
+
+        if (isValidSlangLanguageVersion(version))
+        {
+            auto slangLanguageVersion = static_cast<SlangLanguageVersion>(version);
+            if (_tryApplySourceLanguageDirective(
+                    context,
+                    SourceLanguage::Slang,
+                    slangLanguageVersion))
+            {
+                context->m_preprocessor->languageVersion = slangLanguageVersion;
+            }
+        }
+        else
+        {
+            // Invalid/bad version, figure out the correct diagnostics
+
+            if ((!languageSpecified) && (versionToken.type == TokenType::Identifier))
+            {
+                // Language not specified, so we interpret the bad identifier token as a language
+                GetSink(context)->diagnose(Diagnostics::UnknownLanguage{
+                    .language = versionToken.getContent(),
+                    .location = GetDirectiveLoc(context)});
+            }
+            else if (
+                (versionToken.type == TokenType::IntegerLiteral) ||
+                (versionToken.type == TokenType::Identifier))
+            {
+                // Either:
+                // - integer literal (always interpreted as a version)
+                // - identifier token AND language was specified (interpret as a version)
+                GetSink(context)->diagnose(Diagnostics::UnknownLanguageVersion{
+                    .version = versionToken.getContent(),
+                    .location = GetDirectiveLoc(context)});
+            }
+            else
+            {
+                // Something other than identifier or an integer literal, assume
+                // this is bad version
+                GetSink(context)->diagnose(Diagnostics::ExpectedIntegralVersionNumber{
+                    .location = GetDirectiveLoc(context)});
+            }
+        }
     }
 }
 
@@ -4973,7 +5078,7 @@ TokenList preprocessSource(
     IncludeSystem* includeSystem,
     Dictionary<String, String> const& defines,
     Linkage* linkage,
-    SourceLanguage& outDetectedLanguage,
+    SourceLanguageDirective& outSourceLanguageDirective,
     SlangLanguageVersion& outLanguageVersion,
     PreprocessorHandler* handler)
 {
@@ -5003,13 +5108,13 @@ TokenList preprocessSource(
         desc.sink->setSourceWarningStateTracker(wst);
     }
 
-    return preprocessSource(file, desc, outDetectedLanguage, outLanguageVersion);
+    return preprocessSource(file, desc, outSourceLanguageDirective, outLanguageVersion);
 }
 
 TokenList preprocessSource(
     SourceFile* file,
     PreprocessorDesc const& desc,
-    SourceLanguage& outDetectedLanguage,
+    SourceLanguageDirective& outSourceLanguageDirective,
     SlangLanguageVersion& outLanguageVersion)
 {
     using namespace preprocessor;
@@ -5027,6 +5132,24 @@ TokenList preprocessSource(
 
     preprocessor.warningStateTracker =
         dynamicCast<preprocessor::WarningStateTracker>(desc.sink->getSourceWarningStateTracker());
+
+    // Continue the absolute-location axis from the previous pass that shared this tracker.
+    //
+    // Correctness relies on a pass-ordering invariant the timeline depends on but cannot check:
+    // `preprocessSource` runs once per file, in include order, so the seeded ranges are disjoint
+    // and absolute-location order matches include/program order. That is exactly what keeps
+    // `WarningTimeline::addEntry`'s strictly-increasing insert guard (`location >
+    // maxKnownLocation`) satisfied across files. Each file is preprocessed at most once per
+    // tracker: `Linkage::findAndIncludeFile` de-dupes via the module's included-source-file map. If
+    // a pass ever ran out of include order, or a file were re-preprocessed against the same
+    // tracker, the seeded range could overlap a prior file's range and `#pragma warning` state
+    // would be mis-resolved *silently* (entries dropped on the `PragmaWarningCannotInsertHere`
+    // path, or a wrong suppression).
+    if (preprocessor.warningStateTracker)
+    {
+        preprocessor.absoluteSourceLocCounter =
+            preprocessor.warningStateTracker->persistedAbsoluteSourceLocCounter;
+    }
 
     // Add builtin macros
     {
@@ -5088,6 +5211,25 @@ TokenList preprocessSource(
 
     finalCheckPragmaWarnings(&preprocessor);
 
+    // Hand the advanced counter back so the next `__include` pass continues the axis. The counter
+    // only ever advances within a pass (pushInputFile/popInputFile add non-negative offsets), so
+    // the value handed back must not be below the value seeded above.
+    //
+    // Use a release assert (not `SLANG_ASSERT`, which is elided / becomes `SLANG_ASSUME` in release
+    // builds): violating monotonicity silently corrupts pragma-warning state in shipping
+    // slangc/slangd. This also guards against `SourceLoc::RawValue` (a `uint32_t`) wrapping once
+    // the counter accumulates across every `__include`d file of a very large translation unit -- on
+    // wrap the new value would be smaller than the persisted one, so the assert fires loudly
+    // instead of re-introducing the cross-file location aliasing this fix removes.
+    if (preprocessor.warningStateTracker)
+    {
+        SLANG_RELEASE_ASSERT(
+            preprocessor.absoluteSourceLocCounter >=
+            preprocessor.warningStateTracker->persistedAbsoluteSourceLocCounter);
+        preprocessor.warningStateTracker->persistedAbsoluteSourceLocCounter =
+            preprocessor.absoluteSourceLocCounter;
+    }
+
     // debugging: build the pre-processed source back together
 #if 0
     StringBuilder sb;
@@ -5108,7 +5250,7 @@ TokenList preprocessSource(
     String s = sb.produceString();
 #endif
 
-    outDetectedLanguage = preprocessor.language;
+    outSourceLanguageDirective = preprocessor.sourceLanguageDirective;
     if (preprocessor.languageVersion != SLANG_LANGUAGE_VERSION_UNKNOWN)
         outLanguageVersion = preprocessor.languageVersion;
     return tokens;

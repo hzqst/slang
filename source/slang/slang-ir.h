@@ -6,16 +6,17 @@
 // similar in spirit to LLVM (but much simpler).
 //
 
-#include "../compiler-core/slang-source-loc.h"
-#include "../compiler-core/slang-source-map.h"
-#include "../core/slang-basic.h"
-#include "../core/slang-memory-arena.h"
+#include "compiler-core/slang-source-loc.h"
+#include "compiler-core/slang-source-map.h"
+#include "core/slang-basic.h"
+#include "core/slang-memory-arena.h"
 #include "slang-ast-type.h"
 #include "slang-container-pool.h"
 #include "slang-ir-insts-enum.h"
 #include "slang-type-system-shared.h"
 
 #include <functional>
+#include <mutex>
 
 //
 #include "slang-ir.h.fiddle"
@@ -774,7 +775,9 @@ struct IRInst
     /// It is possible that this instruction has side effects?
     ///
     /// This is a conservative test, and will return `true` if an exact answer can't be determined.
-    bool mightHaveSideEffects(SideEffectAnalysisOptions options = SideEffectAnalysisOptions::None);
+    bool mightHaveSideEffects(
+        SideEffectAnalysisOptions options = SideEffectAnalysisOptions::None,
+        Dictionary<IRInst*, bool>* calleeSideEffectCache = nullptr);
 
     // RTTI support
     static bool isaImpl(IROp) { return true; }
@@ -1157,7 +1160,7 @@ struct IRTerminatorInst : IRInst
 
 // A function parameter is owned by a basic block, and represents
 // either an incoming function parameter (in the entry block), or
-// a value that flows from one SSA block to another (in a non-entry
+// a value that flows from one SSA block to (in a non-entry
 // block).
 //
 // In each case, the basic idea is that a block is a "label with
@@ -1342,7 +1345,12 @@ struct IRBlock : IRInst
         Iterator begin() { return Iterator(begin_, stride); }
         Iterator end() { return Iterator(end_, stride); }
 
-        SuccessorList reverse() { return SuccessorList(end_ - stride, begin_ - stride, -stride); }
+        SuccessorList reverse()
+        {
+            if (!begin_ || !end_)
+                return SuccessorList(nullptr, nullptr, -stride);
+            return SuccessorList(end_ - stride, begin_ - stride, -stride);
+        }
     };
 
     PredecessorList getPredecessors();
@@ -1618,12 +1626,24 @@ FIDDLE()
 struct IRFuncType : IRType
 {
     FIDDLE(leafInst())
-    UInt getParamCount() { return getOperandCount() - 1; }
-    IRType* getParamType(UInt index) { return (IRType*)getOperand(1 + index); }
-    IROperandList<IRType> getParamTypes()
-    {
-        return IROperandList<IRType>(getOperands() + 1, getOperands() + getOperandCount());
-    }
+    // Operand layout:
+    //   [0]                   : result type
+    //   [1 .. paramEnd)       : parameter types
+    //   [paramEnd]            : optional trailing attribute (e.g.
+    //                           `IRFuncThrowTypeAttr`), distinguished
+    //                           from a parameter type by deriving from
+    //                           `IRAttr` rather than `IRType`.
+    //
+    // The accessors below skip the trailing attribute (if any) so that
+    // `getParamCount()` / `getParamType()` / `getParamTypes()` only
+    // expose actual parameter types. They are defined out-of-line in
+    // slang-ir.cpp because they need the full `IRAttr` definition.
+    UInt getParamCount();
+    IRType* getParamType(UInt index);
+    IROperandList<IRType> getParamTypes();
+    // Returns the trailing attribute (e.g. an `IRFuncThrowTypeAttr`) if
+    // one was attached when the type was created, or null otherwise.
+    IRAttr* getAttr();
 };
 
 FIDDLE()
@@ -1857,6 +1877,17 @@ void fixUpFuncType(IRFunc* func, IRType* resultType);
 ///
 void fixUpFuncType(IRFunc* func);
 
+/// Return a function type whose concrete type-pack parameters have been flattened.
+///
+/// Specialization can leave a call-site callee with a function type parameterized as
+/// `(TypePack<T0, T1, ...>)` even though the call operands have already been expanded to
+/// `(T0, T1, ...)`. This helper performs only that concrete `IRTypePack` flattening step.
+IRFuncType* maybeExpandConcreteFuncTypePacks(IRBuilder* builder, IRFuncType* funcType);
+IRFuncType* maybeExpandConcreteFuncTypePacks(
+    IRBuilder* builder,
+    IRInst* funcValue,
+    IRFuncType* funcType);
+
 /// If the function has a DebugFuncDecoration, replaces the function type in
 /// that decoration to match the current type of the function.
 ///
@@ -1960,6 +1991,24 @@ struct IRConstantKey
     HashCode getHashCode() const { return inst->getHashCode(); }
 };
 
+struct AnnotationCacheKey
+{
+    IRInst* inst;
+    AnnotationKind associationKind;
+    bool operator==(const AnnotationCacheKey& other) const
+    {
+        return inst == other.inst && associationKind == other.associationKind;
+    }
+
+    HashCode getHashCode() const
+    {
+        Hasher hasher;
+        hasher.hashValue(inst);
+        hasher.hashValue(static_cast<int>(associationKind));
+        return hasher.getResult();
+    }
+};
+
 // State owned by IRModule for global value deduplication.
 // Not supposed to be used/instantiated outside IRModule.
 struct IRDeduplicationContext
@@ -2029,6 +2078,51 @@ struct IRAnalysis
     IRDominatorTree* getDominatorTree();
 };
 
+struct ModuleLinkingInfo : RefObject
+{
+    typedef Dictionary<IRInst*, List<IRAnnotation*>> InstAnnotationMap;
+
+    ModuleLinkingInfo(IRModule* module);
+
+    /// Query the acceleration cache for module-scope annotations on `target`.
+    /// The result is only valid while the module is unchanged from when this info was built.
+    ArrayView<IRAnnotation*> getAnnotationsForTarget(IRInst* target);
+
+    /// Query the acceleration cache for global HLSL/downstream exports.
+    /// The result is only valid while the module is unchanged from when this info was built.
+    ArrayView<IRInst*> getHLSLExports() { return m_hlslExports.getArrayView(); }
+
+    /// Query the acceleration cache for global shader parameters.
+    /// The result is only valid while the module is unchanged from when this info was built.
+    ArrayView<IRInst*> getGlobalParams() { return m_globalParams.getArrayView(); }
+
+    /// Query the acceleration cache for globals with KnownBuiltin decorations.
+    /// The result is only valid while the module is unchanged from when this info was built.
+    ArrayView<IRInst*> getKnownBuiltins() { return m_knownBuiltins.getArrayView(); }
+
+    /// Return the module's GlobalHashedStringLiterals aggregate, if present when this info was
+    /// built.
+    IRGlobalHashedStringLiterals* getGlobalHashedStringLiterals()
+    {
+        return m_globalHashedStringLiterals;
+    }
+
+private:
+    void _build(IRModule* module);
+
+    // Acceleration cache from annotated inst to the module-scope annotations that target it.
+    InstAnnotationMap m_instAnnotationMap;
+
+    // Acceleration caches for linker decisions that previously scanned all global instructions.
+    List<IRInst*> m_hlslExports;
+    List<IRInst*> m_globalParams;
+    List<IRInst*> m_knownBuiltins;
+
+    // Cached while walking global instructions with the linker caches above. Each module is
+    // expected to contain at most one IRGlobalHashedStringLiterals instruction.
+    IRGlobalHashedStringLiterals* m_globalHashedStringLiterals = nullptr;
+};
+
 FIDDLE()
 struct IRModule : RefObject
 {
@@ -2066,6 +2160,33 @@ public:
     IRDeduplicationContext* getDeduplicationContext() const { return &m_deduplicationContext; }
 
     Dictionary<IRInst*, UInt>* getUniqueIdMap() { return &m_mapInstToUniqueId; }
+
+    Dictionary<AnnotationCacheKey, IRAnnotation*>* getAnnotationLookupCache()
+    {
+        return &m_annotationLookupCache;
+    }
+
+    /// Ensure the module-owned acceleration cache used by linker global handling is built.
+    /// A built cache assumes the module will not change after it is built; callers must
+    /// manually rebuild it if module-scope annotations, global params, exports, known builtins,
+    /// or global hashed string literals change.
+    void _ensureLinkingInfo();
+
+    /// Build or return the module-owned acceleration cache used by linker global handling.
+    /// The returned info has the same lifetime and invalidation assumptions as
+    /// `_ensureLinkingInfo()`.
+    ModuleLinkingInfo* _getOrCreateLinkingInfo();
+
+    /// Return the module-owned linker acceleration cache if it has already been built.
+    /// A built cache assumes the module has not changed since `_ensureLinkingInfo()`.
+    ModuleLinkingInfo* _getLinkingInfo();
+
+    /// Drop the module-owned linker acceleration cache after mutating module-scope state that
+    /// it records. The cache will be rebuilt by the next `_ensureLinkingInfo()` or
+    /// `_getOrCreateLinkingInfo()` call.
+    /// This is not thread-safe and should only be used by experimental APIs that mutate an
+    /// existing module.
+    void _invalidateLinkingInfo();
 
     IRDominatorTree* findDominatorTree(IRGlobalValueWithCode* func)
     {
@@ -2117,24 +2238,28 @@ public:
 
     ContainerPool& getContainerPool() { return m_containerPool; }
 
+    // TODO: Could be better...
+    IRCompilerDictionary* getTranslationDict() { return m_translationDict; }
+    void setTranslationDict(IRCompilerDictionary* dict) { m_translationDict = dict; }
+
+    // Binary module loading checks this range before decoding serialized AST and IR.
+    // Adding an IR instruction requires a new writer version. Earlier modules can remain
+    // supported when their AST and IR representations are compatible with the reader.
     //
-    // The range of module versions this compiler supports
-    //
-    // This will need to be updated if for example an instruction is removed,
-    // the max supported version should be incremented and the min supported
-    // version set to above the last version an instance of that instruction
-    // could be found
-    //
-    // Additionally this should be updated when new instructions are added,
-    // however only k_maxSupportedModuleVersion needs to be incremented in that
-    // case
-    //
-    // It represents the version of module regarding semantics and doesn't have
-    // anything to do with serialization format
-    //
-    const static UInt k_minSupportedModuleVersion = 4;
-    const static UInt k_maxSupportedModuleVersion = 7;
+    // Adding `RefReadOnlyModifier`, `RefWriteOnlyModifier` and the reference parameter type
+    // classes shifts the sequential `ASTNodeType` values, so a version-36 module's later AST
+    // nodes would be decoded as different classes.
+    // Version 37 is the earliest module version with the updated AST node numbering, and with
+    // the `QualType::isReadOnlyMemoryLocation` field in serialized expressions.
+    const static UInt k_minSupportedModuleVersion = 37;
+    const static UInt k_maxSupportedModuleVersion = 37;
     static_assert(k_minSupportedModuleVersion <= k_maxSupportedModuleVersion);
+
+    /// Returns whether `version` is in the inclusive range this compiler can load.
+    static bool isModuleVersionSupported(UInt64 version)
+    {
+        return version >= k_minSupportedModuleVersion && version <= k_maxSupportedModuleVersion;
+    }
 
 private:
     friend struct IRSerialReadContext;
@@ -2189,6 +2314,17 @@ private:
     /// insts when unnecessary.
     ///
     Dictionary<IRInst*, UInt> m_mapInstToUniqueId;
+
+    // Translation cache.
+    IRCompilerDictionary* m_translationDict = nullptr;
+
+    // (inst, association-kind) -> associated-inst
+    Dictionary<AnnotationCacheKey, IRAnnotation*> m_annotationLookupCache;
+
+    // Acceleration cache for linker global handling.
+    // Assumes the module will not change after the cache is built; rebuild manually if it does.
+    RefPtr<ModuleLinkingInfo> m_linkingInfo;
+    std::mutex m_linkingInfoMutex;
 };
 
 
@@ -2370,6 +2506,11 @@ extern bool _slangIRPrintStackAtBreak;
 void _debugSetInstBeingCloned(uint32_t uid);
 void _debugResetInstBeingCloned();
 #endif
+
+// Print a call stack leading to 'inst' as a series of
+// Diagnostics::seeCallOfFunc diagnostic messages.
+void diagnoseCallStack(IRInst* inst, DiagnosticSink* sink);
+
 
 // TODO: Ellie, comment and move somewhere more appropriate?
 

@@ -60,7 +60,7 @@ inputs:
     required: false
     default: ""
   custom-instructions:
-    description: "Custom instructions for Claude"
+    description: "Custom instructions appended to Claude Code's default system prompt (via --append-system-prompt; must not contain unbalanced double quotes)"
     required: true
   mcp-config:
     description: "MCP server configuration JSON"
@@ -101,6 +101,16 @@ inputs:
     required: false
     default: "claude/"
 
+  # Permission configuration
+  allowed-non-write-users:
+    description: "Comma-separated list of usernames to allow without write permissions, or '*' to allow all users. Only works when github_token is provided."
+    required: false
+    default: ""
+  oidc-contents-permission:
+    description: "Contents permission level for OIDC token exchange ('read' or 'write'). Use 'write' only for workflows that need to push code (e.g., CI fixer). Default 'read' for safety."
+    required: false
+    default: "read"
+
   # AWS/Bedrock configuration (LLMGW path uses Bedrock with bearer token)
   aws-region:
     description: "AWS region"
@@ -137,7 +147,14 @@ runs:
     # Windows-specific setup: MSVC dev tools
     - name: Set up MSVC dev tools (Windows)
       if: runner.os == 'Windows'
-      uses: ilammy/msvc-dev-cmd@v1
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      # msvc-dev-cmd has no Node 24 release yet (upstream ilammy/msvc-dev-cmd#105);
+      # run its node20 bundle on the node24 runtime. This restates the
+      # deprecation annotation ("forced to run on Node.js 24") rather than
+      # silencing it — the point is to exercise the runtime that survives the
+      # retirement, so a break surfaces now instead of when Node 20 is removed.
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     # Install dependencies not present in act/self-hosted (pre-installed on GitHub runners)
     - name: Install Linux dependencies
@@ -420,7 +437,7 @@ runs:
           -X POST "$EXCHANGE_URL" \
           -H "Authorization: Bearer $OIDC_TOKEN" \
           -H "Content-Type: application/json" \
-          -d '{"permissions":{"contents":"read","pull_requests":"write","issues":"write","actions":"read"}}' \
+          -d '{"permissions":{"contents":"${{ inputs.oidc-contents-permission }}","pull_requests":"write","issues":"write","actions":"read"}}' \
           2>/dev/null || echo "000")
 
         if [ "$HTTP_CODE" = "200" ] && [ -f "$EXCHANGE_RESPONSE" ]; then
@@ -465,6 +482,22 @@ runs:
 
         echo "model=$MODEL" >> $GITHUB_OUTPUT
 
+    # custom-instructions is interpolated into claude_args inside double quotes and
+    # parsed by shell-quote, not a real shell. An unbalanced double quote flips quote
+    # parity and silently swallows the flags that follow (--model, --allowedTools),
+    # disabling the tool allowlist. Fail closed instead. (Balanced embedded quotes
+    # are tolerated but get stripped by the parser.)
+    - name: Validate custom-instructions quoting
+      shell: bash
+      env:
+        CUSTOM_INSTRUCTIONS: ${{ inputs.custom-instructions }}
+      run: |
+        QUOTE_COUNT=$(printf '%s' "$CUSTOM_INSTRUCTIONS" | tr -cd '"' | wc -c)
+        if [ $((QUOTE_COUNT % 2)) -ne 0 ]; then
+          echo "::error::custom-instructions contains an unbalanced double quote; this corrupts claude_args parsing and drops the tool allowlist. Remove or balance the quote."
+          exit 1
+        fi
+
     # Execute Claude Code Action (v1) - NVIDIA Inference Portal
     - name: Execute Claude Code Action (NV Inference)
       id: claude-action-nv
@@ -482,6 +515,7 @@ runs:
       with:
         anthropic_api_key: ${{ steps.auth-token.outputs.token }}
         github_token: ${{ steps.github-token.outputs.token }}
+        allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
         trigger_phrase: ${{ inputs.trigger-phrase }}
         assignee_trigger: ${{ inputs.assignee-trigger }}
         label_trigger: ${{ inputs.label-trigger }}
@@ -494,7 +528,7 @@ runs:
         branch_prefix: ${{ inputs.branch-prefix }}
         show_full_output: ${{ inputs.show-debug-output }}
         claude_args: |
-          --system-prompt "${{ inputs.custom-instructions }}"
+          --append-system-prompt "${{ inputs.custom-instructions }}"
           --model ${{ steps.determine-model.outputs.model }}
           --max-turns ${{ inputs.max-turns }}
           --allowedTools "${{ inputs.allowed-tools }}"
@@ -529,6 +563,7 @@ runs:
       with:
         use_bedrock: "true"
         github_token: ${{ steps.github-token.outputs.token }}
+        allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
         trigger_phrase: ${{ inputs.trigger-phrase }}
         assignee_trigger: ${{ inputs.assignee-trigger }}
         label_trigger: ${{ inputs.label-trigger }}
@@ -541,7 +576,7 @@ runs:
         branch_prefix: ${{ inputs.branch-prefix }}
         show_full_output: ${{ inputs.show-debug-output }}
         claude_args: |
-          --system-prompt "${{ inputs.custom-instructions }}"
+          --append-system-prompt "${{ inputs.custom-instructions }}"
           --model ${{ steps.determine-model.outputs.model }}
           --max-turns ${{ inputs.max-turns }}
           --allowedTools "${{ inputs.allowed-tools }}"

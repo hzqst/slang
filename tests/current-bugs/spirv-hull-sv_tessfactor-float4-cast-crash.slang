@@ -1,4 +1,4 @@
-//TEST:SIMPLE(filecheck=SPIRV):-target spirv-asm -stage hull -entry hullMain -allow-glsl
+//TEST:SIMPLE(filecheck=SPIRV):-target spirv-asm -stage hull -entry hullMain
 
 /*
 Repro for SPIR-V emit crash when using vector types for tessellation-factor builtins.
@@ -11,7 +11,7 @@ Slang currently allows authoring `float4`/`float2` here (and docs show this form
 but SPIR-V legalization introduces a BuiltinCast (vector -> array) which the SPIR-V
 emitter doesn't handle, leading to an internal error like:
 
-(0): error 99999: Slang compilation aborted due to an exception of ...: unimplemented:
+(0): error 99997: Slang compilation aborted due to an exception of ...: unimplemented:
 Unhandled local inst in spirv-emit:
 let  %1 : %2    = BuiltinCast(%3)
 */

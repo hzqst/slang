@@ -173,28 +173,45 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getResultAsFileSystem(
     ComPtr<ISlangBlob> code;
 
     SLANG_RETURN_ON_FAIL(
-        getEntryPointCode(entryPointIndex, targetIndex, diagnostics.writeRef(), code.writeRef()));
+        getEntryPointCode(entryPointIndex, targetIndex, code.writeRef(), diagnostics.writeRef()));
 
     auto linkage = getLinkage();
-
     auto target = linkage->targets[targetIndex];
 
     auto targetProgram = getTargetProgram(target);
 
+    // The entry point result artifact is cached in the `TargetProgram` and shared by every caller
+    // that asks for the same entry point and target, possibly from different threads. We treat it
+    // as read-only here: the diagnostics and the obfuscated source maps that belong in the file
+    // system are added to a private copy, not to the cached artifact. This keeps concurrent
+    // callers from racing on the artifact's association list, and keeps the items reported by
+    // `getEntryPointCompileResult()` independent of whether `getResultAsFileSystem()` was called.
     IArtifact* artifact = targetProgram->getExistingEntryPointResult(entryPointIndex);
 
-    // Add diagnostics id needs be...
+    // Filter the cached artifact into a copy containing the things that can be written.
+    ComPtr<IArtifact> writeArtifact;
+    SLANG_RETURN_ON_FAIL(ArtifactContainerUtil::filter(artifact, writeArtifact));
+    SLANG_ASSERT(writeArtifact);
+
+    // The additions below are filtered in the same way, so that every artifact in the copy holds a
+    // blob and can be written.
+    auto addFilteredAssociated = [&](IArtifact* associated) -> SlangResult
+    {
+        ComPtr<IArtifact> filteredAssociated;
+        SLANG_RETURN_ON_FAIL(ArtifactContainerUtil::filter(associated, filteredAssociated));
+        if (filteredAssociated)
+            writeArtifact->addAssociated(filteredAssociated);
+        return SLANG_OK;
+    };
+
+    // Add diagnostics if needed...
     if (diagnostics && !_findDiagnosticRepresentation(artifact))
     {
-        // Add as an associated
-
         auto diagnosticsArtifact = Artifact::create(
             ArtifactDesc::make(Artifact::Kind::HumanText, ArtifactPayload::Diagnostics));
         diagnosticsArtifact->addRepresentationUnknown(diagnostics);
 
-        artifact->addAssociated(diagnosticsArtifact);
-
-        SLANG_ASSERT(diagnosticsArtifact == _findDiagnosticRepresentation(artifact));
+        SLANG_RETURN_ON_FAIL(addFilteredAssociated(diagnosticsArtifact));
     }
 
     // Add obfuscated source maps
@@ -219,8 +236,8 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getResultAsFileSystem(
 
                 sourceMapArtifact->addRepresentation(obfuscatedSourceMap);
 
-                // associate with the artifact
-                artifact->addAssociated(sourceMapArtifact);
+                // associate with the copy
+                SLANG_RETURN_ON_FAIL(addFilteredAssociated(sourceMapArtifact));
             }
         }
     }
@@ -228,13 +245,30 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getResultAsFileSystem(
     // Turn into a file system and return
     ComPtr<ISlangMutableFileSystem> fileSystem(new MemoryFileSystem);
 
-    // Filter the containerArtifact into things that can be written
-    ComPtr<IArtifact> writeArtifact;
-    SLANG_RETURN_ON_FAIL(ArtifactContainerUtil::filter(artifact, writeArtifact));
     SLANG_RETURN_ON_FAIL(ArtifactContainerUtil::writeContainer(writeArtifact, "", fileSystem));
 
     *outFileSystem = fileSystem.detach();
 
+    return SLANG_OK;
+}
+
+// Diagnose an out-of-range `entryPointIndex` into `sink` and return `SLANG_E_INVALID_ARG`, or
+// `SLANG_OK` when it is in range. The bound is the live `getEntryPointCount()` rather than any
+// cached result-array size, because entry points can be added to a program after a `TargetProgram`
+// (and thus its lazily grown result cache) has been created.
+static SlangResult checkEntryPointIndexInRange(
+    ComponentType* program,
+    SlangInt entryPointIndex,
+    DiagnosticSink* sink)
+{
+    auto entryPointCount = program->getEntryPointCount();
+    if (entryPointIndex < 0 || entryPointIndex >= entryPointCount)
+    {
+        sink->diagnose(Diagnostics::EntryPointIndexOutOfRange{
+            .entryPointIndex = (int64_t)entryPointIndex,
+            .entryPointCount = (int64_t)entryPointCount});
+        return SLANG_E_INVALID_ARG;
+    }
     return SLANG_OK;
 }
 
@@ -255,6 +289,13 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getEntryPointCode(
     applySettingsToDiagnosticSink(&sink, &sink, linkage->m_optionSet);
     applySettingsToDiagnosticSink(&sink, &sink, m_optionSet);
 
+    if (SlangResult res = checkEntryPointIndexInRange(this, entryPointIndex, &sink);
+        SLANG_FAILED(res))
+    {
+        sink.getBlobIfNeeded(outDiagnostics);
+        return res;
+    }
+
     IArtifact* artifact = targetProgram->getOrCreateEntryPointResult(entryPointIndex, &sink);
     sink.getBlobIfNeeded(outDiagnostics);
 
@@ -271,7 +312,7 @@ SLANG_NO_THROW void SLANG_MCALL ComponentType::getEntryPointHash(
 {
     DigestBuilder<SHA1> builder;
 
-    // A note on enums that may be hashed in as part of the following two function calls:
+    // A note on enums that may be hashed in as part of the digest-building calls below:
     //
     // While enums are not guaranteed to be encoded the same way across all versions of
     // the compiler, part of hashing the linkage is hashing in the compiler version.
@@ -280,6 +321,21 @@ SLANG_NO_THROW void SLANG_MCALL ComponentType::getEntryPointHash(
     getLinkage()->buildHash(builder, targetIndex);
 
     buildHash(builder);
+
+    // A component's own option set feeds target code generation (TargetProgram merges it in), so it
+    // belongs in the entry-point cache key -- in particular the link-time downstream arguments that
+    // linkWithOptions records here (e.g. an -Xnvrtc --fmad= flag). For the linked composite that
+    // linkWithOptions produces, nothing above hashes that option set.
+    //
+    // This runs for every component kind. For a plain composite from link() the own set is empty,
+    // so it appends nothing. For a Module the own set is a copy of the session option set without
+    // its DownstreamArgs, which is therefore reached by three distinct hashing paths:
+    // getLinkage()->buildHash above (which also hashes the target option set), buildHash() above
+    // (Module::buildHash -> computeDigest also hashes the module's option set and the session's
+    // DownstreamArgs), and this call. For a specialized component the own set is
+    // the base's, copied via overrideWith. The extra hashing is deterministic and safe -- appending
+    // more bytes can only turn a cache hit into a miss, never a miss into a false hit.
+    getOptionSet().buildHash(builder);
 
     // Add the name and name override for the specified entry point to the hash.
     auto entryPoint = getEntryPoint(entryPointIndex);
@@ -313,6 +369,13 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getEntryPointHostCallable(
     DiagnosticSink sink(linkage->getSourceManager(), Lexer::sourceLocationLexer);
     applySettingsToDiagnosticSink(&sink, &sink, m_optionSet);
 
+    if (SlangResult res = checkEntryPointIndexInRange(this, entryPointIndex, &sink);
+        SLANG_FAILED(res))
+    {
+        sink.getBlobIfNeeded(outDiagnostics);
+        return res;
+    }
+
     IArtifact* artifact = targetProgram->getOrCreateEntryPointResult(entryPointIndex, &sink);
     sink.getBlobIfNeeded(outDiagnostics);
 
@@ -338,6 +401,13 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getEntryPointMetadata(
     DiagnosticSink sink(linkage->getSourceManager(), Lexer::sourceLocationLexer);
     applySettingsToDiagnosticSink(&sink, &sink, linkage->m_optionSet);
     applySettingsToDiagnosticSink(&sink, &sink, m_optionSet);
+
+    if (SlangResult res = checkEntryPointIndexInRange(this, entryPointIndex, &sink);
+        SLANG_FAILED(res))
+    {
+        sink.getBlobIfNeeded(outDiagnostics);
+        return res;
+    }
 
     IArtifact* artifact = targetProgram->getOrCreateEntryPointResult(entryPointIndex, &sink);
     sink.getBlobIfNeeded(outDiagnostics);
@@ -395,6 +465,10 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::specialize(
     slang::IComponentType** outSpecializedComponentType,
     ISlangBlob** outDiagnostics)
 {
+    // Specialization still walks and mutates linkage-owned front-end state, so keep it
+    // serialized with other component-type front-end operations.
+    std::lock_guard<std::recursive_mutex> lock(getLinkage()->getComponentTypeOperationMutex());
+
     SLANG_AST_BUILDER_RAII(getLinkage()->getASTBuilder());
     DiagnosticSink sink(getLinkage()->getSourceManager(), Lexer::sourceLocationLexer);
 
@@ -415,7 +489,10 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::specialize(
                 if (!parsedExpr)
                     return SLANG_FAIL;
 
-                SharedSemanticsContext sharedSemanticsContext(getLinkage(), nullptr, &sink);
+                SharedSemanticsContext sharedSemanticsContext(
+                    getLinkage(),
+                    getLinkage()->m_optionSet.getLanguageVersion(),
+                    &sink);
                 SemanticsVisitor visitor(&sharedSemanticsContext);
                 auto checkedExpr = visitor.CheckTerm(parsedExpr);
                 if (auto typeType = as<TypeType>(checkedExpr->type.type))
@@ -456,6 +533,10 @@ RefPtr<ComponentType> fillRequirements(ComponentType* inComponentType);
 SLANG_NO_THROW SlangResult SLANG_MCALL
 ComponentType::link(slang::IComponentType** outLinkedComponentType, ISlangBlob** outDiagnostics)
 {
+    // Linking mutates the same shared linkage state as specialization/layout and is not yet part
+    // of the parallel backend-only execution model.
+    std::lock_guard<std::recursive_mutex> lock(getLinkage()->getComponentTypeOperationMutex());
+
     // TODO: It should be possible for `fillRequirements` to fail,
     // in cases where we have a dependency that can't be automatically
     // resolved.
@@ -464,7 +545,7 @@ ComponentType::link(slang::IComponentType** outLinkedComponentType, ISlangBlob**
 
     DiagnosticSink sink(getLinkage()->getSourceManager(), Lexer::sourceLocationLexer);
 
-    try
+    SLANG_EXCEPTION_TRY
     {
         auto linked = fillRequirements(this);
         if (!linked)
@@ -473,6 +554,7 @@ ComponentType::link(slang::IComponentType** outLinkedComponentType, ISlangBlob**
         *outLinkedComponentType = ComPtr<slang::IComponentType>(linked).detach();
         return SLANG_OK;
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const AbortCompilationException& e)
     {
         outputExceptionDiagnostic(e, sink, outDiagnostics);
@@ -488,12 +570,13 @@ ComponentType::link(slang::IComponentType** outLinkedComponentType, ISlangBlob**
         outputExceptionDiagnostic(sink, outDiagnostics);
         return SLANG_FAIL;
     }
+#endif
 }
 
 SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::linkWithOptions(
     slang::IComponentType** outLinkedComponentType,
     uint32_t count,
-    slang::CompilerOptionEntry* entries,
+    slang::CompilerOptionEntry const* entries,
     ISlangBlob** outDiagnostics)
 {
     SLANG_RETURN_ON_FAIL(link(outLinkedComponentType, outDiagnostics));
@@ -524,6 +607,13 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getEntryPointCompileResult
     DiagnosticSink sink(linkage->getSourceManager(), Lexer::sourceLocationLexer);
     applySettingsToDiagnosticSink(&sink, &sink, linkage->m_optionSet);
     applySettingsToDiagnosticSink(&sink, &sink, m_optionSet);
+
+    if (SlangResult res = checkEntryPointIndexInRange(this, entryPointIndex, &sink);
+        SLANG_FAILED(res))
+    {
+        sink.getBlobIfNeeded(outDiagnostics);
+        return res;
+    }
 
     IArtifact* artifact = targetProgram->getOrCreateEntryPointResult(entryPointIndex, &sink);
     sink.getBlobIfNeeded(outDiagnostics);
@@ -680,11 +770,15 @@ IArtifact* ComponentType::getTargetArtifact(Int targetIndex, slang::IBlob** outD
     if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
         return nullptr;
     ComPtr<IArtifact> artifact;
-    if (m_targetArtifacts.tryGetValue(targetIndex, artifact))
     {
-        return artifact.get();
+        // Parallel backend requests can race this lookup, so guard the shared artifact cache.
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        if (m_targetArtifacts.tryGetValue(targetIndex, artifact))
+        {
+            return artifact.get();
+        }
     }
-    try
+    SLANG_EXCEPTION_TRY
     {
         // If the user hasn't specified any entry points, then we should
         // discover all entrypoints that are defined in linked modules, and
@@ -719,6 +813,12 @@ IArtifact* ComponentType::getTargetArtifact(Int targetIndex, slang::IBlob** outD
                                           ->getTargetArtifact(targetIndex, outDiagnostics);
                 if (targetArtifact)
                 {
+                    // Another thread may have published the artifact while we were doing the
+                    // link above, so only commit the first cache entry.
+                    std::lock_guard<std::mutex> lock(m_cacheMutex);
+                    ComPtr<IArtifact> existingArtifact;
+                    if (m_targetArtifacts.tryGetValue(targetIndex, existingArtifact))
+                        return existingArtifact.get();
                     m_targetArtifacts[targetIndex] = targetArtifact;
                 }
                 return targetArtifact;
@@ -734,9 +834,18 @@ IArtifact* ComponentType::getTargetArtifact(Int targetIndex, slang::IBlob** outD
 
         IArtifact* targetArtifact = targetProgram->getOrCreateWholeProgramResult(&sink);
         sink.getBlobIfNeeded(outDiagnostics);
-        m_targetArtifacts[targetIndex] = ComPtr<IArtifact>(targetArtifact);
-        return targetArtifact;
+        artifact = ComPtr<IArtifact>(targetArtifact);
+        {
+            // Publish the whole-program artifact only once and avoid racing the cache map.
+            std::lock_guard<std::mutex> lock(m_cacheMutex);
+            ComPtr<IArtifact> existingArtifact;
+            if (m_targetArtifacts.tryGetValue(targetIndex, existingArtifact))
+                return existingArtifact.get();
+            m_targetArtifacts[targetIndex] = artifact;
+        }
+        return artifact.get();
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const Exception& e)
     {
         if (outDiagnostics && !*outDiagnostics)
@@ -751,6 +860,7 @@ IArtifact* ComponentType::getTargetArtifact(Int targetIndex, slang::IBlob** outD
         }
         return nullptr;
     }
+#endif
 }
 
 SLANG_NO_THROW SlangResult SLANG_MCALL
@@ -816,7 +926,10 @@ Type* ComponentType::getTypeFromString(String const& typeStr, DiagnosticSink* si
     SLANG_AST_BUILDER_RAII(linkage->getASTBuilder());
 
     Expr* typeExpr = linkage->parseTermString(typeStr, scope);
-    SharedSemanticsContext sharedSemanticsContext(linkage, nullptr, sink);
+    SharedSemanticsContext sharedSemanticsContext(
+        linkage,
+        linkage->m_optionSet.getLanguageVersion(),
+        sink);
     SemanticsVisitor visitor(&sharedSemanticsContext);
     type = visitor.TranslateTypeNode(typeExpr);
     auto typeOut = visitor.tryCoerceToProperType(TypeExp(type));
@@ -833,7 +946,8 @@ Type* ComponentType::getTypeFromString(String const& typeStr, DiagnosticSink* si
 Expr* ComponentType::tryResolveOverloadedExpr(Expr* exprIn)
 {
     auto linkage = getLinkage();
-    SemanticsContext context(linkage->getSemanticsForReflection());
+    auto sharedSemanticsContext = linkage->getSemanticsForReflection();
+    SemanticsContext context(sharedSemanticsContext);
     SemanticsVisitor visitor(context);
     return visitor.maybeResolveOverloadedExpr(exprIn, LookupMask::Function, nullptr);
 }
@@ -937,7 +1051,8 @@ Expr* ComponentType::findDeclFromString(String const& name, DiagnosticSink* sink
 
     Expr* expr = linkage->parseTermString(name, scope);
 
-    SemanticsContext context(linkage->getSemanticsForReflection());
+    auto sharedSemanticsContext = linkage->getSemanticsForReflection();
+    SemanticsContext context(sharedSemanticsContext);
     context = context.allowStaticReferenceToNonStaticMember().withSink(sink);
 
     SemanticsVisitor visitor(context);
@@ -1007,7 +1122,8 @@ Expr* ComponentType::findDeclFromStringInType(
     {
         expr = linkage->parseTermString(name, scope);
     }
-    SemanticsContext context(linkage->getSemanticsForReflection());
+    auto sharedSemanticsContext = linkage->getSemanticsForReflection();
+    SemanticsContext context(sharedSemanticsContext);
     context = context.allowStaticReferenceToNonStaticMember().withSink(sink);
 
     SemanticsVisitor visitor(context);
@@ -1085,7 +1201,8 @@ Expr* ComponentType::findDeclFromStringInType(
 
 bool ComponentType::isSubType(Type* subType, Type* superType)
 {
-    SemanticsContext context(getLinkage()->getSemanticsForReflection());
+    auto sharedSemanticsContext = getLinkage()->getSemanticsForReflection();
+    SemanticsContext context(sharedSemanticsContext);
     SemanticsVisitor visitor(context);
 
     return (visitor.isSubtype(subType, superType, IsSubTypeOptions::None) != nullptr);
@@ -1164,10 +1281,26 @@ ConstantIntVal* ComponentType::tryFoldIntVal(IntVal* intVal)
 TargetProgram* ComponentType::getTargetProgram(TargetRequest* target)
 {
     RefPtr<TargetProgram> targetProgram;
-    if (!m_targetPrograms.tryGetValue(target, targetProgram))
     {
-        targetProgram = new TargetProgram(this, target);
-        m_targetPrograms[target] = targetProgram;
+        // Multiple entry-point compile threads can race creation of the per-target wrapper.
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        if (m_targetPrograms.tryGetValue(target, targetProgram))
+            return targetProgram;
+    }
+
+    // Constructing a TargetProgram can cascade into shared front-end work, so serialize it with
+    // other component-type operations.
+    std::lock_guard<std::recursive_mutex> operationLock(
+        getLinkage()->getComponentTypeOperationMutex());
+
+    {
+        // Re-check under the cache lock so only one TargetProgram is published per target.
+        std::lock_guard<std::mutex> lock(m_cacheMutex);
+        if (!m_targetPrograms.tryGetValue(target, targetProgram))
+        {
+            targetProgram = new TargetProgram(this, target);
+            m_targetPrograms[target] = targetProgram;
+        }
     }
     return targetProgram;
 }

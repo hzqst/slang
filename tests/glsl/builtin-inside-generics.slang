@@ -1,8 +1,10 @@
-//TEST:SIMPLE(filecheck=CHECK_SPIRV): -entry main -stage compute -target spirv -allow-glsl
-//TEST:SIMPLE(filecheck=CHECK_GLSL): -entry main -stage compute -target glsl -allow-glsl
-//TEST:SIMPLE(filecheck=CHECK_HLSL): -entry main -stage compute -target hlsl -allow-glsl
-//TEST:SIMPLE(filecheck=CHECK_METAL): -entry main -stage compute -target metal -allow-glsl
-//TEST:SIMPLE(filecheck=CHECK_WGSL): -entry main -stage compute -target wgsl -allow-glsl
+//TEST:SIMPLE(filecheck=CHECK_SPIRV): -entry main -stage compute -target spirv
+//TEST:SIMPLE(filecheck=CHECK_GLSL): -entry main -stage compute -target glsl
+//TEST:SIMPLE(filecheck=CHECK_HLSL): -entry main -stage compute -target hlsl
+//TEST:SIMPLE(filecheck=CHECK_METAL): -entry main -stage compute -target metal
+//TEST:SIMPLE(filecheck=CHECK_WGSL): -entry main -stage compute -target wgsl
+
+import glsl;
 
 RWStructuredBuffer<uint> outputBuffer;
 
@@ -16,20 +18,20 @@ T getWaveLaneIndex<T: IInteger>(T value)
     return T(WaveGetLaneIndex()) + value;
 }
 
-// CHECK_SPIRV: GlobalInvocationId
-// CHECK_SPIRV: SubgroupLocalInvocationId
+// CHECK_SPIRV-DAG: GlobalInvocationId
+// CHECK_SPIRV-DAG: SubgroupLocalInvocationId
 
-// CHECK_GLSL: gl_GlobalInvocationID
-// CHECK_GLSL: gl_SubgroupInvocationID
+// CHECK_GLSL-DAG: gl_GlobalInvocationID
+// CHECK_GLSL-DAG: gl_SubgroupInvocationID
 
-// CHECK_HLSL: WaveGetLaneIndex()
-// CHECK_HLSL: SV_DispatchThreadID
+// CHECK_HLSL-DAG: WaveGetLaneIndex()
+// CHECK_HLSL-DAG: SV_DispatchThreadID
 
-// CHECK_METAL: thread_position_in_grid
-// CHECK_METAL: thread_index_in_simdgroup
+// CHECK_METAL-DAG: thread_position_in_grid
+// CHECK_METAL-DAG: thread_index_in_simdgroup
 
-// CHECK_WGSL: global_invocation_id
-// CHECK_WGSL: subgroup_invocation_id
+// CHECK_WGSL-DAG: global_invocation_id
+// CHECK_WGSL-DAG: subgroup_invocation_id
 
 [shader("compute")]
 void main()

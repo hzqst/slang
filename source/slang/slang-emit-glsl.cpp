@@ -1,18 +1,17 @@
 // slang-emit-glsl.cpp
 #include "slang-emit-glsl.h"
 
-#include "../core/slang-writer.h"
+#include "core/slang-writer.h"
 #include "slang-emit-source-writer.h"
 #include "slang-ir-call-graph.h"
+#include "slang-ir-check-push-constant-blocks.h"
 #include "slang-ir-entry-point-decorations.h"
 #include "slang-ir-layout.h"
 #include "slang-ir-util.h"
 #include "slang-legalize-types.h"
-#include "slang-mangled-lexer.h"
 #include "slang-rich-diagnostics.h"
 #include "slang/slang-ir.h"
 
-#include <assert.h>
 
 namespace Slang
 {
@@ -70,12 +69,20 @@ void GLSLSourceEmitter::_beforeComputeEmitProcessInstruction(
             SLANG_ASSERT(requireComputeDerivative);
             SLANG_ASSERT(m_entryPointStage == Stage::Compute);
 
-            // Compute derivatives are quad by default, add the decoration if entry point
-            // does not not explicit linear decoration.
-            bool isQuad = !entryPoint->findDecoration<IRDerivativeGroupLinearDecoration>();
-            if (isQuad)
+            // Grouping may be explicit or already inferred for an earlier derivative operation.
+            if (!entryPoint->findDecoration<IRDerivativeGroupDecoration>())
             {
-                builder.addDecoration(entryPoint, kIROp_DerivativeGroupQuadDecoration);
+                switch (inferDerivativeGroupMode(entryPoint))
+                {
+                case DerivativeGroupMode::Quad:
+                    builder.addDecoration(entryPoint, kIROp_DerivativeGroupQuadDecoration);
+                    break;
+                case DerivativeGroupMode::Linear:
+                    builder.addDecoration(entryPoint, kIROp_DerivativeGroupLinearDecoration);
+                    break;
+                default:
+                    SLANG_UNEXPECTED("unexpected derivative-group mode");
+                }
             }
         }
     }
@@ -84,6 +91,24 @@ void GLSLSourceEmitter::_beforeComputeEmitProcessInstruction(
 void GLSLSourceEmitter::beforeComputeEmitActions(IRModule* module)
 {
     buildEntryPointReferenceGraph(this->m_referencingEntryPoints, module);
+
+    // glslang rejects a stage that declares more than one `layout(push_constant)` block. We report
+    // the case where an entry point's own call tree uses more than one block. A block read only by
+    // an exported function that the entry point does not call is still declared, and this check
+    // does not count it.
+    checkForMultiplePushConstantBlocksPerEntryPoint(
+        module,
+        m_referencingEntryPoints,
+        isPushConstantBlockByLayout,
+        getSink());
+
+    Index pushConstantBlockCount = 0;
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        if (as<IRGlobalParam>(globalInst) && isPushConstantBlockByLayout(globalInst))
+            pushConstantBlockCount++;
+    }
+    m_hasMultiplePushConstantBlocks = pushConstantBlockCount > 1;
 
     IRBuilder builder(module);
     for (auto globalInst : module->getGlobalInsts())
@@ -1062,6 +1087,11 @@ void GLSLSourceEmitter::_emitGLSLTextureOrTextureSamplerType(
     if (type->isArray())
     {
         m_writer->emit("Array");
+        if (type->GetBaseShape() == SLANG_TEXTURE_CUBE)
+        {
+            // samplerCubeArray requires GL_ARB_texture_cube_map_array on GLSL < 4.00
+            _requireGLSLExtension(UnownedStringSlice::fromLiteral("GL_ARB_texture_cube_map_array"));
+        }
     }
 
     // Note: we're adding 'Shadow' only for combined texture/sampler types. Plain texture
@@ -1435,9 +1465,16 @@ void GLSLSourceEmitter::emitSimpleValueImpl(IRInst* inst)
                     switch (type->getOp())
                     {
                     case kIROp_HalfType:
+                        // The `HF` literal suffix is gated behind
+                        // GL_EXT_shader_explicit_arithmetic_types, so register the requirement
+                        // here just as the integer-literal cases above do for their suffixes.
+                        _requireBaseType(BaseType::Half);
                         m_writer->emit("HF");
                         break;
                     case kIROp_DoubleType:
+                        // No `_requireBaseType` here: double is gated by GLSL `#version`, not by an
+                        // extension, and `ShaderExtensionTracker` has no `BaseType::Double`
+                        // mapping, so registering it would be a no-op.
                         m_writer->emit("LF");
                         break;
                     default:
@@ -1462,6 +1499,13 @@ void GLSLSourceEmitter::emitParameterGroupImpl(
     IRGlobalParam* varDecl,
     IRUniformParameterGroupType* type)
 {
+    // glslang allows one `layout(push_constant)` block per stage and counts every block we
+    // declare, including one that nothing reads. `-preserve-params` keeps such unused blocks, so
+    // a module with one used block and one unused block would be rejected. We therefore omit a
+    // push-constant block with no uses when the module has more than one push-constant block.
+    if (m_hasMultiplePushConstantBlocks && isPushConstantBlockByLayout(varDecl) &&
+        !varDecl->hasUses())
+        return;
     _emitGLSLParameterGroup(varDecl, type);
 }
 
@@ -1584,9 +1628,9 @@ void GLSLSourceEmitter::emitEntryPointAttributesImpl(
                 m_writer->emit(") in;\n");
             }
 
-            // These decorations were moved from the parameters to the entry point by
-            // ir-glsl-legalize. The actual parameters have become potentially multiple global
-            // parameters.
+            // The input primitive topology is available on the entry-point function by emit time;
+            // the emitter reads it there because the input parameter may have been split into
+            // multiple globals or erased entirely (e.g. an empty input struct).
             if (auto decor = as<IRGeometryInputPrimitiveTypeDecoration>(decoration))
             {
                 switch (decor->getOp())
@@ -1638,6 +1682,37 @@ void GLSLSourceEmitter::emitEntryPointAttributesImpl(
             {
                 // https://www.khronos.org/opengl/wiki/Early_Fragment_Test
                 m_writer->emit("layout(early_fragment_tests) in;\n");
+            }
+            else if (as<IRPostDepthCoverageDecoration>(decoration))
+            {
+                // GL_ARB_post_depth_coverage: `layout(post_depth_coverage) in;` makes
+                // gl_SampleMaskIn report only samples that survived the early depth/stencil
+                // test. The extension implicitly enables early_fragment_tests, so it is not
+                // redeclared here. If the entry point also has `[earlydepthstencil]`, the
+                // separate decoration branch additionally emits `layout(early_fragment_tests)
+                // in;`; declaring both qualifiers is valid (the ARB-implied one made explicit).
+                _requireGLSLExtension(
+                    UnownedStringSlice::fromLiteral("GL_ARB_post_depth_coverage"));
+                m_writer->emit("layout(post_depth_coverage) in;\n");
+            }
+            else if (as<IRGLSLFragDepthGreaterDecoration>(decoration))
+            {
+                // Redeclare the `gl_FragDepth` builtin with the conservative-depth
+                // layout qualifier so glslang emits the DepthGreater execution mode
+                // (HLSL SV_DepthGreaterEqual). Requires GL_ARB_conservative_depth
+                // (core since GLSL 4.20). An entry point carries at most one directional
+                // depth qualifier: a param has exactly one of SV_DepthGreaterEqual /
+                // SV_DepthLessEqual, and the producer deduplicates the decoration, so the
+                // two branches here are mutually exclusive (emitting both would redeclare
+                // `gl_FragDepth` twice — invalid GLSL).
+                _requireGLSLExtension(UnownedStringSlice("GL_ARB_conservative_depth"));
+                m_writer->emit("layout(depth_greater) out float gl_FragDepth;\n");
+            }
+            else if (as<IRGLSLFragDepthLessDecoration>(decoration))
+            {
+                // As above, for SV_DepthLessEqual -> DepthLess.
+                _requireGLSLExtension(UnownedStringSlice("GL_ARB_conservative_depth"));
+                m_writer->emit("layout(depth_less) out float gl_FragDepth;\n");
             }
             else if (as<IRRequireFullQuadsDecoration>(decoration))
             {
@@ -2406,6 +2481,20 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
                     break;
                 }
                 break;
+            case BaseType::Double:
+                switch (fromType)
+                {
+                case BaseType::UInt64:
+                    m_writer->emit("uint64BitsToDouble");
+                    break;
+                case BaseType::Int64:
+                    m_writer->emit("int64BitsToDouble");
+                    break;
+                default:
+                    emitType(inst->getDataType());
+                    break;
+                }
+                break;
             case BaseType::Bool:
                 m_writer->emit("bool");
                 break;
@@ -2424,7 +2513,7 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
     case kIROp_Not:
         {
             IRInst* operand = inst->getOperand(0);
-            if (const auto vectorType = as<IRVectorType>(operand->getDataType()))
+            if (const auto vectorType = as<IRVectorType>(operand->getDataType()); vectorType)
             {
                 EmitOpInfo outerPrec = inOuterPrec;
                 bool needClose = false;
@@ -2559,24 +2648,28 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
             IRInst* left = inst->getOperand(0);
             IRInst* right = inst->getOperand(1);
 
-            // Handle as a function call
-            auto prec = getInfo(EmitOp::Postfix);
+            // GLSL has no built-in floating-point remainder. Its `mod()` is a
+            // floor-modulus (`x - y*floor(x/y)`, whose sign follows the divisor),
+            // whereas `FRem` is a truncated remainder (whose sign follows the
+            // dividend). They disagree for operands of opposite sign, e.g.
+            // `-7.0 % 3.0` is `-1.0` but `mod(-7.0, 3.0)` is `2.0`. Recover the
+            // remainder as `sign(x) * mod(abs(x), abs(y))`: `mod` on the
+            // magnitudes gives the correct magnitude, and multiplying by
+            // `sign(x)` restores the dividend's sign. Unlike the ternary form the
+            // core module uses for the scalar `fmod` intrinsic, this is
+            // branchless and component-wise, so it is also valid for vector
+            // operands (`float3 % float3`), where a `?:` on a boolean vector
+            // would not be. The operands are emitted at general precedence
+            // because each use is wrapped in a `sign(...)`/`abs(...)` call.
+            auto argPrec = getInfo(EmitOp::General);
 
-            EmitOpInfo outerPrec = inOuterPrec;
-            bool needClose = maybeEmitParens(outerPrec, prec);
-
-            // TODO: the GLSL `mod` function amounts to a floating-point
-            // modulus rather than a floating-point remainder. We need
-            // to fix this to emit the right SPIR-V opcode, but there is
-            // no built-in GLSL function that maps to the opcode we want.
-            //
-            m_writer->emit("mod(");
-            emitOperand(left, getInfo(EmitOp::General));
-            m_writer->emit(",");
-            emitOperand(right, getInfo(EmitOp::General));
-            m_writer->emit(")");
-
-            maybeCloseParens(needClose);
+            m_writer->emit("(sign(");
+            emitOperand(left, argPrec);
+            m_writer->emit(") * mod(abs(");
+            emitOperand(left, argPrec);
+            m_writer->emit("), abs(");
+            emitOperand(right, argPrec);
+            m_writer->emit(")))");
 
             return true;
         }
@@ -2607,6 +2700,19 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
                 m_writer->emit("0");
             }
             m_writer->emit(getIntVal(location));
+            return true;
+        }
+    case kIROp_SubpassLoad:
+        {
+            auto subpassLoad = as<IRSubpassLoad>(inst);
+            m_writer->emit("subpassLoad(");
+            emitOperand(subpassLoad->getSubpassInput(), getInfo(EmitOp::General));
+            if (auto sample = subpassLoad->getSample())
+            {
+                m_writer->emit(", ");
+                emitOperand(sample, getInfo(EmitOp::General));
+            }
+            m_writer->emit(")");
             return true;
         }
     case kIROp_ImageLoad:
@@ -2722,18 +2828,65 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
             m_glslExtensionTracker->requireExtension(toSlice("GL_EXT_debug_printf"));
             m_writer->emit("debugPrintfEXT(");
             emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
-            if (inst->getOperandCount() == 2)
+            if (inst->getOperandCount() > 1)
             {
-                auto operand = inst->getOperand(1);
-                if (auto makeStruct = as<IRMakeStruct>(operand))
+                List<IRInst*> args;
+                collectFlattenedVariadicOperands(inst, 1, args);
+                for (auto arg : args)
                 {
-                    // Flatten the tuple resulting from the variadic pack.
-                    for (UInt bb = 0; bb < makeStruct->getOperandCount(); ++bb)
-                    {
-                        m_writer->emit(", ");
-                        emitOperand(makeStruct->getOperand(bb), getInfo(EmitOp::General));
-                    }
+                    m_writer->emit(", ");
+                    emitOperand(arg, getInfo(EmitOp::General));
                 }
+            }
+            m_writer->emit(")");
+            return true;
+        }
+    case kIROp_Abort:
+        {
+            // abortEXT() requires a literal format string. GLSL emission does
+            // not run the SPIR-V processAbort path, so keep this user-facing
+            // diagnostic here for GLSL targets.
+            if (!as<IRStringLit>(inst->getOperand(0)))
+            {
+                getSink()->diagnose(
+                    Diagnostics::AbortFormatMustBeStringLiteral{.location = inst->sourceLoc});
+                return true;
+            }
+            m_glslExtensionTracker->requireExtension(toSlice("GL_EXT_shader_abort"));
+
+            List<IRInst*> args;
+            collectFlattenedVariadicOperands(inst, 1, args);
+
+            m_writer->emit("abortEXT(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            for (auto arg : args)
+            {
+                m_writer->emit(", ");
+
+                IRVectorType* vectorType = as<IRVectorType>(arg->getDataType());
+                auto elementType = vectorType ? vectorType->getElementType() : arg->getDataType();
+                SLANG_RELEASE_ASSERT(as<IRBasicType>(elementType));
+
+                if (as<IRBoolType>(elementType))
+                {
+                    if (vectorType)
+                    {
+                        m_writer->emit("uvec");
+                        emitSimpleValue(vectorType->getElementCount());
+                        m_writer->emit("(");
+                        emitOperand(arg, getInfo(EmitOp::General));
+                        m_writer->emit(")");
+                    }
+                    else
+                    {
+                        m_writer->emit("uint(");
+                        emitOperand(arg, getInfo(EmitOp::General));
+                        m_writer->emit(")");
+                    }
+                    continue;
+                }
+
+                emitOperand(arg, getInfo(EmitOp::General));
             }
             m_writer->emit(")");
             return true;
@@ -2763,6 +2916,100 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
             m_writer->emit(")");
 
             maybeCloseParens(needClose);
+            return true;
+        }
+    case kIROp_MakeArray:
+    case kIROp_MakeArrayFromElement:
+        {
+            // Emit an array value using GLSL array-constructor syntax
+            // `elementType[]( e0, e1, ... )` rather than the base emitter's C-style
+            // `{ ... }`. Brace/aggregate initializers are only valid in GLSL 4.20+
+            // (GL_ARB_shading_language_420pack), so they break on earlier profiles such
+            // as glsl_330; the constructor form is the portable spelling that is valid
+            // across GLSL versions. Mirrors the WGSL emitter, which overrides the same
+            // ops for the same reason.
+            //
+            // GLSL splits array brackets around the (here absent) declarator, so a
+            // nested array writes its outermost dimension unsized and inner dimensions
+            // sized: `ivec2[]` for `ivec2[2]`, `int[][3]` for `int[2][3]`. The C-like
+            // base emitter spells array types via its declarator machinery, but a
+            // constructor prefix has no declarator name to thread through it, so the
+            // bracket sequence is emitted directly here.
+            //
+            // The outermost dimension is left unsized, so the emitted array length is
+            // fixed entirely by the number of constructor arguments below. That is
+            // correct because a MakeArray carries exactly one operand per declared
+            // element (array-literal lowering pads any missing trailing elements with
+            // the default value before building the inst); a short operand list would
+            // otherwise emit an array of the wrong length.
+            auto arrayType = cast<IRArrayType>(inst->getDataType());
+
+            IRType* elementType = arrayType->getElementType();
+            List<IRInst*> innerDimSizes;
+            while (auto innerArrayType = as<IRArrayType>(elementType))
+            {
+                innerDimSizes.add(innerArrayType->getElementCount());
+                elementType = innerArrayType->getElementType();
+            }
+
+            emitType(elementType);
+            m_writer->emit("[]");
+            for (auto innerDimSize : innerDimSizes)
+            {
+                m_writer->emit("[");
+                emitVal(innerDimSize, getInfo(EmitOp::General));
+                m_writer->emit("]");
+            }
+
+            m_writer->emit("(");
+            if (inst->getOp() == kIROp_MakeArrayFromElement)
+            {
+                // A single element value is broadcast across the outermost dimension.
+                UInt argCount = (UInt)cast<IRIntLit>(arrayType->getElementCount())->getValue();
+                for (UInt aa = 0; aa < argCount; ++aa)
+                {
+                    if (aa != 0)
+                        m_writer->emit(", ");
+                    emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+                }
+            }
+            else
+            {
+                UInt argCount = inst->getOperandCount();
+                for (UInt aa = 0; aa < argCount; ++aa)
+                {
+                    if (aa != 0)
+                        m_writer->emit(", ");
+                    emitOperand(inst->getOperand(aa), getInfo(EmitOp::General));
+                }
+            }
+            m_writer->emit(")");
+
+            return true;
+        }
+    case kIROp_MakeStruct:
+        {
+            // Emit a struct value with GLSL's struct-constructor syntax
+            // `StructType( f0, f1, ... )` instead of the base emitter's C-style
+            // `{ ... }`. Aggregate/brace initializers are only valid in GLSL 4.20+
+            // (GL_ARB_shading_language_420pack) and break on earlier profiles such as
+            // glsl_330, whereas struct constructors are portable (core since GLSL 1.10).
+            //
+            // This is a separate case from the array case above rather than folded into
+            // it: an array uses GLSL's bracket-split spelling `elementType[]( ... )`,
+            // which is invalid for a struct. A MakeStruct carries one operand per field
+            // in declaration order, matching GLSL constructor argument order.
+            emitType(inst->getDataType());
+            m_writer->emit("(");
+            UInt argCount = inst->getOperandCount();
+            for (UInt aa = 0; aa < argCount; ++aa)
+            {
+                if (aa != 0)
+                    m_writer->emit(", ");
+                emitOperand(inst->getOperand(aa), getInfo(EmitOp::General));
+            }
+            m_writer->emit(")");
+
             return true;
         }
     default:
@@ -3476,14 +3723,9 @@ void GLSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
             {
                 m_writer->emit("hitObjectNV");
             }
-            else if (targetCaps.implies(CapabilityAtom::_GL_EXT_shader_invocation_reorder))
+            else // if (targetCaps.implies(CapabilityAtom::_GL_EXT_shader_invocation_reorder))
             {
                 m_writer->emit("hitObjectEXT");
-            }
-            else
-            {
-                SLANG_UNEXPECTED(
-                    "HitObjectType requires GL_EXT or GL_NV shader_invocation_reorder capability");
             }
             return;
         }
@@ -3548,7 +3790,8 @@ void GLSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
         _emitGLSLSubpassInputType(subpassType);
         return;
     }
-    else if (const auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(type))
+    else if (const auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(type);
+             structuredBufferType)
     {
         // TODO: We desugar global variables with structured-buffer type into GLSL
         // `buffer` declarations, but we don't currently handle structured-buffer types
@@ -3780,6 +4023,15 @@ void GLSLSourceEmitter::emitVarDecorationsImpl(IRInst* varDecl)
         {
             _requireGLSLExtension(toSlice("GL_EXT_fragment_shader_barycentric"));
             prefix = toSlice("pervertex");
+        }
+        else if (as<IRGLSLPatchDecoration>(decoration))
+        {
+            prefix = toSlice("patch");
+            // `patch` is a core GLSL keyword, no need for suffix like EXT
+            postfix = toSlice("");
+            // Unlike the payload branches below, no `layout(location = ...)` here: a patch
+            // variable is an ordinary varying, so its location comes from the normal varying
+            // layout path (`emitLayoutQualifiersImpl`), and emitting one here would duplicate it.
         }
         else
         {

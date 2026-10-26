@@ -2,10 +2,10 @@
 
 #define _CRT_SECURE_NO_WARNINGS 1
 
-#include "../../source/core/slang-test-tool-util.h"
-#include "../source/core/slang-io.h"
-#include "../source/core/slang-std-writers.h"
-#include "../source/core/slang-string-util.h"
+#include "core/slang-io.h"
+#include "core/slang-std-writers.h"
+#include "core/slang-string-util.h"
+#include "core/slang-test-tool-util.h"
 #include "core/slang-token-reader.h"
 #include "options.h"
 #include "png-serialize-util.h"
@@ -18,6 +18,9 @@
 #if defined(_WIN32)
 #include <d3d12.h>
 #include <windows.h>
+#endif
+
+#if defined(_MSC_VER)
 #pragma comment(lib, "advapi32")
 #endif
 
@@ -190,6 +193,25 @@ static void _outputProfileTime(uint64_t startTicks, uint64_t endTicks)
     out.print("profile-time=%g\n", time);
 }
 
+static rhi::Feature _getFeatureFromName(const UnownedStringSlice& featureName)
+{
+    struct FeatureNameMapEntry
+    {
+        const char* name;
+        rhi::Feature feature;
+    };
+
+#define SLANG_RHI_FEATURES_X(id, name) {name, rhi::Feature::id},
+    static const FeatureNameMapEntry kFeatureNameMap[] = {SLANG_RHI_FEATURES(SLANG_RHI_FEATURES_X)};
+#undef SLANG_RHI_FEATURES_X
+
+    for (auto& entry : kFeatureNameMap)
+        if (featureName == UnownedStringSlice(entry.name))
+            return entry.feature;
+
+    return rhi::Feature::_Count;
+}
+
 class ProgramVars;
 
 struct ShaderOutputPlan
@@ -279,6 +301,7 @@ struct AssignValsFromLayoutContext
     ShaderOutputPlan& outputPlan;
     TestResourceContext& resourceContext;
     IAccelerationStructure* accelerationStructure;
+    Dictionary<String, ComPtr<IBuffer>> namedBuffers;
 
     AssignValsFromLayoutContext(
         IDevice* device,
@@ -313,6 +336,14 @@ struct AssignValsFromLayoutContext
 
     SlangResult assignData(ShaderCursor const& dstCursor, ShaderInputLayout::DataVal* srcVal)
     {
+        if (srcVal->addressRefs.getCount() > 0)
+        {
+            StdWriters::getError().print(
+                "error: data=[bufferName] address references are only supported in buffer"
+                " (ubuffer) inputs, not uniform data\n");
+            return SLANG_FAIL;
+        }
+
         const size_t bufferSize = srcVal->bufferData.getCount() * sizeof(uint32_t);
 
         ShaderCursor dataCursor = dstCursor;
@@ -405,15 +436,70 @@ struct AssignValsFromLayoutContext
         }
     }
 
-    SlangResult assignBuffer(ShaderCursor const& dstCursor, ShaderInputLayout::BufferVal* srcVal)
+    SlangResult assignBuffer(
+        ShaderCursor const& dstCursor,
+        ShaderInputLayout::BufferVal* srcVal,
+        String const& fieldName = String())
     {
         const InputBufferDesc& srcBuffer = srcVal->bufferDesc;
         auto& bufferData = srcVal->bufferData;
+
+        // Resolve buffer address references: replace placeholders with actual device addresses
+        // of previously created named buffers.
+        if (srcVal->addressRefs.getCount() > 0 && srcBuffer.stride > 0 && srcBuffer.stride < 4)
+        {
+            StdWriters::getError().print(
+                "error: data=[bufferName] requires stride >= 4 (got %d);"
+                " device addresses occupy 8 bytes and would be mangled by sub-word packing\n",
+                srcBuffer.stride);
+            return SLANG_FAIL;
+        }
+        for (auto& ref : srcVal->addressRefs)
+        {
+            ComPtr<IBuffer> refBuffer;
+            if (namedBuffers.tryGetValue(ref.bufferName, refBuffer))
+            {
+                uint64_t addr = refBuffer->getDeviceAddress();
+                bufferData[ref.dataOffset] = (uint32_t)(addr & 0xFFFFFFFF);
+                bufferData[ref.dataOffset + 1] = (uint32_t)(addr >> 32);
+            }
+            else
+            {
+                StdWriters::getError().print(
+                    "error: buffer '%s' referenced in data=[] not found"
+                    " (ensure it is declared before this buffer)\n",
+                    ref.bufferName.begin());
+                return SLANG_FAIL;
+            }
+        }
+
+        // When stride=1 or stride=2, each value in data=[] should occupy only `stride` bytes.
+        // Pack values per uint32, little-endian (first value in LSB).
+        if (srcBuffer.stride == 1 || srcBuffer.stride == 2)
+        {
+            const int strideBits = srcBuffer.stride * 8;
+            const uint32_t mask = (1u << strideBits) - 1u;
+            const int valsPerWord = (int)sizeof(uint32_t) / srcBuffer.stride;
+            List<uint32_t> packed;
+            for (Index i = 0; i < bufferData.getCount(); i += valsPerWord)
+            {
+                uint32_t word = 0;
+                for (int j = 0; j < valsPerWord && (i + j) < bufferData.getCount(); j++)
+                    word |= (bufferData[i + j] & mask) << (j * strideBits);
+                packed.add(word);
+            }
+            bufferData = packed;
+        }
+
         const size_t bufferSize = Math::Max(
             (size_t)bufferData.getCount() * sizeof(uint32_t),
             (size_t)(srcBuffer.elementCount * srcBuffer.stride));
-        bufferData.reserve(bufferSize / sizeof(uint32_t));
-        for (size_t i = bufferData.getCount(); i < bufferSize / sizeof(uint32_t); i++)
+        // Round the backing storage up to a complete word because the RHI copies bufferSize bytes,
+        // including the final partial word.
+        const size_t wordSize = sizeof(uint32_t);
+        const size_t bufferWordCount = bufferSize / wordSize + (bufferSize % wordSize != 0);
+        bufferData.reserve(bufferWordCount);
+        for (size_t i = bufferData.getCount(); i < bufferWordCount; i++)
             bufferData.add(0);
 
         ComPtr<IBuffer> bufferResource;
@@ -427,6 +513,10 @@ struct AssignValsFromLayoutContext
 
         // Keep buffer alive in resource context
         resourceContext.resources.add(ComPtr<IResource>(bufferResource.get()));
+
+        // Register named buffer for cross-referencing by other buffers' data=[]
+        if (fieldName.getLength() > 0)
+            namedBuffers[fieldName] = bufferResource;
 
         // Check for device address/pointer FIRST (before descriptor handles)
         // This ensures plain uint64/pointer types use device addresses, not descriptor handles
@@ -673,7 +763,7 @@ struct AssignValsFromLayoutContext
                         (int)fieldIndex);
                     return SLANG_E_INVALID_ARG;
                 }
-                SLANG_RETURN_ON_FAIL(assign(fieldCursor, field.val));
+                SLANG_RETURN_ON_FAIL(assign(fieldCursor, field.val, field.name));
             }
             else
             {
@@ -685,7 +775,7 @@ struct AssignValsFromLayoutContext
                         field.name.begin());
                     return SLANG_E_INVALID_ARG;
                 }
-                SLANG_RETURN_ON_FAIL(assign(fieldCursor, field.val));
+                SLANG_RETURN_ON_FAIL(assign(fieldCursor, field.val, field.name));
             }
         }
         return SLANG_OK;
@@ -776,11 +866,25 @@ struct AssignValsFromLayoutContext
         ShaderCursor const& dstCursor,
         ShaderInputLayout::AccelerationStructureVal* srcVal)
     {
+        SLANG_UNUSED(srcVal);
+        if (isDescriptorHandleType(dstCursor))
+        {
+            if (!accelerationStructure)
+                return SLANG_E_NOT_AVAILABLE;
+            DescriptorHandle handle;
+            SLANG_RETURN_ON_FAIL(accelerationStructure->getDescriptorHandle(&handle));
+            SLANG_RETURN_ON_FAIL(dstCursor.setDescriptorHandle(handle));
+            return SLANG_OK;
+        }
+
         dstCursor.setBinding(accelerationStructure);
         return SLANG_OK;
     }
 
-    SlangResult assign(ShaderCursor const& dstCursor, ShaderInputLayout::ValPtr const& srcVal)
+    SlangResult assign(
+        ShaderCursor const& dstCursor,
+        ShaderInputLayout::ValPtr const& srcVal,
+        String const& fieldName = String())
     {
         auto& entryCursor = dstCursor;
         switch (srcVal->kind)
@@ -789,7 +893,7 @@ struct AssignValsFromLayoutContext
             return assignData(dstCursor, (ShaderInputLayout::DataVal*)srcVal.Ptr());
 
         case ShaderInputType::Buffer:
-            return assignBuffer(dstCursor, (ShaderInputLayout::BufferVal*)srcVal.Ptr());
+            return assignBuffer(dstCursor, (ShaderInputLayout::BufferVal*)srcVal.Ptr(), fieldName);
 
         case ShaderInputType::CombinedTextureSampler:
             return assignCombinedTextureSampler(
@@ -1071,21 +1175,15 @@ void RenderTestApp::_initializeRenderPass()
 
 void RenderTestApp::_initializeAccelerationStructure()
 {
-    if (!m_device->hasFeature("ray-tracing"))
+    // Inline ray queries need the acceleration structure too. Metal supports them without
+    // ray-tracing pipelines.
+    if (!m_device->hasFeature("ray-tracing") && !m_device->hasFeature("ray-query"))
         return;
     BufferDesc vertexBufferDesc = {};
     vertexBufferDesc.size = kVertexCount * sizeof(Vertex);
     vertexBufferDesc.usage = BufferUsage::AccelerationStructureBuildInput;
     vertexBufferDesc.defaultState = ResourceState::AccelerationStructureBuildInput;
     ComPtr<IBuffer> vertexBuffer = m_device->createBuffer(vertexBufferDesc, &kVertexData[0]);
-
-    BufferDesc transformBufferDesc = {};
-    transformBufferDesc.size = sizeof(float) * 12;
-    transformBufferDesc.usage = BufferUsage::AccelerationStructureBuildInput;
-    transformBufferDesc.defaultState = ResourceState::AccelerationStructureBuildInput;
-    float transformData[12] =
-        {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
-    ComPtr<IBuffer> transformBuffer = m_device->createBuffer(transformBufferDesc, &transformData);
 
     // Build bottom level acceleration structure.
     {
@@ -1096,7 +1194,6 @@ void RenderTestApp::_initializeAccelerationStructure()
         buildInput.triangles.vertexFormat = Format::RGB32Float;
         buildInput.triangles.vertexCount = kVertexCount;
         buildInput.triangles.vertexStride = sizeof(Vertex);
-        buildInput.triangles.preTransformBuffer = transformBuffer;
         buildInput.triangles.flags = AccelerationStructureGeometryFlags::Opaque;
         AccelerationStructureBuildDesc buildDesc = {};
         buildDesc.inputs = &buildInput;
@@ -1113,11 +1210,14 @@ void RenderTestApp::_initializeAccelerationStructure()
         scratchBufferDesc.size = accelerationStructureSizes.scratchSize;
         ComPtr<IBuffer> scratchBuffer = m_device->createBuffer(scratchBufferDesc);
 
+        // Compact the acceleration structure where the device can report its compacted size.
+        // Metal can't, so there the acceleration structure is used as built.
         ComPtr<IQueryPool> compactedSizeQuery;
         QueryPoolDesc queryPoolDesc = {};
         queryPoolDesc.count = 1;
         queryPoolDesc.type = QueryType::AccelerationStructureCompactedSize;
-        m_device->createQueryPool(queryPoolDesc, compactedSizeQuery.writeRef());
+        if (SLANG_FAILED(m_device->createQueryPool(queryPoolDesc, compactedSizeQuery.writeRef())))
+            compactedSizeQuery = nullptr;
 
         // Build acceleration structure.
         ComPtr<IAccelerationStructure> draftAS;
@@ -1125,37 +1225,54 @@ void RenderTestApp::_initializeAccelerationStructure()
         draftDesc.size = accelerationStructureSizes.accelerationStructureSize;
         m_device->createAccelerationStructure(draftDesc, draftAS.writeRef());
 
-        compactedSizeQuery->reset();
+        if (!compactedSizeQuery)
+        {
+            auto encoder = m_queue->createCommandEncoder();
+            encoder->buildAccelerationStructure(
+                buildDesc,
+                draftAS,
+                nullptr,
+                scratchBuffer,
+                0,
+                nullptr);
+            m_queue->submit(encoder->finish());
+            m_queue->waitOnHost();
+            m_bottomLevelAccelerationStructure = draftAS;
+        }
+        else
+        {
+            compactedSizeQuery->reset();
 
-        auto encoder = m_queue->createCommandEncoder();
-        AccelerationStructureQueryDesc compactedSizeQueryDesc = {};
-        compactedSizeQueryDesc.queryPool = compactedSizeQuery;
-        compactedSizeQueryDesc.queryType = QueryType::AccelerationStructureCompactedSize;
-        encoder->buildAccelerationStructure(
-            buildDesc,
-            draftAS,
-            nullptr,
-            scratchBuffer,
-            1,
-            &compactedSizeQueryDesc);
-        m_queue->submit(encoder->finish());
-        m_queue->waitOnHost();
+            auto encoder = m_queue->createCommandEncoder();
+            AccelerationStructureQueryDesc compactedSizeQueryDesc = {};
+            compactedSizeQueryDesc.queryPool = compactedSizeQuery;
+            compactedSizeQueryDesc.queryType = QueryType::AccelerationStructureCompactedSize;
+            encoder->buildAccelerationStructure(
+                buildDesc,
+                draftAS,
+                nullptr,
+                scratchBuffer,
+                1,
+                &compactedSizeQueryDesc);
+            m_queue->submit(encoder->finish());
+            m_queue->waitOnHost();
 
-        uint64_t compactedSize = 0;
-        compactedSizeQuery->getResult(0, 1, &compactedSize);
-        AccelerationStructureDesc finalDesc;
-        finalDesc.size = compactedSize;
-        m_device->createAccelerationStructure(
-            finalDesc,
-            m_bottomLevelAccelerationStructure.writeRef());
+            uint64_t compactedSize = 0;
+            compactedSizeQuery->getResult(0, 1, &compactedSize);
+            AccelerationStructureDesc finalDesc;
+            finalDesc.size = compactedSize;
+            m_device->createAccelerationStructure(
+                finalDesc,
+                m_bottomLevelAccelerationStructure.writeRef());
 
-        encoder = m_queue->createCommandEncoder();
-        encoder->copyAccelerationStructure(
-            m_bottomLevelAccelerationStructure,
-            draftAS,
-            AccelerationStructureCopyMode::Compact);
-        m_queue->submit(encoder->finish());
-        m_queue->waitOnHost();
+            encoder = m_queue->createCommandEncoder();
+            encoder->copyAccelerationStructure(
+                m_bottomLevelAccelerationStructure,
+                draftAS,
+                AccelerationStructureCopyMode::Compact);
+            m_queue->submit(encoder->finish());
+            m_queue->waitOnHost();
+        }
     }
 
     // Build top level acceleration structure.
@@ -1238,6 +1355,8 @@ void RenderTestApp::setProjectionMatrix(IShaderObject* rootObject)
     float kIdentity[16] =
         {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
     auto info = m_device->getInfo();
+    // TODO: PR #7303 (Simon Kallweit) - info is set but never used.
+    SLANG_UNUSED(info);
     ShaderCursor(rootObject)
         .getField("Uniforms")
         .getDereferenced()
@@ -1503,10 +1622,9 @@ static SlangResult _setSessionPrelude(
         session->setLanguagePrelude(SLANG_SOURCE_LANGUAGE_HLSL, buf.getBuffer());
 #endif
     }
-    else
-    {
-        session->setLanguagePrelude(SLANG_SOURCE_LANGUAGE_HLSL, "");
-    }
+    // When no NVAPI slot is requested, leave the session's HLSL prelude untouched (matching
+    // slang-test) rather than blanking it, so render-test emission keeps whatever prelude the
+    // session already has — normally the compiler default an ordinary slangc user gets.
 
     return SLANG_OK;
 }
@@ -1667,9 +1785,6 @@ static SlangResult _innerMain(
         }
     }
 
-    static renderer_test::CoreToRHIDebugBridge debugCallback;
-    debugCallback.setCoreCallback(stdWriters->getDebugCallback());
-
     // Use the profile name set on options if set
     input.profile = options.profileName.getLength() ? options.profileName : input.profile;
 
@@ -1726,13 +1841,87 @@ static SlangResult _innerMain(
         return SLANG_E_NOT_AVAILABLE;
     }
 
+    if (options.compileOnly)
+    {
+        // Use text output targets so downstream compilers are not required.
+        // This exercises Slang's emit code paths without needing DXC, FXC, NVRTC, etc.
+        switch (input.target)
+        {
+        case SLANG_DXBC:
+        case SLANG_DXIL:
+            input.target = SLANG_HLSL;
+            break;
+        case SLANG_METAL_LIB:
+            input.target = SLANG_METAL;
+            break;
+        case SLANG_PTX:
+            input.target = SLANG_CUDA_SOURCE;
+            break;
+        case SLANG_SHADER_HOST_CALLABLE:
+            input.target = SLANG_CPP_SOURCE;
+            break;
+        case SLANG_SPIRV:
+            // When not generating SPIRV directly, remap to GLSL to avoid
+            // needing glslang. This exercises the GLSL emitter rather than
+            // the SPIRV emitter for these tests.
+            if (!options.generateSPIRVDirectly)
+                input.target = SLANG_GLSL;
+            break;
+        default:
+            break;
+        }
+        input.passThrough = SLANG_PASS_THROUGH_NONE;
+
+        ShaderCompilerUtil::OutputAndLayout output;
+        SLANG_RETURN_ON_FAIL(
+            ShaderCompilerUtil::compileWithLayout(session, options, input, output));
+
+        // Force target code generation so the emit pipeline is exercised.
+        // compileWithLayout only links the program; without this call the
+        // backend emit code (slang-emit-hlsl, slang-emit-spirv, etc.) would
+        // never run and would not appear in coverage data.
+        //
+        // This is best-effort: some configurations (incomplete libraries,
+        // certain pipeline types) may fail at code generation even though
+        // compilation succeeded. We still count those as passing since the
+        // compilation itself is the authority.
+        if (output.output.slangProgram)
+        {
+            ComPtr<ISlangBlob> code;
+            ComPtr<ISlangBlob> diagnostics;
+            SlangResult codeGenResult = output.output.slangProgram->getTargetCode(
+                0,
+                code.writeRef(),
+                diagnostics.writeRef());
+            if (SLANG_FAILED(codeGenResult))
+            {
+                if (diagnostics)
+                {
+                    fprintf(
+                        stderr,
+                        "compile-only: code generation failed: %s\n",
+                        (const char*)diagnostics->getBufferPointer());
+                }
+                else
+                {
+                    fprintf(
+                        stderr,
+                        "compile-only: code generation failed (0x%08x)\n",
+                        (unsigned)codeGenResult);
+                }
+            }
+        }
+        return SLANG_OK;
+    }
+
     CachedDeviceWrapper deviceWrapper;
+    // The acquired device's debug bridge; bound to this invocation's callback below (#11856).
+    Slang::RefPtr<renderer_test::CoreToRHIDebugBridge> deviceBridge;
     {
         DeviceDesc desc = {};
         desc.deviceType = options.deviceType;
 
         desc.enableValidation = options.enableDebugLayers;
-        desc.debugCallback = &debugCallback;
 
         desc.slang.lineDirectiveMode = SLANG_LINE_DIRECTIVE_MODE_NONE;
         if (options.generateSPIRVDirectly)
@@ -1740,9 +1929,9 @@ static SlangResult _innerMain(
         else
             desc.slang.targetFlags = 0;
 
-        List<const char*> requiredFeatureList;
+        List<rhi::Feature> requiredFeatureList;
         for (auto& name : options.renderFeatures)
-            requiredFeatureList.add(name.getBuffer());
+            requiredFeatureList.add(_getFeatureFromName(name.getUnownedSlice()));
 
         desc.requiredFeatures = requiredFeatureList.getBuffer();
         desc.requiredFeatureCount = (int)requiredFeatureList.getCount();
@@ -1793,7 +1982,7 @@ static SlangResult _innerMain(
             SlangResult res;
             if (options.cacheRhiDevice)
             {
-                res = DeviceCache::acquireDevice(desc, rhiDevice.writeRef());
+                res = DeviceCache::acquireDevice(desc, rhiDevice.writeRef(), &deviceBridge);
                 if (SLANG_FAILED(res))
                 {
                     rhiDevice = nullptr;
@@ -1801,6 +1990,9 @@ static SlangResult _innerMain(
             }
             else
             {
+                // Not caching: create the device wired to a fresh retained bridge.
+                deviceBridge = renderer_test::createRetainedCoreToRHIDebugBridge();
+                desc.debugCallback = deviceBridge.Ptr();
                 res = rhi::getRHI()->createDevice(desc, rhiDevice.writeRef());
                 if (SLANG_FAILED(res))
                 {
@@ -1845,6 +2037,13 @@ static SlangResult _innerMain(
         }
     }
 
+    // Bind this invocation's callback to the device's bridge for the adapter query and rendering;
+    // clearing on scope exit lets a later cached-device message with no active scope drop (#11785).
+    SLANG_ASSERT(deviceBridge);
+    renderer_test::ScopedCoreDebugCallback scopedDebugCallback(
+        *deviceBridge,
+        stdWriters->getDebugCallback());
+
     // Print adapter info after device creation but before any other operations
     if (options.showAdapterInfo)
     {
@@ -1863,9 +2062,19 @@ static SlangResult _innerMain(
         RenderTestApp app;
         renderDocBeginFrame();
         SLANG_RETURN_ON_FAIL(app.initialize(session, deviceWrapper.get(), options, input));
-        app.update();
+        // A failure reported by `update` (binding the parameters or writing the output) means the
+        // test output was not produced or cannot be trusted. We return it only after the frame-end
+        // cleanup, so that the RenderDoc frame opened above is closed on this path as well.
+        //
+        // SLANG_E_NOT_AVAILABLE is turned into a failure because the test harness reads it as
+        // "ignore this test", and that outcome is reserved for the device and feature gating
+        // earlier in this function.
+        SlangResult updateResult = app.update();
         renderDocEndFrame();
         app.finalize();
+        if (updateResult == SLANG_E_NOT_AVAILABLE)
+            updateResult = SLANG_FAIL;
+        SLANG_RETURN_ON_FAIL(updateResult);
     }
 
     return SLANG_OK;
@@ -1919,6 +2128,12 @@ SLANG_TEST_TOOL_API SlangResult innerMain(
 int main(int argc, char** argv)
 {
     using namespace Slang;
+
+#if SLANG_IGNORE_ABORT_MSG && defined(_MSC_VER)
+    // Suppress the modal abort() dialog in unattended/LLM-driven builds.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
+
     SlangSession* session = spCreateSession(nullptr);
 
     TestToolUtil::setSessionDefaultPreludeFromExePath(argv[0], session);

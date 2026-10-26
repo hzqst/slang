@@ -168,27 +168,28 @@ bool isResourceType(IRType* type)
         type = arrayType->getElementType();
     }
 
-    if (const auto resourceTypeBase = as<IRResourceTypeBase>(type))
+    if (const auto resourceTypeBase = as<IRResourceTypeBase>(type); resourceTypeBase)
     {
         return true;
     }
-    else if (const auto builtinGenericType = as<IRBuiltinGenericType>(type))
+    else if (const auto builtinGenericType = as<IRBuiltinGenericType>(type); builtinGenericType)
     {
         return true;
     }
-    else if (const auto pointerLikeType = as<IRPointerLikeType>(type))
+    else if (const auto pointerLikeType = as<IRPointerLikeType>(type); pointerLikeType)
     {
         return true;
     }
-    else if (const auto samplerType = as<IRSamplerStateTypeBase>(type))
+    else if (const auto samplerType = as<IRSamplerStateTypeBase>(type); samplerType)
     {
         return true;
     }
-    else if (const auto subpassInputType = as<IRSubpassInputType>(type))
+    else if (const auto subpassInputType = as<IRSubpassInputType>(type); subpassInputType)
     {
         return true;
     }
-    else if (const auto untypedBufferType = as<IRUntypedBufferResourceType>(type))
+    else if (const auto untypedBufferType = as<IRUntypedBufferResourceType>(type);
+             untypedBufferType)
     {
         return true;
     }
@@ -199,64 +200,112 @@ bool isResourceType(IRType* type)
 }
 
 
-bool isOpaqueTypeImpl(IRType* type, HashSet<IRType*>& visited, IRType** outLeafOpaqueHandleType)
+// A type property tested by the queries for by-value storage.
+//
+// The queries below inspect the values stored in an aggregate. The compiler represents a
+// native pointer as an address, with separate storage for the pointed-to value. These queries
+// treat parameter-group types as leaves because `isResourceType` classifies them as opaque.
+enum class ContainedTypeProperty
 {
+    Opaque,
+    Unsized,
+};
+
+/// Find the first by-value type, including `type`, with the requested `property`.
+///
+/// Examines canonical struct fields, array elements, and tuple elements. Requires `visited`
+/// to contain the struct types on the current traversal path. Returns `nullptr` when no
+/// matching type occurs. For the opaque query, a recursive aggregate remains an opaque match,
+/// preserving the existing conservative classification of invalid recursive storage.
+static IRType* findContainedTypeWithProperty(
+    IRType* type,
+    ContainedTypeProperty property,
+    HashSet<IRType*>& visited)
+{
+    // A recursive by-value aggregate cannot have finite storage. `isOpaqueType` reports that
+    // aggregate as an opaque match. Recursion alone does not establish that the aggregate
+    // contains an `IRUnsizedArrayType`.
     if (visited.contains(type))
     {
-        if (outLeafOpaqueHandleType)
-            *outLeafOpaqueHandleType = type;
-        return true;
+        if (property == ContainedTypeProperty::Opaque)
+            return type;
+        return nullptr;
     }
 
-    if (isResourceType(type))
+    // Each query recognizes its own kind of leaf before considering aggregate contents.
+    // In particular, `isResourceType` also recognizes arrays of resources; returning `type`
+    // here preserves the type reported by the existing `isOpaqueType` query.
+    switch (property)
     {
-        if (outLeafOpaqueHandleType)
-            *outLeafOpaqueHandleType = type;
-        return true;
+    case ContainedTypeProperty::Opaque:
+        if (isResourceType(type))
+            return type;
+        break;
+    case ContainedTypeProperty::Unsized:
+        if (as<IRUnsizedArrayType>(type))
+            return type;
+        break;
     }
 
+    // Struct fields occupy storage inside the struct value. Base types also appear as
+    // fields after AST-to-IR lowering, so this traversal covers inherited contents.
     if (auto structType = as<IRStructType>(type))
     {
         visited.add(type);
         for (auto field : structType->getFields())
         {
-            if (isOpaqueTypeImpl(field->getFieldType(), visited, outLeafOpaqueHandleType))
+            auto matchingType =
+                findContainedTypeWithProperty(field->getFieldType(), property, visited);
+            if (matchingType)
             {
-                return true;
+                return matchingType;
             }
         }
         visited.remove(type);
     }
 
+    // Array elements contribute to the array's by-value representation. We inspect their
+    // types even when the containing array has a fixed element count.
     if (auto arrayType = as<IRArrayTypeBase>(type))
     {
-        if (isOpaqueTypeImpl(arrayType->getElementType(), visited, outLeafOpaqueHandleType))
-        {
-            return true;
-        }
+        return findContainedTypeWithProperty(arrayType->getElementType(), property, visited);
     }
 
+    // The tuple's stored values have the types denoted by its type operands. The queries
+    // inspect those types; other operands do not correspond to additional stored values.
     if (auto tupleType = as<IRTupleTypeBase>(type))
     {
         for (UInt i = 0; i < tupleType->getOperandCount(); i++)
         {
             if (auto elementType = as<IRType>(tupleType->getOperand(i)))
             {
-                if (isOpaqueTypeImpl(elementType, visited, outLeafOpaqueHandleType))
+                auto matchingType = findContainedTypeWithProperty(elementType, property, visited);
+                if (matchingType)
                 {
-                    return true;
+                    return matchingType;
                 }
             }
         }
     }
 
-    return false;
+    return nullptr;
 }
 
 bool isOpaqueType(IRType* type, IRType** outLeafOpaqueHandleType)
 {
     HashSet<IRType*> visited;
-    return isOpaqueTypeImpl(type, visited, outLeafOpaqueHandleType);
+    auto matchingType = findContainedTypeWithProperty(type, ContainedTypeProperty::Opaque, visited);
+    if (!matchingType)
+        return false;
+    if (outLeafOpaqueHandleType)
+        *outLeafOpaqueHandleType = matchingType;
+    return true;
+}
+
+bool isUnsizedType(IRType* type)
+{
+    HashSet<IRType*> visited;
+    return findContainedTypeWithProperty(type, ContainedTypeProperty::Unsized, visited) != nullptr;
 }
 
 SourceLoc findBestSourceLocFromUses(IRInst* inst)
@@ -353,11 +402,6 @@ struct TupleTypeBuilder
                 {
                     specialType = legalFieldType;
                 }
-
-                // `void` is currently legalized to simple, but we don't want to add a
-                // `void` field to the struct.
-                if (legalLeafType.getSimple()->getOp() == kIROp_VoidType)
-                    return;
             }
             break;
 
@@ -533,10 +577,24 @@ struct TupleTypeBuilder
             originalStructType->transferDecorationsTo(ordinaryStructType);
             copyNameHintAndDebugDecorations(originalStructType, ordinaryStructType);
 
+            // `transferDecorationsTo` above moved every decoration off `originalStructType`
+            // onto `ordinaryStructType`, including the synthesized-parameter-group marker.
+            // The parameter-group leak diagnostic in `legalizeTypeImpl` reads that marker off
+            // the *original* struct, and the same buffer can be re-legalized on a later pass,
+            // so the original must keep it. We re-add it here (rather than inside
+            // `copyNameHintAndDebugDecorations`, whose other callers flatten varying-IO
+            // structs and debug vars where this marker has no meaning) to keep the marker's
+            // scope narrow to parameter-group structs (issue #11825).
+            if (ordinaryStructType->findDecoration<IRSynthesizedParameterGroupDecoration>())
+                builder->addSynthesizedParameterGroupDecoration(originalStructType);
+
             // The new struct type will appear right after the original in the IR,
             // so that we can be sure any instruction that could reference the
             // original can also reference the new one.
             ordinaryStructType->insertAfter(originalStructType);
+
+            bool isOptimizableType =
+                (ordinaryStructType->findDecoration<IROptimizableTypeDecoration>());
 
             for (auto ee : ordinaryElements)
             {
@@ -556,7 +614,14 @@ struct TupleTypeBuilder
                 //
                 IRType* fieldType = ee.type;
                 if (!fieldType)
-                    fieldType = context->getBuilder()->getVoidType();
+                    if (!isOptimizableType)
+                        // If the type is not optimizable, the position may be important for layout
+                        // information. In that case, we will keep the field but give it a `void`
+                        // type.
+                        //
+                        fieldType = context->getBuilder()->getVoidType();
+                    else
+                        continue; // If type is optimizable, skip the field entirely.
 
                 // TODO: shallow clone of modifiers, etc.
                 IRStructField* originalField = findStructField(originalStructType, ee.fieldKey);
@@ -1121,8 +1186,13 @@ static LegalType wrapLegalType(
 
     case LegalType::Flavor::implicitDeref:
         {
-            return LegalType::implicitDeref(
-                wrapLegalType(context, legalType, ordinaryWrapper, specialWrapper));
+            // Wrap the pointed-to value type and restore the `implicitDeref`. Recursing on
+            // `legalType` itself (rather than its `valueType`) would not terminate.
+            return LegalType::implicitDeref(wrapLegalType(
+                context,
+                legalType.getImplicitDeref()->valueType,
+                ordinaryWrapper,
+                specialWrapper));
         }
         break;
 
@@ -1169,6 +1239,25 @@ static LegalType wrapLegalType(
     }
 }
 
+// An array of a parameter group whose element still needs decomposition must not take the
+// "resource types are legal as-is" shortcut in `legalizeTypeImpl`: `isResourceType` strips array
+// wrappers and treats the pointer-like group as a resource, so without this the array would stay
+// unlegalized while its element type legalizes to a non-simple form — the inconsistency that
+// crashes `GetElement`. Route such arrays to the array branch instead.
+static bool isArrayOfParameterGroupsNeedingLegalization(
+    TypeLegalizationContext* context,
+    IRType* type)
+{
+    if (!as<IRArrayTypeBase>(type))
+        return false;
+
+    auto paramGroupType = as<IRUniformParameterGroupType>(unwrapArray(type));
+    if (!paramGroupType)
+        return false;
+
+    return legalizeType(context, paramGroupType).flavor != LegalType::Flavor::simple;
+}
+
 // Legalize a type, including any nested types
 // that it transitively contains.
 LegalType legalizeTypeImpl(TypeLegalizationContext* context, IRType* type)
@@ -1182,6 +1271,12 @@ LegalType legalizeTypeImpl(TypeLegalizationContext* context, IRType* type)
     // the target defines its semantics fully.
     //
     if (type->findDecoration<IRTargetIntrinsicDecoration>())
+        return LegalType::simple(type);
+
+    // Work-graph record types (DispatchNodeInputRecord<T>, NodeOutput<T>, etc.) are
+    // opaque ABI objects. They must survive type legalization as-is even though they
+    // have no IR fields — eliminating them breaks entry-point parameter handling.
+    if (isWorkGraphRecordType(type))
         return LegalType::simple(type);
 
     if (context->isSimpleType(type))
@@ -1224,7 +1319,61 @@ LegalType legalizeTypeImpl(TypeLegalizationContext* context, IRType* type)
         }
         else
         {
+            // Whether this parameter group was synthesized by the compiler rather than
+            // written by the user. We read the marker *before* legalizing the element type:
+            // legalizing a struct with mixed resource/ordinary fields moves the original
+            // struct's decorations onto a new "ordinary" struct via `transferDecorationsTo`
+            // and then re-adds this marker onto the original (see the struct-splitting site
+            // above). Reading it here keeps this independent of that re-add, so we don't
+            // depend on the ordering of the nested legalization that happens inside
+            // `legalizeType` below.
+            bool isSynthesizedGroup =
+                originalElementType->findDecoration<IRSynthesizedParameterGroupDecoration>() !=
+                nullptr;
+
             legalElementType = legalizeType(context, originalElementType);
+
+            // When special types leak out of a parameter group, they need to
+            // be bound differently. Warn the user when this happens.
+            //
+            // We only warn for source-authored groups. A group whose element struct
+            // carries `SynthesizedParameterGroupDecoration` was created by the compiler
+            // (e.g. by collecting entry-point `uniform`/resource parameters, or global
+            // shader parameters, into an implicit constant buffer). The user wrote a flat
+            // parameter/global list, not the grouping, so there is nothing for them to
+            // restructure and the warning is just noise (issue #11825).
+            if (legalElementType.flavor == LegalType::Flavor::pair &&
+                as<IRConstantBufferType>(type) && !isSynthesizedGroup)
+            {
+                // The parameter group type's source location can be empty
+                // (e.g. when it comes from a linked module). Fall back to the
+                // location of the first use so the warning always points
+                // somewhere meaningful.
+                SourceLoc groupLoc = findFirstUseLoc(type);
+
+                context->m_sink->diagnose(
+                    Diagnostics::SpecialTypeLeaksFromParameterGroup{.location = groupLoc});
+
+                // indicate which elements cannot be part of the parameter group
+                auto& specialType = legalElementType.getPair()->specialType;
+                if (specialType.flavor == LegalType::Flavor::tuple)
+                {
+                    auto specialTuple = specialType.getTuple();
+                    for (auto specialElement : specialTuple->elements)
+                    {
+                        // The member key's location may be empty; fall back to
+                        // the parameter group location computed above.
+                        SourceLoc memberLoc =
+                            specialElement.key ? specialElement.key->sourceLoc : SourceLoc();
+                        if (!memberLoc.isValid())
+                            memberLoc = groupLoc;
+                        context->m_sink->diagnose(
+                            Diagnostics::SpecialTypeMemberLeaksFromParameterGroup{
+                                .location = memberLoc});
+                    }
+                }
+            }
+
             // As a bit of a corner case, if the user requested something
             // like `ConstantBuffer<Texture2D>` the element type would
             // legalize to a "simple" type, and that would be interpreted
@@ -1276,7 +1425,7 @@ LegalType legalizeTypeImpl(TypeLegalizationContext* context, IRType* type)
             bufferType->getOperandCount(),
             operands.getArrayView().getBuffer()));
     }
-    else if (isResourceType(type))
+    else if (isResourceType(type) && !isArrayOfParameterGroupsNeedingLegalization(context, type))
     {
         // We assume that any resource types not handled above
         // are legal as-is.

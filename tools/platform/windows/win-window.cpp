@@ -1,12 +1,14 @@
 #ifdef _WIN32
 
-#include "../window.h"
+#include "platform/window.h"
 
 #include <windows.h>
 #include <windowsx.h>
 using namespace Slang;
 
+#ifdef _MSC_VER
 #pragma comment(lib, "Gdi32")
+#endif
 
 namespace platform
 {

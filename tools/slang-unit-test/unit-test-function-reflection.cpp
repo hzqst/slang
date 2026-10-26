@@ -1,7 +1,7 @@
 // unit-test-translation-unit-import.cpp
 
-#include "../../source/core/slang-io.h"
-#include "../../source/core/slang-process.h"
+#include "core/slang-io.h"
+#include "core/slang-process.h"
 #include "slang-com-ptr.h"
 #include "slang.h"
 #include "unit-test/slang-unit-test.h"
@@ -16,6 +16,89 @@ static String getTypeFullName(slang::TypeReflection* type)
     ComPtr<ISlangBlob> blob;
     type->getFullName(blob.writeRef());
     return String((const char*)blob->getBufferPointer());
+}
+
+static const char* kLanguageVersionOverloadSource = R"(
+    module reflectionVersion;
+
+    public struct BroadResult {}
+    public struct ShapedResult {}
+
+    public BroadResult choose<T : IFloat>(T value)
+    {
+        return BroadResult();
+    }
+
+    __generic<T : __BuiltinFloatingPointType, let N : int>
+    public ShapedResult choose(vector<T, N> value)
+    {
+        return ShapedResult();
+    }
+
+    public BroadResult rankedChoose<T : IFloat>(T value)
+    {
+        return BroadResult();
+    }
+
+    __generic<T : __BuiltinFloatingPointType, let N : int>
+    [OverloadRank(1)]
+    public ShapedResult rankedChoose(vector<T, N> value)
+    {
+        return ShapedResult();
+    }
+)";
+
+// Resolves the return type selected for `functionName(float3)` in `layout`.
+static String resolveFunctionReturnType(slang::ProgramLayout* layout, const char* functionName)
+{
+    SLANG_CHECK_ABORT(layout != nullptr);
+    auto function = layout->findFunctionByName(functionName);
+    SLANG_CHECK_ABORT(function != nullptr);
+    auto float3Type = layout->findTypeByName("float3");
+    SLANG_CHECK_ABORT(float3Type != nullptr);
+
+    slang::TypeReflection* argTypes[] = {float3Type};
+    auto resolved = function->specializeWithArgTypes(1, argTypes);
+    return resolved ? getTypeFullName(resolved->getReturnType()) : String();
+}
+
+// Resolves `functionName(float3)` through reflection in a fresh session configured for
+// `languageVersion`. A fresh session isolates the version policy under test from module and
+// reflection caches created by the other case.
+static String resolveFunctionReturnTypeForLanguageVersion(
+    SlangLanguageVersion languageVersion,
+    const char* functionName)
+{
+    ComPtr<slang::IGlobalSession> globalSession;
+    SLANG_CHECK_ABORT(
+        slang_createGlobalSession(SLANG_API_VERSION, globalSession.writeRef()) == SLANG_OK);
+
+    slang::CompilerOptionEntry languageVersionEntry = {};
+    languageVersionEntry.name = slang::CompilerOptionName::LanguageVersion;
+    languageVersionEntry.value.kind = slang::CompilerOptionValueKind::Int;
+    languageVersionEntry.value.intValue0 = languageVersion;
+
+    slang::TargetDesc targetDesc = {};
+    targetDesc.format = SLANG_HLSL;
+    targetDesc.profile = globalSession->findProfile("sm_5_0");
+
+    slang::SessionDesc sessionDesc = {};
+    sessionDesc.targetCount = 1;
+    sessionDesc.targets = &targetDesc;
+    sessionDesc.compilerOptionEntryCount = 1;
+    sessionDesc.compilerOptionEntries = &languageVersionEntry;
+    ComPtr<slang::ISession> session;
+    SLANG_CHECK_ABORT(globalSession->createSession(sessionDesc, session.writeRef()) == SLANG_OK);
+
+    ComPtr<slang::IBlob> diagnostics;
+    auto module = session->loadModuleFromSourceString(
+        "reflectionVersion",
+        "reflection-version.slang",
+        kLanguageVersionOverloadSource,
+        diagnostics.writeRef());
+    SLANG_CHECK_ABORT(module != nullptr);
+
+    return resolveFunctionReturnType(module->getLayout(), functionName);
 }
 
 // Test that the reflection API provides correct info about entry point and ordinary functions.
@@ -216,6 +299,168 @@ SLANG_UNIT_TEST(functionReflection)
     SLANG_CHECK_ABORT(fooType != nullptr);
     auto ctor = module->getLayout()->findFunctionByNameInType(fooType, "$init");
     SLANG_CHECK(ctor != nullptr);
+}
+
+// Reflection overload resolution has no primary source module, but it still needs an effective
+// Slang language version. Verify that it uses the session option: Slang 2026 applies the deprecated
+// final fallback, while Slang 202c leaves the otherwise-tied candidates ambiguous.
+SLANG_UNIT_TEST(reflectionOverloadUsesSessionLanguageVersion)
+{
+    SLANG_CHECK(
+        resolveFunctionReturnTypeForLanguageVersion(SLANG_LANGUAGE_VERSION_2026, "choose") ==
+        "BroadResult");
+    // The public reflection specialization API reports failure as null and does not expose its
+    // diagnostic sink. First prove that 202c reflection can resolve this same pair of candidate
+    // shapes when the ordinary OverloadRank rule distinguishes them. The diagnostics test proves
+    // that the otherwise-identical `choose` overload set fails specifically because it is
+    // ambiguous, while the final assertion verifies that reflection applies that policy.
+    SLANG_CHECK(
+        resolveFunctionReturnTypeForLanguageVersion(SLANG_LANGUAGE_VERSION_202C, "rankedChoose") ==
+        "ShapedResult");
+    SLANG_CHECK(
+        resolveFunctionReturnTypeForLanguageVersion(SLANG_LANGUAGE_VERSION_202C, "choose")
+            .getLength() == 0);
+}
+
+// Legacy compile requests can process command-line options after reflection has initialized its
+// ad hoc semantic context. Verify that changing `-std` replaces that context instead of retaining
+// overload rules from its originally cached language version.
+SLANG_UNIT_TEST(reflectionRefreshesChangedLanguageVersion)
+{
+    auto session = spCreateSession();
+    auto request = spCreateCompileRequest(session);
+
+    spAddCodeGenTarget(request, SLANG_HLSL);
+    int translationUnitIndex =
+        spAddTranslationUnit(request, SLANG_SOURCE_LANGUAGE_SLANG, "reflectionVersion");
+    spAddTranslationUnitSourceString(
+        request,
+        translationUnitIndex,
+        "reflection-version.slang",
+        kLanguageVersionOverloadSource);
+    SLANG_CHECK_ABORT(spCompile(request) == SLANG_OK);
+
+    auto layout = slang::ShaderReflection::get(request);
+    SLANG_CHECK(resolveFunctionReturnType(layout, "choose") == "BroadResult");
+
+    const char* slang202cArgs[] = {"-std", "202c"};
+    SLANG_CHECK_ABORT(
+        spProcessCommandLineArguments(request, slang202cArgs, SLANG_COUNT_OF(slang202cArgs)) ==
+        SLANG_OK);
+    SLANG_CHECK(resolveFunctionReturnType(layout, "choose").getLength() == 0);
+
+    spDestroyCompileRequest(request);
+    spDestroySession(session);
+}
+
+// Regression test for shader-slang/slang#11277. `ModifiedType` wrappers
+// (e.g. the auto-`no_diff` synthesized on a `[Differentiable]` generic's
+// signature, or an explicit `no_diff` on a struct field) used to leak out
+// of the reflection API, causing `getKind()` to return `None`, layout to
+// be zero-sized, and downstream consumers like slangpy to treat the type
+// as unknown. The reflection boundary now unwraps `ModifiedType` so all
+// structural queries see the inner type, regardless of whether they reach
+// the boundary via a function return, a function parameter, or a struct
+// field — every accessor flows through the same `convert(Type*)` helper.
+SLANG_UNIT_TEST(functionReflectionNoDiffSpecializedReturn)
+{
+    const char* source = R"(
+        [Differentiable]
+        public T multiply<T : IArithmetic>(T x, T y) { return x * y; }
+
+        public struct S {
+            public no_diff float a;
+            public float b;
+            public unorm float c;
+            public snorm float d;
+        }
+        )";
+
+    ComPtr<slang::IGlobalSession> globalSession;
+    SLANG_CHECK(slang_createGlobalSession(SLANG_API_VERSION, globalSession.writeRef()) == SLANG_OK);
+    slang::TargetDesc targetDesc = {};
+    targetDesc.format = SLANG_HLSL;
+    targetDesc.profile = globalSession->findProfile("sm_5_0");
+    slang::SessionDesc sessionDesc = {};
+    sessionDesc.targetCount = 1;
+    sessionDesc.targets = &targetDesc;
+    ComPtr<slang::ISession> session;
+    SLANG_CHECK(globalSession->createSession(sessionDesc, session.writeRef()) == SLANG_OK);
+
+    ComPtr<slang::IBlob> diag;
+    auto module = session->loadModuleFromSourceString("m", "m.slang", source, diag.writeRef());
+    SLANG_CHECK_ABORT(module != nullptr);
+
+    auto layout = module->getLayout();
+    auto func = layout->findFunctionByName("multiply");
+    SLANG_CHECK_ABORT(func != nullptr);
+
+    auto float4Type = layout->findTypeByName("float4");
+    SLANG_CHECK_ABORT(float4Type != nullptr);
+
+    slang::TypeReflection* argTypes[2] = {float4Type, float4Type};
+    auto specFunc = func->specializeWithArgTypes(2, argTypes);
+    SLANG_CHECK_ABORT(specFunc != nullptr);
+
+    // Return type is the original symptom from #11277.
+    auto retType = specFunc->getReturnType();
+    SLANG_CHECK_ABORT(retType != nullptr);
+    SLANG_CHECK(retType->getKind() == slang::TypeReflection::Kind::Vector);
+    SLANG_CHECK(retType->getElementCount() == 4);
+    SLANG_CHECK(getTypeFullName(retType) == "vector<float,4>");
+
+    auto elementType = retType->getElementType();
+    SLANG_CHECK_ABORT(elementType != nullptr);
+    SLANG_CHECK(elementType->getKind() == slang::TypeReflection::Kind::Scalar);
+    SLANG_CHECK(elementType->getScalarType() == slang::TypeReflection::ScalarType::Float32);
+
+    // Parameter types are reached through a different accessor
+    // (`spReflectionVariable_GetType`) but share the same convert path, so
+    // lock them in too — a regression that scopes the unwrap to the return
+    // type only would otherwise not be caught.
+    SLANG_CHECK_ABORT(specFunc->getParameterCount() == 2);
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        auto paramType = specFunc->getParameterByIndex(i)->getType();
+        SLANG_CHECK_ABORT(paramType != nullptr);
+        SLANG_CHECK(paramType->getKind() == slang::TypeReflection::Kind::Vector);
+        SLANG_CHECK(paramType->getElementCount() == 4);
+        SLANG_CHECK(getTypeFullName(paramType) == "vector<float,4>");
+    }
+
+    // Layout queries: the original slangpy symptom was `uniform_layout.size`
+    // returning 0 because `convert()` handed back the `ModifiedType` to
+    // `getTypeLayout`, which then refused to lay it out.
+    auto retLayout = layout->getTypeLayout(retType);
+    SLANG_CHECK_ABORT(retLayout != nullptr);
+    SLANG_CHECK(retLayout->getKind() == slang::TypeReflection::Kind::Vector);
+    SLANG_CHECK(retLayout->getSize() == 16);
+
+    // Struct fields hit the same convert path via
+    // `spReflectionType_GetFieldByIndex` → `spReflectionVariable_GetType`.
+    // `unorm` / `snorm` use the same `ModifiedType` representation as
+    // `no_diff` (different `TypeModifierVal` subclass, same wrapper), so
+    // pin them too to document the cross-modifier contract.
+    auto sType = layout->findTypeByName("S");
+    SLANG_CHECK_ABORT(sType != nullptr);
+    SLANG_CHECK_ABORT(sType->getFieldCount() == 4);
+    auto noDiffField = sType->getFieldByIndex(0)->getType();
+    SLANG_CHECK_ABORT(noDiffField != nullptr);
+    SLANG_CHECK(noDiffField->getKind() == slang::TypeReflection::Kind::Scalar);
+    SLANG_CHECK(noDiffField->getScalarType() == slang::TypeReflection::ScalarType::Float32);
+    SLANG_CHECK(getTypeFullName(noDiffField) == "float");
+
+    auto unormField = sType->getFieldByIndex(2)->getType();
+    SLANG_CHECK_ABORT(unormField != nullptr);
+    SLANG_CHECK(unormField->getKind() == slang::TypeReflection::Kind::Scalar);
+    SLANG_CHECK(unormField->getScalarType() == slang::TypeReflection::ScalarType::Float32);
+    SLANG_CHECK(getTypeFullName(unormField) == "float");
+
+    auto snormField = sType->getFieldByIndex(3)->getType();
+    SLANG_CHECK_ABORT(snormField != nullptr);
+    SLANG_CHECK(snormField->getKind() == slang::TypeReflection::Kind::Scalar);
+    SLANG_CHECK(snormField->getScalarType() == slang::TypeReflection::ScalarType::Float32);
+    SLANG_CHECK(getTypeFullName(snormField) == "float");
 }
 
 // Test that findFunctionByNameInType finds all functions with the same name but different

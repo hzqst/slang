@@ -49,7 +49,7 @@ private:
 
     bool containsOpaqueHandleTypeCached(IRType* type);
     bool containsOpaqueHandleTypeInternal(IRType* type, HashSet<IRType*>& visitedInCurrentCheck);
-    void validateStructuredBufferVariable(IRInst* inst);
+    void validateStructuredBufferVariable(IRType* type, SourceLoc loc);
 };
 
 void validateIRInst(IRValidateContext* context, IRInst* inst);
@@ -383,6 +383,83 @@ void validateCodeBody(IRValidateContext* context, IRGlobalValueWithCode* code)
     }
 }
 
+// Check declaration-scope contracts, guarding operand counts before reading fixed positions.
+static void validateDebugScopeOperands(IRValidateContext* context, IRInst* inst)
+{
+    IRInst* scope = nullptr;
+    switch (inst->getOp())
+    {
+    case kIROp_DebugLexicalBlock:
+        {
+            bool validCount = inst->getOperandCount() == 4;
+            validate(context, validCount, inst, "invalid debug declaration operand count");
+            if (!validCount)
+                return;
+            scope = inst->getOperand(3);
+            break;
+        }
+    case kIROp_DebugVar:
+    case kIROp_DebugInlinedAt:
+        {
+            auto count = inst->getOperandCount();
+            bool validCount = count == 4 || count == 5;
+            validate(context, validCount, inst, "invalid debug declaration operand count");
+            if (!validCount)
+                return;
+            scope = inst->getOperand(3);
+            break;
+        }
+    case kIROp_DebugScope:
+        validate(
+            context,
+            inst->getOperandCount() == 1 || inst->getOperandCount() == 2,
+            inst,
+            "invalid DebugScope operand count");
+        if (!inst->getOperandCount())
+            return;
+        scope = inst->getOperand(0);
+        break;
+    case kIROp_DebugLocationDecoration:
+        if (inst->getOperandCount() == 4)
+            scope = inst->getOperand(3);
+        else
+            return;
+        break;
+    default:
+        return;
+    }
+    validate(
+        context,
+        as<IRDebugFunction>(scope) || as<IRDebugLexicalBlock>(scope),
+        inst,
+        "debug scope must be a function or lexical block");
+    if (as<IRDebugLexicalBlock>(inst))
+    {
+        validate(
+            context,
+            as<IRDebugSource>(inst->getOperand(0)) && as<IRIntLit>(inst->getOperand(1)) &&
+                as<IRIntLit>(inst->getOperand(2)),
+            inst,
+            "lexical block requires source, line and column");
+        HashSet<IRInst*> parents;
+        parents.add(inst);
+        while (auto block = as<IRDebugLexicalBlock>(scope))
+        {
+            if (!parents.add(block) || block->getOperandCount() != 4)
+            {
+                validate(context, false, inst, "invalid lexical parent chain");
+                return;
+            }
+            scope = block->getParentScope();
+        }
+        validate(
+            context,
+            as<IRDebugFunction>(scope),
+            inst,
+            "lexical parent chain must end at a function");
+    }
+}
+
 void validateIRInst(IRValidateContext* context, IRInst* inst)
 {
     // Validate that any operands of the instruction are used appropriately
@@ -401,6 +478,8 @@ void validateIRInst(IRValidateContext* context, IRInst* inst)
 
     if (as<IRGlobalValueWithCode>(inst))
         context->domTree = nullptr;
+
+    validateDebugScopeOperands(context, inst);
 }
 
 void validateIRInst(IRInst* inst)
@@ -450,8 +529,9 @@ void validateIRModuleIfEnabled(CodeGenContext* codeGenContext, IRModule* module)
     validateIRModule(module, sink);
 }
 
-// Returns whether 'dst' is a valid destination for atomic operations, meaning
-// it leads either to 'groupshared' or 'device buffer' memory.
+// Returns whether 'dst' is a valid destination for atomic operations: it leads
+// to 'groupshared' or 'device buffer' memory, or is an image/texel destination
+// (an IRImageSubscript, or the descriptor-heap-lowered texel pointer below).
 static bool isValidAtomicDest(bool skipFuncParamValidation, IRInst* dst)
 {
     bool isGroupShared = as<IRGroupSharedRate>(dst->getRate());
@@ -461,6 +541,14 @@ static bool isValidAtomicDest(bool skipFuncParamValidation, IRInst* dst)
     if (as<IRRWStructuredBufferGetElementPtr>(dst))
         return true;
     if (as<IRImageSubscript>(dst))
+        return true;
+    // Under spvDescriptorHeapEXT, processImageSubscript (slang-ir-spirv-legalize)
+    // rewrites an image-subscript atomic destination into this heap texel pointer.
+    // Atomic validation runs after that lowering, so we see the lowered form here
+    // rather than the original IRImageSubscript; and this opcode is produced only
+    // on that texture-atomic heap path, so accepting it unconditionally is as safe
+    // as the IRImageSubscript case above.
+    if (as<IRSPIRVLoadTexelPointerFromHeap>(dst))
         return true;
 
     if (auto ptrType = as<IRPtrType>(dst->getDataType()))
@@ -472,6 +560,16 @@ static bool isValidAtomicDest(bool skipFuncParamValidation, IRInst* dst)
         case AddressSpace::StorageBuffer:
         case AddressSpace::UserPointer:
             return true;
+        case AddressSpace::Uniform:
+            // SPIRV 1.3 represents SSBOs as Uniform storage class with BufferBlock decoration,
+            // rather than StorageBuffer storage class used in SPIRV 1.4+. Accept uniform pointers
+            // to BufferBlock-decorated structs as valid atomic targets.
+            if (auto structType = as<IRStructType>(ptrType->getValueType()))
+            {
+                if (structType->findDecorationImpl(kIROp_SPIRVBufferBlockDecoration))
+                    return true;
+            }
+            break;
         default:
             break;
         }
@@ -668,6 +766,77 @@ void validateVectorsAndMatrices(
     }
 }
 
+bool validateMutableGlobalVariableTypes(IRModule* module, DiagnosticSink* sink)
+{
+    // Consider a module that declares `extern struct Thing {}` and uses `Thing` as the type of a
+    // file- or namespace-scope mutable `static` variable. Semantic checking cannot know whether a
+    // definition from another module contains a resource or an unsized array. Lowering marks that
+    // declaration category, so this validation can check its type once the definition is
+    // available.
+    bool hasErrors = false;
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        // Only `IRGlobalVar` instructions represent mutable module-scope storage. Shader
+        // parameters and constants do not require that storage and are checked elsewhere.
+        auto globalVar = as<IRGlobalVar>(globalInst);
+        if (!globalVar)
+            continue;
+
+        // An `IRGlobalVar` may also represent a static data member. The decoration instead
+        // identifies a file- or namespace-scope mutable `static` variable, or a shadow synthesized
+        // for a uniform parameter under `-Gec`. The candidate predicate below separately checks
+        // that the global has no explicit storage rate before treating it as per-invocation state.
+        if (!globalVar->findDecoration<IRFileOrNamespaceScopeMutableVarDecoration>())
+            continue;
+
+        // We record whether the marked global has the rate and stored type accepted as a resource-
+        // replacement candidate before diagnosing other opaque types. The legalization pass later
+        // validates the candidate's uses and call graph before committing to replacement.
+        bool isPerInvocationResourceReplacementCandidate =
+            isResourceGlobalCandidateForPerInvocationReplacement(globalVar);
+
+        // The shared accessor asserts the concrete pointer and pointee representation established
+        // by linking. We remove wrappers from the stored value before inspecting its storage
+        // requirements.
+        auto valueType = as<IRType>(unwrapAttributedType(getGlobalVarValueType(globalVar)));
+        SLANG_RELEASE_ASSERT(valueType);
+
+        // The linker can select a definition with a trailing unsized array. Such a type may be
+        // valid as a buffer element, but we cannot independently allocate a mutable variable of
+        // that type. We check this before the resource exception below because an unbounded array
+        // of otherwise supported resources still cannot become function-local storage.
+        if (isUnsizedType(valueType))
+        {
+            sink->diagnose(Diagnostics::UnsizedTypeInMutableGlobalStorage{
+                .type = valueType,
+                .location = globalVar->sourceLoc});
+            hasErrors = true;
+            continue;
+        }
+
+        // `isOpaqueType` examines fields and array elements recursively. A later pass can attempt
+        // to replace one resource value or a fixed-size homogeneous resource array selected by the
+        // shared predicate. Every other opaque value would require unsupported mutable global
+        // storage.
+        IRType* opaqueType = nullptr;
+        if (isOpaqueType(valueType, &opaqueType))
+        {
+            if (isPerInvocationResourceReplacementCandidate)
+                continue;
+
+            // The diagnostic belongs at the variable declaration. Reporting it before resource
+            // legalization prevents an unsupported global initializer from being split as if it
+            // were a function returning its resource fields through generated `out` parameters.
+            sink->diagnose(Diagnostics::OpaqueTypeNotSupportedForMutableGlobalStorage{
+                .type = opaqueType,
+                .location = globalVar->sourceLoc});
+            hasErrors = true;
+            continue;
+        }
+    }
+    return !hasErrors;
+}
+
 //
 // Structure buffer resource types
 //
@@ -727,28 +896,32 @@ bool StructuredBufferValidationContext::containsOpaqueHandleTypeInternal(
     return false;
 }
 
-void StructuredBufferValidationContext::validateStructuredBufferVariable(IRInst* inst)
+void StructuredBufferValidationContext::validateStructuredBufferVariable(
+    IRType* type,
+    SourceLoc loc)
 {
-    IRType* type = inst->getDataType();
-
-    // Unwrap arrays if present
-    type = unwrapArrayAndPointers(type);
-
-    // Check if this is a structured buffer type
-    auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(type);
-    if (!structuredBufferType)
-        return;
-
-    // Get the element type
-    auto elementType = structuredBufferType->getElementType();
-
-    // Check if the element type contains any resource/opaque handle types
-    if (containsOpaqueHandleTypeCached(elementType))
+    while (type)
     {
-        m_sink->diagnose(Diagnostics::CannotUseResourceTypeInStructuredBuffer{
-            .type = elementType,
-            .location = inst->sourceLoc});
-        m_hasErrors = true;
+        if (auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(type))
+        {
+            auto elementType = structuredBufferType->getElementType();
+            if (containsOpaqueHandleTypeCached(elementType))
+            {
+                m_sink->diagnose(Diagnostics::CannotUseResourceTypeInStructuredBuffer{
+                    .type = elementType,
+                    .location = loc});
+                m_hasErrors = true;
+            }
+            return;
+        }
+        else if (auto arrayType = as<IRArrayTypeBase>(type))
+            type = arrayType->getElementType();
+        else if (auto ptrType = as<IRPtrTypeBase>(type))
+            type = ptrType->getValueType();
+        else if (auto groupType = as<IRParameterGroupType>(type))
+            type = groupType->getElementType();
+        else
+            return;
     }
 }
 
@@ -758,18 +931,30 @@ bool StructuredBufferValidationContext::validate(IRModule* module)
     if (m_targetRequest && areResourceTypesBindlessOnTarget(m_targetRequest))
         return true;
 
-    // Iterate through all global instructions
+    // `getGlobalInsts()` only yields direct children of the module. That is
+    // sufficient by the time this pass runs (after `specializeModule`),
+    // because concrete struct types have already been hoisted to module
+    // scope. Any unspecialized `IRStructType` parented under an `IRGeneric`
+    // is unreachable from here, which is fine since its
+    // `StructuredBuffer<T>` fields have no concrete `T` to validate yet.
     for (auto globalInst : module->getGlobalInsts())
     {
-        if (auto globalVar = as<IRGlobalParam>(globalInst))
+        if (auto globalParam = as<IRGlobalParam>(globalInst))
         {
-            validateStructuredBufferVariable(globalVar);
+            validateStructuredBufferVariable(globalParam->getDataType(), globalParam->sourceLoc);
+        }
+        else if (auto structType = as<IRStructType>(globalInst))
+        {
+            for (auto field : structType->getFields())
+            {
+                validateStructuredBufferVariable(field->getFieldType(), field->sourceLoc);
+            }
         }
         else if (auto func = as<IRFunc>(globalInst))
         {
             for (auto param : func->getParams())
             {
-                validateStructuredBufferVariable(param);
+                validateStructuredBufferVariable(param->getDataType(), param->sourceLoc);
             }
         }
     }
@@ -789,6 +974,74 @@ bool validateStructuredBufferResourceTypes(
 void validateAtomicOperations(IRModule* module, bool skipFuncParamValidation, DiagnosticSink* sink)
 {
     validateAtomicOperations(skipFuncParamValidation, sink, module->getModuleInst());
+}
+
+static void collectAssumeAddressInsts(IRInst* inst, List<IRInst*>& out)
+{
+    if (inst->getOp() == kIROp_AssumeAddress)
+        out.add(inst);
+    for (auto child : inst->getModifiableChildren())
+        collectAssumeAddressInsts(child, out);
+}
+
+void validateAndRemoveAssumeAddress(IRModule* module, bool validate, DiagnosticSink* sink)
+{
+    List<IRInst*> assumeAddrs;
+    collectAssumeAddressInsts(module->getModuleInst(), assumeAddrs);
+
+    if (validate)
+    {
+        for (auto inst : assumeAddrs)
+        {
+            auto addr = inst->getOperand(0);
+            auto root = getRootAddr(addr);
+            bool shouldDiagnose = false;
+            if (root->getOp() == kIROp_Var)
+            {
+                // Don't diagnose vars that hold resource/buffer handles. Those
+                // always refer to device memory regardless of where the handle
+                // itself is stored (e.g. a ConstantBuffer parameter copied to a
+                // local var still points into device memory).
+                IRType* valueType = nullptr;
+                if (auto ptrType = as<IRPtrTypeBase>(root->getDataType()))
+                    valueType = ptrType->getValueType();
+                shouldDiagnose = !valueType || (!as<IRPointerLikeType>(valueType) &&
+                                                !as<IRHLSLStructuredBufferTypeBase>(valueType) &&
+                                                !as<IRByteAddressBufferTypeBase>(valueType));
+            }
+            else if (auto param = as<IRParam>(root))
+            {
+                // Also diagnose function parameters that are not of
+                // pointer/pointer-like type. Those represent function-local
+                // storage that cannot be addressed on GPU targets.
+                // (By-value params go through a kIROp_Var copy above; this
+                // catches inout/ref params where the IRParam itself is the root.)
+                auto parentBlock = as<IRBlock>(param->getParent());
+                IRGlobalValueWithCode* parentFunc = nullptr;
+                if (parentBlock)
+                    parentFunc = as<IRGlobalValueWithCode>(parentBlock->getParent());
+
+                if (parentFunc && parentBlock == parentFunc->getFirstBlock())
+                {
+                    auto type = root->getDataType();
+                    shouldDiagnose = !as<IRPtrTypeBase>(type) && !as<IRPointerLikeType>(type) &&
+                                     !as<IRHLSLStructuredBufferTypeBase>(type) &&
+                                     !as<IRByteAddressBufferTypeBase>(type);
+                }
+            }
+            if (!shouldDiagnose)
+                continue;
+            sink->diagnose(Diagnostics::InvalidAddressOf{
+                .location = inst->sourceLoc,
+            });
+        }
+    }
+
+    for (auto inst : assumeAddrs)
+    {
+        inst->replaceUsesWith(inst->getOperand(0));
+        inst->removeAndDeallocate();
+    }
 }
 
 } // namespace Slang

@@ -12,18 +12,19 @@
 // from the public API.
 //
 
-#include "../compiler-core/slang-artifact.h"
-#include "../compiler-core/slang-command-line-args.h"
-#include "../compiler-core/slang-include-system.h"
-#include "../compiler-core/slang-name.h"
-#include "../core/slang-riff.h"
-#include "../core/slang-smart-pointer.h"
+#include "compiler-core/slang-artifact.h"
+#include "compiler-core/slang-command-line-args.h"
+#include "compiler-core/slang-include-system.h"
+#include "compiler-core/slang-name.h"
+#include "core/slang-riff.h"
+#include "core/slang-smart-pointer.h"
 #include "slang-ast-base.h"
 #include "slang-compiler-fwd.h"
 #include "slang-compiler-options.h"
 #include "slang-content-assist-info.h"
 #include "slang-global-session.h"
 
+#include <mutex>
 #include <slang.h>
 
 namespace Slang
@@ -90,7 +91,16 @@ struct ContainerTypeKey
 class Linkage : public RefObject, public slang::ISession
 {
 public:
-    SLANG_REF_OBJECT_IUNKNOWN_ALL
+    SLANG_COM_INTERFACE(
+        0xa3f29c15,
+        0x4e82,
+        0x47d1,
+        {0x9b, 0x53, 0x7c, 0xe6, 0x1f, 0x48, 0xd2, 0x07})
+
+    SLANG_NO_THROW SlangResult SLANG_MCALL queryInterface(SlangUUID const& uuid, void** outObject)
+        SLANG_OVERRIDE;
+    SLANG_REF_OBJECT_IUNKNOWN_ADD_REF
+    SLANG_REF_OBJECT_IUNKNOWN_RELEASE
 
     CompilerOptionSet m_optionSet;
 
@@ -172,6 +182,8 @@ public:
     virtual SLANG_NO_THROW slang::IModule* SLANG_MCALL getLoadedModule(SlangInt index) override;
     virtual SLANG_NO_THROW bool SLANG_MCALL
     isBinaryModuleUpToDate(const char* modulePath, slang::IBlob* binaryModuleBlob) override;
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL
+    getDeclSourceLocation(slang::DeclReflection* decl, slang::SourceLocation* outLocation) override;
 
     // Updates the supplied builder with linkage-related information, which includes preprocessor
     // defines, the compiler version, and other compiler options. This is then merged with the hash
@@ -217,6 +229,7 @@ public:
     NamePool* getNamePool() { return namePool; }
 
     ASTBuilder* getASTBuilder() { return m_astBuilder; }
+    std::recursive_mutex& getComponentTypeOperationMutex() { return m_componentTypeOperationMutex; }
 
     RefPtr<ASTBuilder> m_astBuilder;
 
@@ -228,6 +241,9 @@ public:
     void destroyTypeCheckingCache();
 
     RefPtr<RefObject> m_typeCheckingCache = nullptr;
+    // Front-end component-type operations still share linkage-owned mutable state and can
+    // re-enter one another, so they remain serialized even when backend emission is parallelized.
+    std::recursive_mutex m_componentTypeOperationMutex;
 
     // Modules that have been dynamically loaded via `import`
     //
@@ -246,6 +262,8 @@ public:
 
     // Counters for allocating sequential IDs to witness tables conforming to each interface type.
     Dictionary<String, uint32_t> mapInterfaceMangledNameToSequentialIDCounters;
+    // Witness-table sequential ID assignment updates both maps together.
+    std::mutex m_sequentialIDMapMutex;
 
     SearchDirectoryList searchDirectoryCache;
 
@@ -296,6 +314,8 @@ public:
     /// or one of the specialized cases `loadSourceModuleImpl`
     /// and `loadBinaryModuleImpl`.
     ///
+    /// For IR modules, `isSpeculativeLoad` warns on an incompatible version so an import
+    /// search can continue to source. Non-speculative loads report an error instead.
     RefPtr<Module> loadModuleImpl(
         Name* name,
         const PathInfo& filePathInfo,
@@ -303,7 +323,8 @@ public:
         SourceLoc const& loc,
         DiagnosticSink* sink,
         const LoadedModuleDictionary* additionalLoadedModules,
-        ModuleBlobType blobType);
+        ModuleBlobType blobType,
+        bool isSpeculativeLoad = false);
 
     RefPtr<Module> loadSourceModuleImpl(
         Name* name,
@@ -318,7 +339,8 @@ public:
         const PathInfo& filePathInfo,
         ISlangBlob* fileContentsBlob,
         SourceLoc const& loc,
-        DiagnosticSink* sink);
+        DiagnosticSink* sink,
+        bool isSpeculativeLoad);
 
     /// Either finds a previously-loaded module matching what
     /// was serialized into `moduleChunk`, or else attempts
@@ -422,8 +444,11 @@ public:
 
     void _stopRetainingParentSession() { m_retainedSession = nullptr; }
 
-    // Get shared semantics information for reflection purposes.
-    SharedSemanticsContext* getSemanticsForReflection();
+    /// Gets a snapshot of the shared semantic state used by reflection operations.
+    ///
+    /// The strong reference keeps that snapshot alive if a later `-std` change replaces the
+    /// linkage's cached context.
+    RefPtr<SharedSemanticsContext> getSemanticsForReflection();
 
 private:
     /// The global Slang library session that this linkage is a child of
@@ -465,6 +490,31 @@ private:
 
     /// Is the given module in the middle of being imported?
     bool isBeingImported(Module* module);
+
+    /// Discovers a module without applying the import policy that belongs to the consumer.
+    ///
+    /// Import policy currently consists of the experimental-module feature gate.
+    ///
+    /// This is the implementation of `findOrImportModule`; callers must use that public wrapper so
+    /// every successful discovery passes through `_getImportableModuleOrDiagnose`.
+    RefPtr<Module> _findOrImportModuleWithoutPolicy(
+        Name* moduleName,
+        SourceLoc const& requestingLoc,
+        DiagnosticSink* sink,
+        const LoadedModuleDictionary* loadedModules);
+
+    /// Returns `module` when it may be imported, or `nullptr` when it is absent or rejected.
+    ///
+    /// Discovery owns diagnostics for an absent module, so this helper deliberately passes its
+    /// `nullptr` through without another diagnostic. A rejected import is non-importable: this
+    /// helper returns `nullptr` and diagnoses it when `sink` is present. The public
+    /// `findOrImportModule` wrapper applies this validation to every import request after
+    /// discovery, including cache hits.
+    RefPtr<Module> _getImportableModuleOrDiagnose(
+        Module* module,
+        Name* moduleName,
+        SourceLoc const& requestingLoc,
+        DiagnosticSink* sink);
 
     /// Diagnose that an error occured in the process of importing a module
     void _diagnoseErrorInImportedModule(DiagnosticSink* sink);

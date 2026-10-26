@@ -1,5 +1,6 @@
 #include "slang-ir-util.h"
 
+#include "core/slang-short-list.h"
 #include "slang-ir-clone.h"
 #include "slang-ir-dce.h"
 #include "slang-ir-dominators.h"
@@ -8,6 +9,186 @@
 
 namespace Slang
 {
+
+// Share the struct-field traversal while allowing callers to choose which field types disappear.
+// DCE's existing query ignores only void and nested empty structs. Payload boundaries also need
+// arrays of empty elements, but must preserve target-intrinsic types even when they have no fields.
+static bool isStructEmpty(IRType* type, bool (*isEmptyFieldType)(IRType*))
+{
+    auto structType = as<IRStructType>(type);
+    if (!structType)
+        return false;
+
+    for (auto field : structType->getFields())
+    {
+        if (!isEmptyFieldType(field->getFieldType()))
+            return false;
+    }
+    return true;
+}
+
+// Keep DCE's historical field classification independent of the broader payload query.
+static bool isVoidOrEmptyStruct(IRType* type)
+{
+    return as<IRVoidType>(type) || isStructEmpty(type);
+}
+
+bool isStructEmpty(IRType* type)
+{
+    return isStructEmpty(type, isVoidOrEmptyStruct);
+}
+
+bool isEmptyType(IRType* type)
+{
+    if (type->findDecoration<IRTargetIntrinsicDecoration>())
+        return false;
+    if (as<IRVoidType>(type))
+        return true;
+    if (auto arrayType = as<IRArrayTypeBase>(type))
+        return isEmptyType(arrayType->getElementType());
+
+    // Only ordinary structs and arrays recurse. Pointers, resources, and opaque work-graph
+    // record types carry their own representation even when their element type is empty.
+    return isStructEmpty(type, isEmptyType);
+}
+
+bool doesInstOnlyDependOnOperandTypes(IRInst* inst)
+{
+    // Some static type queries take a runtime value and inspect only its static type. Others
+    // compare types directly or query their layout. We enumerate both forms so that value-use
+    // analyses can ignore their operands while conservatively treating every unlisted instruction
+    // as a value use.
+    switch (inst->getOp())
+    {
+    case kIROp_IsBool:
+    case kIROp_IsInt:
+    case kIROp_IsUnsignedInt:
+    case kIROp_IsSignedInt:
+    case kIROp_IsHalf:
+    case kIROp_IsFloat:
+    case kIROp_IsCoopFloat:
+    case kIROp_IsVector:
+    case kIROp_IsBindlessTextureNVEncodable:
+    case kIROp_GetNaturalStride:
+    case kIROp_GetNaturalAlignment:
+    case kIROp_TypeEquals:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool isSingleResourceValueType(IRInst* type)
+{
+    // We first remove attributed and rate wrappers. We then accept exactly the four IR type
+    // families that represent one texture or typed-buffer, sampler, structured-buffer, or
+    // byte-address-buffer value. Pass-specific restrictions on individual members of those
+    // families belong in the caller.
+    type = unwrapAttributedType(type);
+    if (!type)
+        return false;
+    if (as<IRResourceTypeBase>(type))
+        return true;
+    if (as<IRSamplerStateTypeBase>(type))
+        return true;
+    if (as<IRHLSLStructuredBufferTypeBase>(type))
+        return true;
+    return as<IRByteAddressBufferTypeBase>(type) != nullptr;
+}
+
+bool isResourceValueOrArrayTypeSupportedForPerInvocationReplacement(IRInst* type)
+{
+    // Semantic checking admits language types in
+    // `_isResourceTypeSupportedForPerInvocationReplacement` in `slang-check-decl.cpp`. This
+    // predicate recognizes IR types that the replacement pass can carry. Every admitted language
+    // type must lower to a type that satisfies this check after the target's selected resource-
+    // and empty-type legalization passes. Recognizing an IR type here does not make its
+    // corresponding language type legal in a mutable global declaration.
+    //
+    // We strip attributed and rate wrappers at every level because either wrapper may surround an
+    // array or its element. `IRArrayType` identifies a fixed-size array; we reject
+    // `IRUnsizedArrayType` without asking a separate recursive type query to infer that fact.
+    for (;;)
+    {
+        type = unwrapAttributedType(type);
+        if (!type || as<IRUnsizedArrayType>(type))
+            return false;
+
+        if (auto arrayType = as<IRArrayType>(type))
+        {
+            type = arrayType->getOperand(0);
+            continue;
+        }
+
+        break;
+    }
+
+    // The replacement pass creates one local for the whole value in each affected function. A
+    // non-entry-point function with runtime access also receives one generated parameter. We
+    // therefore require a type with one target-independent value. We reject aggregate and
+    // container forms, combined texture-samplers, and append or consume buffers because some
+    // target pipelines split them into several values.
+    if (!isSingleResourceValueType(type))
+        return false;
+
+    if (auto resourceType = as<IRResourceTypeBase>(type))
+        return !resourceType->isCombined();
+
+    switch (type->getOp())
+    {
+    case kIROp_HLSLAppendStructuredBufferType:
+    case kIROp_HLSLConsumeStructuredBufferType:
+        return false;
+    default:
+        return true;
+    }
+}
+
+IRType* getGlobalVarValueType(IRGlobalVar* globalVar)
+{
+    // IR transformations may retain attributes by wrapping the pointer type of a global variable.
+    // After removing those wrappers, the linked representation must contain a concrete pointer and
+    // pointee type. We retain wrappers on the pointee because they remain part of the stored value.
+    auto pointerType = as<IRPtrTypeBase>(unwrapAttributedType(globalVar->IRInst::getDataType()));
+    SLANG_RELEASE_ASSERT(pointerType);
+    auto valueType = as<IRType>(pointerType->getOperand(0));
+    SLANG_RELEASE_ASSERT(valueType);
+    return valueType;
+}
+
+bool isResourceGlobalCandidateForPerInvocationReplacement(IRGlobalVar* globalVar)
+{
+    // AST-to-IR lowering marks file- or namespace-scope mutable `static` variables and mutable
+    // uniform-parameter shadows synthesized for `-Gec`. The marker records those declaration
+    // categories but does not determine their storage rate. We therefore also require the absence
+    // of an explicit rate. For example, `groupshared` storage is shared among threads, and
+    // `actual-global` storage persists across entry-point invocations.
+    if (globalVar->getRate() ||
+        !globalVar->findDecoration<IRFileOrNamespaceScopeMutableVarDecoration>())
+        return false;
+
+    return isResourceValueOrArrayTypeSupportedForPerInvocationReplacement(
+        getGlobalVarValueType(globalVar));
+}
+
+bool isShaderOrCudaKernelEntryPoint(IRFunc* func)
+{
+    return func->findDecoration<IREntryPointDecoration>() != nullptr ||
+           func->findDecoration<IRCudaKernelDecoration>() != nullptr;
+}
+
+bool hasGenericAssemblyImplementation(IRFunc* func)
+{
+    // `IRGenericAsm` is a block terminator whose text supplies emitted target code instead of
+    // ordinary instructions in that block. Translation-unit lowering has already removed
+    // error-handling and `defer` terminators, so no other terminator represents generic assembly.
+    for (auto block : func->getBlocks())
+    {
+        if (as<IRGenericAsm>(block->getTerminator()))
+            return true;
+    }
+    return false;
+}
 
 bool isPointerOfType(IRInst* type, IROp opCode)
 {
@@ -24,6 +205,87 @@ bool isUserPointerType(IRInst* type)
     if (!ptrType)
         return false;
     return ptrType->getAddressSpace() == AddressSpace::UserPointer;
+}
+
+bool isAddressInst(IRInst* inst)
+{
+    switch (inst->getOp())
+    {
+    case kIROp_FieldAddress:
+    case kIROp_GetElementPtr:
+    case kIROp_GetOffsetPtr:
+    case kIROp_RWStructuredBufferGetElementPtr:
+    case kIROp_NodeOutputRecordGetElementPtr:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool doesUserResultTransferStorageAccessFromUse(IRUse* use)
+{
+    // We ask whether a later access through the user's result can transfer to or from storage
+    // supplied by this exact operand use. Every supported transfer operation takes that storage in
+    // operand zero; another operand may instead supply an index, a type, or a stored value.
+    auto user = use->getUser();
+    if (user->getOperandCount() == 0 || user->getOperandUse(0) != use)
+        return false;
+
+    // An address projection derives its result from the storage named by operand zero.
+    if (isAddressInst(user))
+        return true;
+
+    switch (user->getOp())
+    {
+    case kIROp_GetAddress:
+    case kIROp_AssumeAddress:
+        // These operations expose the address represented by operand zero.
+        return true;
+    case kIROp_BitCast:
+    case kIROp_Reinterpret:
+    case kIROp_PtrCast:
+    case kIROp_OutImplicitCast:
+    case kIROp_InOutImplicitCast:
+        // Only the pointer-to-pointer form can transfer access to operand-zero storage. An `inout`
+        // cast transfers reads into its temporary and writes back; an `out` cast transfers only
+        // writes back. This direction-independent predicate accepts either relation. Type
+        // attributes do not change the pointer relation, so we remove them before testing it.
+        return as<IRPtrTypeBase>(unwrapAttributedType(use->get()->getDataType())) != nullptr &&
+               as<IRPtrTypeBase>(unwrapAttributedType(user->getDataType())) != nullptr;
+    default:
+        return false;
+    }
+}
+
+IRInst* findCallArgumentParameterType(IRCall* call, IRUse* argumentUse)
+{
+    // We match the exact operand use rather than its value, because one value may be passed to
+    // multiple parameters with different direction contracts. Operand zero is the callee, and the
+    // remaining operands correspond positionally to the function-type parameters.
+    if (argumentUse == call->getCalleeUse())
+        return nullptr;
+
+    Index argumentIndex = -1;
+    for (UInt i = 0; i < call->getArgCount(); ++i)
+    {
+        if (call->getOperandUse(i + 1) == argumentUse)
+        {
+            argumentIndex = Index(i);
+            break;
+        }
+    }
+    if (argumentIndex < 0)
+        return nullptr;
+
+    // The callee's data type is the signature at this call site. It already contains generic
+    // substitutions and also covers indirect function-valued callees.
+    auto funcType = as<IRFuncType>(call->getCallee()->getDataType());
+    if (!funcType || UInt(argumentIndex) >= funcType->getParamCount())
+        return nullptr;
+    // `IRFuncType::getParamType` assumes that every parameter operand derives from `IRType`.
+    // Generic functions can instead use a type parameter directly as a parameter type. We only
+    // need to inspect direction wrappers, so we retain the more general `IRInst*` representation.
+    return unwrapAttributedType(funcType->getOperand(UInt(argumentIndex) + 1));
 }
 
 IRType* getVectorElementType(IRType* type)
@@ -75,6 +337,11 @@ bool isPointerOfType(IRInst* type, IRInst* elementType)
                isTypeEqual(ptrType->getValueType(), (IRType*)elementType);
     }
     return false;
+}
+
+bool isAnnotation(IRInst* inst)
+{
+    return as<IRAnnotation>(inst);
 }
 
 bool isPtrToClassType(IRInst* type)
@@ -177,6 +444,55 @@ IROp getTypeStyle(BaseType op)
     }
 }
 
+// Split parameter type into a direction and a type
+std::tuple<ParameterDirectionInfo, IRType*> splitParameterDirectionAndType(IRType* paramType)
+{
+    if (as<IROutParamType>(paramType))
+        return {
+            ParameterDirectionInfo(ParameterDirectionInfo::Kind::Out),
+            as<IROutParamType>(paramType)->getValueType()};
+    else if (as<IRBorrowInOutParamType>(paramType))
+        return {
+            ParameterDirectionInfo(ParameterDirectionInfo::Kind::BorrowInOut),
+            as<IRBorrowInOutParamType>(paramType)->getValueType()};
+    else if (auto refParamType = as<IRRefParamType>(paramType))
+    {
+        ParameterDirectionInfo info(
+            ParameterDirectionInfo::Kind::Ref,
+            refParamType->getAddressSpace());
+        info.accessQualifier = refParamType->getAccessQualifier();
+        return {info, refParamType->getValueType()};
+    }
+    else if (as<IRBorrowInParamType>(paramType))
+        return {
+            ParameterDirectionInfo(
+                ParameterDirectionInfo::Kind::BorrowIn,
+                as<IRBorrowInParamType>(paramType)->getAddressSpace()),
+            as<IRBorrowInParamType>(paramType)->getValueType()};
+    else
+        return {ParameterDirectionInfo(ParameterDirectionInfo::Kind::In), paramType};
+}
+
+// Join parameter direction and a type back into a parameter type
+IRType* fromDirectionAndType(IRBuilder* builder, ParameterDirectionInfo info, IRType* type)
+{
+    switch (info.kind)
+    {
+    case ParameterDirectionInfo::Kind::In:
+        return type;
+    case ParameterDirectionInfo::Kind::Out:
+        return builder->getOutParamType(type);
+    case ParameterDirectionInfo::Kind::BorrowInOut:
+        return builder->getBorrowInOutParamType(type);
+    case ParameterDirectionInfo::Kind::BorrowIn:
+        return builder->getBorrowInParamType(type, info.addressSpace);
+    case ParameterDirectionInfo::Kind::Ref:
+        return builder->getRefParamType(type, info.accessQualifier, info.addressSpace);
+    default:
+        SLANG_UNEXPECTED("Unhandled parameter info in fromDirectionAndType");
+    }
+}
+
 IRInst* specializeWithGeneric(
     IRBuilder& builder,
     IRInst* genericToSpecialize,
@@ -246,8 +562,8 @@ bool isValueType(IRInst* dataType)
     case kIROp_TupleType:
     case kIROp_ResultType:
     case kIROp_OptionalType:
+    case kIROp_ConditionalType:
     case kIROp_DifferentialPairType:
-    case kIROp_DifferentialPairUserCodeType:
     case kIROp_DynamicType:
     case kIROp_AnyValueType:
     case kIROp_ArrayType:
@@ -255,6 +571,11 @@ bool isValueType(IRInst* dataType)
     case kIROp_RaytracingAccelerationStructureType:
     case kIROp_GLSLAtomicUintType:
     case kIROp_EnumType:
+    // Work-graph input records are immutable payload views, so treat them as values.
+    case kIROp_DispatchNodeInputRecordType:
+    case kIROp_ThreadNodeInputRecordType:
+    case kIROp_GroupNodeInputRecordsType:
+    case kIROp_EmptyNodeInputType:
         return true;
     default:
         // Read-only resource handles are considered as Value type.
@@ -346,6 +667,7 @@ bool isWrapperType(IRInst* inst)
     case kIROp_HLSLConsumeStructuredBufferType:
     case kIROp_TupleType:
     case kIROp_OptionalType:
+    case kIROp_ConditionalType:
     case kIROp_TypePack:
         return true;
     default:
@@ -404,6 +726,17 @@ IRInst* hoistValueFromGeneric(
             subOutSpecialized,
             false);
         newGeneric->setFullType((IRType*)genericFuncType);
+    }
+    else if (newResultVal->getOp() == kIROp_WitnessTable)
+    {
+        IRBuilder subBuilder = builder;
+        IRInst* subOutSpecialized = nullptr;
+        auto genericWitnessTableType = hoistValueFromGeneric(
+            subBuilder,
+            newResultVal->getFullType(),
+            subOutSpecialized,
+            false);
+        newGeneric->setFullType((IRType*)genericWitnessTableType);
     }
     else
     {
@@ -763,6 +1096,80 @@ void getTypeNameHint(StringBuilder& sb, IRInst* type)
     case kIROp_TextureFootprintType:
         sb << "TextureFootprint";
         break;
+    // The following opaque builtin types carry no name-hint/linkage decoration, and their operands
+    // form the type's identity. Each case renders the surface name plus those operands, so
+    // consumers (chiefly SPIR-V debug info) get a real name instead of the empty hint that would
+    // collapse distinct instantiations into the literal "unnamed".
+    case kIROp_DescriptorHandleType:
+        sb << "DescriptorHandle<";
+        getTypeNameHint(sb, as<IRDescriptorHandleType>(type)->getResourceType());
+        sb << ">";
+        break;
+    case kIROp_RayQueryType:
+        // The first operand is the ray-flags value (RayQueryType has min_operands == 1, so
+        // getOperand(0) is in bounds); include it so `RayQuery<flags>` instantiations that differ
+        // only in flags get distinct names.
+        sb << "RayQuery<";
+        getTypeNameHint(sb, type->getOperand(0));
+        sb << ">";
+        break;
+    case kIROp_CoopVectorType:
+        sb << "CoopVec<";
+        getTypeNameHint(sb, as<IRCoopVectorType>(type)->getElementType());
+        sb << ",";
+        getTypeNameHint(sb, as<IRCoopVectorType>(type)->getElementCount());
+        sb << ">";
+        break;
+    case kIROp_CoopMatrixType:
+        {
+            // Include every operand (scope and use as well as element/shape): each is part of the
+            // cooperative-matrix type identity, so omitting any would collide distinct types.
+            auto coopMat = as<IRCoopMatrixType>(type);
+            sb << "CoopMat<";
+            getTypeNameHint(sb, coopMat->getElementType());
+            sb << ",";
+            getTypeNameHint(sb, coopMat->getScope());
+            sb << ",";
+            getTypeNameHint(sb, coopMat->getRowCount());
+            sb << ",";
+            getTypeNameHint(sb, coopMat->getColumnCount());
+            sb << ",";
+            getTypeNameHint(sb, coopMat->getMatrixUse());
+            sb << ">";
+        }
+        break;
+    case kIROp_TensorAddressingTensorLayoutType:
+        {
+            auto tensorLayout = as<IRTensorAddressingTensorLayoutType>(type);
+            sb << "TensorLayout<";
+            getTypeNameHint(sb, tensorLayout->getDimension());
+            sb << ",";
+            getTypeNameHint(sb, tensorLayout->getClampMode());
+            sb << ">";
+        }
+        break;
+    case kIROp_TensorAddressingTensorViewType:
+        {
+            // Operands are [dimension, hasDimension, permutation...]; the two leading operands are
+            // rendered by name, so the remaining `getOperandCount() - 2` are the permutation. Only
+            // the first `dimension`-many permutation entries are meaningful; trailing slots are the
+            // sentinel 255 (padding that the OpTypeTensorViewNV writer in the SPIR-V emitter
+            // ignores). This function deliberately renders every slot so the name stays a faithful,
+            // collision-free function of the full operand list.
+            auto tensorView = as<IRTensorAddressingTensorViewType>(type);
+            sb << "TensorView<";
+            getTypeNameHint(sb, tensorView->getDimension());
+            sb << ",";
+            getTypeNameHint(sb, tensorView->getHasDimension());
+            UInt permutationCount = tensorView->getOperandCount() - 2;
+            for (UInt i = 0; i < permutationCount; i++)
+            {
+                sb << ",";
+                getTypeNameHint(sb, tensorView->getPermutation((int)i));
+            }
+            sb << ">";
+        }
+        break;
     case kIROp_Specialize:
         {
             auto specialize = as<IRSpecialize>(type);
@@ -857,6 +1264,7 @@ IRInst* getRootAddr(IRInst* addr)
         {
         case kIROp_GetElementPtr:
         case kIROp_FieldAddress:
+        case kIROp_NodeOutputRecordGetElementPtr:
             addr = addr->getOperand(0);
             continue;
         default:
@@ -867,7 +1275,16 @@ IRInst* getRootAddr(IRInst* addr)
     return addr;
 }
 
-IRInst* getRootAddr(IRInst* addr, List<IRInst*>& outAccessChain, List<IRInst*>* outTypes)
+// Walk `addr` to its root, appending each access-chain key LEAF-FIRST. Shared by
+// the public `getRootAddr` (which reverses afterwards, so callers see root-first)
+// and by `canAddressesPotentiallyAlias`, which indexes from the end instead so it
+// can keep its chains on the stack. Templated on the list type for exactly that
+// reason -- one walker means the two cannot drift apart.
+template<typename TChainList, typename TTypeList>
+static IRInst* _collectAccessChainLeafFirst(
+    IRInst* addr,
+    TChainList& outAccessChain,
+    TTypeList* outTypes)
 {
     for (;;)
     {
@@ -875,6 +1292,7 @@ IRInst* getRootAddr(IRInst* addr, List<IRInst*>& outAccessChain, List<IRInst*>* 
         {
         case kIROp_GetElementPtr:
         case kIROp_FieldAddress:
+        case kIROp_NodeOutputRecordGetElementPtr:
             outAccessChain.add(addr->getOperand(1));
             if (outTypes)
                 outTypes->add(addr->getFullType());
@@ -885,10 +1303,27 @@ IRInst* getRootAddr(IRInst* addr, List<IRInst*>& outAccessChain, List<IRInst*>* 
         }
         break;
     }
+    return addr;
+}
+
+// Overload for callers that want the chain but not the types. It exists so the
+// common case needs no explicit template arguments: passing `nullptr` for
+// `outTypes` cannot deduce `TTypeList` (its type is `std::nullptr_t`), which
+// would otherwise force every call site to spell out both parameters, the
+// second of them naming the type of a list that is never written.
+template<typename TChainList>
+static IRInst* _collectAccessChainLeafFirst(IRInst* addr, TChainList& outAccessChain)
+{
+    return _collectAccessChainLeafFirst<TChainList, List<IRInst*>>(addr, outAccessChain, nullptr);
+}
+
+IRInst* getRootAddr(IRInst* addr, List<IRInst*>& outAccessChain, List<IRInst*>* outTypes)
+{
+    auto root = _collectAccessChainLeafFirst(addr, outAccessChain, outTypes);
     outAccessChain.reverse();
     if (outTypes)
         outTypes->reverse();
-    return addr;
+    return root;
 }
 
 
@@ -1095,8 +1530,17 @@ bool canAddressesPotentiallyAlias(
     // then they cannot alias.
     if (root1 == root2)
     {
-        List<IRInst*> accessChain1;
-        List<IRInst*> accessChain2;
+        // Stack-allocated, and collected leaf-first so no reverse is needed: the
+        // loop below indexes from the end instead. This branch is the hot one
+        // whenever a target flattens shader parameters into one aggregate
+        // (Metal, and the CPU-like targets), because then every address in the
+        // function shares a root and lands here -- at which point two heap
+        // allocations per query, once per (address, instruction) scan step, are
+        // most of what the surrounding pass does. 8 is generous headroom for the access-chain
+        // depths seen in practice, not a hard limit -- nesting is user-controlled and unbounded,
+        // so deeper chains still work, they just spill to the heap as before.
+        ShortList<IRInst*, 8> accessChain1;
+        ShortList<IRInst*, 8> accessChain2;
 
         // Since getRootBufferOrAddr has a different behavior around
         // RWStructuredBufferGetElementPtr compared to getRootAddr,
@@ -1104,14 +1548,18 @@ bool canAddressesPotentiallyAlias(
         // that we can handle here, so that we don't need to handle the nuance
         // of whether or not to trace past any RWStructuredBufferGetElementPtr.
         //
-        root1 = getRootAddr(addr1, accessChain1, nullptr);
-        root2 = getRootAddr(addr2, accessChain2, nullptr);
+        root1 = _collectAccessChainLeafFirst(addr1, accessChain1);
+        root2 = _collectAccessChainLeafFirst(addr2, accessChain2);
         if (root1 != root2)
             return true;
-        for (Index i = 0; i < Math::Min(accessChain1.getCount(), accessChain2.getCount()); i++)
+        const Index count1 = accessChain1.getCount();
+        const Index count2 = accessChain2.getCount();
+        for (Index i = 0; i < Math::Min(count1, count2); i++)
         {
-            auto node1 = accessChain1[i];
-            auto node2 = accessChain2[i];
+            // Indices run root-first, as they did when both chains were reversed
+            // into root-first `List`s; these are leaf-first, so walk from the end.
+            auto node1 = accessChain1[count1 - 1 - i];
+            auto node2 = accessChain2[count2 - 1 - i];
             if (as<IRStructKey>(node1) && as<IRStructKey>(node2))
             {
                 // Two different field keys means the two addresses cannot alias.
@@ -1161,12 +1609,23 @@ bool isPtrLikeOrHandleType(IRInst* type)
     case kIROp_RefParamType:
     case kIROp_BorrowInParamType:
     case kIROp_GLSLShaderStorageBufferType:
+    // Work-graph output records are mutable handles, so treat them as pointer-like.
+    case kIROp_ThreadNodeOutputRecordsType:
+    case kIROp_GroupNodeOutputRecordsType:
+    case kIROp_NodeOutputType:
+    case kIROp_NodeOutputArrayType:
+    case kIROp_EmptyNodeOutputType:
+    case kIROp_EmptyNodeOutputArrayType:
         return true;
     }
     return false;
 }
 
-bool canInstHaveSideEffectAtAddress(IRGlobalValueWithCode* func, IRInst* inst, IRInst* addr)
+bool canInstHaveSideEffectAtAddress(
+    IRGlobalValueWithCode* func,
+    IRInst* inst,
+    IRInst* addr,
+    Dictionary<IRInst*, bool>* calleeSideEffectCache)
 {
     switch (inst->getOp())
     {
@@ -1189,7 +1648,7 @@ bool canInstHaveSideEffectAtAddress(IRGlobalValueWithCode* func, IRInst* inst, I
             if (!isChildInstOf(getRootAddr(addr), func))
             {
                 auto callee = call->getCallee();
-                if (callee && !doesCalleeHaveSideEffect(callee))
+                if (callee && !doesCalleeHaveSideEffect(callee, calleeSideEffectCache))
                 {
                     // An exception is if the callee is side-effect free and is not reading from
                     // memory.
@@ -1253,6 +1712,12 @@ bool canInstHaveSideEffectAtAddress(IRGlobalValueWithCode* func, IRInst* inst, I
             }
         }
         break;
+    case kIROp_RequireTargetExtension:
+        // A target-extension requirement is consumed only when code is emitted and neither reads
+        // nor writes memory, so loads and stores can be forwarded across it. It still reports a
+        // side effect through `mightHaveSideEffects`, which is what keeps the otherwise unused
+        // requirement alive through DCE.
+        break;
     default:
         // Default behavior is that any insts that have side effect may affect `addr`.
         if (inst->mightHaveSideEffects())
@@ -1262,26 +1727,10 @@ bool canInstHaveSideEffectAtAddress(IRGlobalValueWithCode* func, IRInst* inst, I
     return false;
 }
 
-IRInst* getUnitPoisonVal(IRBuilder builder, IRModule* module)
+IRInst* getUnitPoisonVal(IRBuilder* builder)
 {
-    IRInst* undefInst = nullptr;
-
-    for (auto inst : module->getModuleInst()->getChildren())
-    {
-        if (inst->getOp() == kIROp_Poison && inst->getDataType() &&
-            inst->getDataType()->getOp() == kIROp_VoidType)
-        {
-            undefInst = inst;
-            break;
-        }
-    }
-    if (!undefInst)
-    {
-        auto voidType = builder.getVoidType();
-        builder.setInsertAfter(voidType);
-        undefInst = builder.emitPoison(voidType);
-    }
-    return undefInst;
+    builder->setInsertInto(builder->getModule()->getModuleInst());
+    return builder->getPoison(builder->getVoidType());
 }
 
 IROp getSwapSideComparisonOp(IROp op)
@@ -1413,6 +1862,8 @@ IRInst* tryFindBasePtr(IRInst* inst, IRInst* parentFunc)
         return tryFindBasePtr(as<IRGetElementPtr>(inst)->getBase(), parentFunc);
     case kIROp_FieldAddress:
         return tryFindBasePtr(as<IRFieldAddress>(inst)->getBase(), parentFunc);
+    case kIROp_NodeOutputRecordGetElementPtr:
+        return tryFindBasePtr(inst->getOperand(0), parentFunc);
     default:
         return nullptr;
     }
@@ -1541,7 +1992,8 @@ bool areCallArgumentsSideEffectFree(IRCall* call, SideEffectAnalysisOptions opti
         }
         else
         {
-            if (param && param->findDecoration<IRIgnoreSideEffectsDecoration>())
+            if (param && !as<IROutParamType>(param->getDataType()) &&
+                param->findDecoration<IRIgnoreSideEffectsDecoration>())
                 continue;
 
             return false;
@@ -1560,9 +2012,12 @@ bool isPureFunctionalCall(IRCall* call, SideEffectAnalysisOptions options)
     return false;
 }
 
-bool isSideEffectFreeFunctionalCall(IRCall* call, SideEffectAnalysisOptions options)
+bool isSideEffectFreeFunctionalCall(
+    IRCall* call,
+    SideEffectAnalysisOptions options,
+    Dictionary<IRInst*, bool>* calleeSideEffectCache)
 {
-    if (!doesCalleeHaveSideEffect(call->getCallee()))
+    if (!doesCalleeHaveSideEffect(call->getCallee(), calleeSideEffectCache))
     {
         return areCallArgumentsSideEffectFree(call, options);
     }
@@ -1573,74 +2028,44 @@ bool isSideEffectFreeFunctionalCall(IRCall* call, SideEffectAnalysisOptions opti
 // that might be used by a pass (e.g. auto-diff)
 //
 template<typename TFunc>
-void forEachAssociatedFunction(IRInst* func, TFunc callback)
+void forEachAssociatedCallee(IRInst* callee, TFunc callback)
 {
-    // Resolve the function to get all its decorations
-    auto resolvedFunc = getResolvedInstForDecorations(func);
-    if (!resolvedFunc)
-        return;
-
-    // We'll scan for appropriate decorations and return
-    // the function references.
+    // PRECONDITION: `callback` must not add or remove uses of `callee`. This
+    // walks the use list live, so mutating it invalidates `use->nextUse` under
+    // the iteration. `traverseUsers` snapshots into a `List<IRUse*>` precisely
+    // to tolerate that, and this does not -- because the snapshot costs a heap
+    // allocation and a full copy on every query, and on a hot intrinsic the use
+    // list holds one entry per call site. Callers that memoize the enclosing
+    // query pay that once per callee; the uncached ones that remain
+    // (slang-ir-simplify-for-emit.cpp, the autodiff passes) pay it per query.
     //
-    // TODO: In the future, as we get more function transformation
-    // passes, we might want to create a parent class for such
-    // decorations that associate functions with each other.
+    // A mutating callback belongs on `traverseUsers`, not here.
     //
-    for (auto decor : resolvedFunc->getDecorations())
+    // The precondition isn't otherwise enforced, so a future mutating callback would silently
+    // walk a freed `use->nextUse`. Re-check `firstUse` after every callback invocation to turn
+    // the most common violation -- a use added or removed at the head of the list -- into a
+    // debug-build `SLANG_ASSERT` instead of a silent use-after-free. Release builds have no
+    // guard at all (`SLANG_ASSERT` compiles out); the precondition is a hard requirement there,
+    // not just in debug. This also doesn't catch every possible mutation (e.g. one that leaves
+    // `firstUse` unchanged but frees a later use) -- it's a cheap debug-build guard rail for the
+    // shape a mutating callback is most likely to produce, not a substitute for the precondition.
+    for (auto use = callee->firstUse; use; use = use->nextUse)
     {
-        switch (decor->getOp())
+        if (use->usedValue != callee)
+            continue;
+        auto annotation = as<IRAnnotation>(use->getUser());
+        if (annotation && annotation->getTarget() == callee)
         {
-        case kIROp_UserDefinedBackwardDerivativeDecoration:
-            if (as<IRUserDefinedBackwardDerivativeDecoration>(decor))
-            {
-                auto associatedCallee = as<IRUserDefinedBackwardDerivativeDecoration>(decor)
-                                            ->getBackwardDerivativeFunc();
-                callback(associatedCallee);
-            }
-            break;
-
-        case kIROp_ForwardDerivativeDecoration:
-            if (as<IRForwardDerivativeDecoration>(decor))
-            {
-                auto associatedCallee =
-                    as<IRForwardDerivativeDecoration>(decor)->getForwardDerivativeFunc();
-                callback(associatedCallee);
-            }
-            break;
-
-        case kIROp_PrimalSubstituteDecoration:
-            if (as<IRPrimalSubstituteDecoration>(decor))
-            {
-                auto associatedCallee =
-                    as<IRPrimalSubstituteDecoration>(decor)->getPrimalSubstituteFunc();
-                callback(associatedCallee);
-            }
-            break;
-
-        default:
-            break;
+            auto expectedFirstUse = callee->firstUse;
+            callback(annotation->getInst());
+            SLANG_ASSERT(callee->firstUse == expectedFirstUse);
         }
     }
 }
 
 bool doesCalleeHaveSideEffect(IRInst* callee)
 {
-    bool sideEffect = true;
-
-    for (auto decor : getResolvedInstForDecorations(callee)->getDecorations())
-    {
-        switch (decor->getOp())
-        {
-        case kIROp_NoSideEffectDecoration:
-        case kIROp_ReadNoneDecoration:
-        case kIROp_IgnoreSideEffectsDecoration:
-            sideEffect = false;
-            break;
-        default:
-            break;
-        }
-    }
+    bool sideEffect = !isNoSideEffectCallee(callee);
 
     // If the callee has no side effect, check if any of its associated functions have side
     // effect. If so, we want to keep the callee around.
@@ -1648,17 +2073,34 @@ bool doesCalleeHaveSideEffect(IRInst* callee)
     // Typically, once the relevant pass has completed, the association is removed,
     // and at that point we can remove the function.
     //
+    // TODO: We can narrow this check down a bit.. this check is only really
+    // needed if the parent function that is performing the call is an operand
+    // of a translate inst (i.e. IRTranslateBase/IRTranslatedTypeBase)
+    //
     if (!sideEffect)
     {
-        forEachAssociatedFunction(
+        forEachAssociatedCallee(
             callee,
             [&](IRInst* associatedCallee)
             {
-                sideEffect |= doesCalleeHaveSideEffect(associatedCallee);
+                sideEffect |= !isNoSideEffectCallee(associatedCallee);
                 return;
             });
     }
 
+    return sideEffect;
+}
+
+bool doesCalleeHaveSideEffect(IRInst* callee, Dictionary<IRInst*, bool>* cache)
+{
+    if (!cache)
+        return doesCalleeHaveSideEffect(callee);
+
+    if (auto cached = cache->tryGetValue(callee))
+        return *cached;
+
+    const bool sideEffect = doesCalleeHaveSideEffect(callee);
+    cache->add(callee, sideEffect);
     return sideEffect;
 }
 
@@ -1677,6 +2119,12 @@ IRInst* findInterfaceRequirement(IRInterfaceType* type, IRInst* key)
 
 IRInst* findWitnessTableEntry(IRWitnessTable* table, IRInst* key)
 {
+    if (table->getConformanceType()->getOp() == kIROp_VoidType)
+    {
+        IRBuilder builder(table->getModule());
+        return builder.getVoidValue();
+    }
+
     for (auto entry : table->getEntries())
     {
         if (entry->getRequirementKey() == key)
@@ -1709,7 +2157,7 @@ IRInst* getInstInBlock(IRInst* inst)
 {
     SLANG_RELEASE_ASSERT(inst);
 
-    if (const auto block = as<IRBlock>(inst->getParent()))
+    if (const auto block = as<IRBlock>(inst->getParent()); block)
         return inst;
 
     return getInstInBlock(inst->getParent());
@@ -1917,19 +2365,6 @@ void initializeScratchData(IRInst* inst)
     }
 }
 
-void resetScratchDataBit(IRInst* inst, int bitIndex)
-{
-    List<IRInst*> workList;
-    workList.add(inst);
-    while (workList.getCount() != 0)
-    {
-        auto item = workList.getLast();
-        workList.removeLast();
-        item->scratchData &= ~(1ULL << bitIndex);
-        for (auto child = item->getLastDecorationOrChild(); child; child = child->getPrevInst())
-            workList.add(child);
-    }
-}
 
 ///
 /// IRBlock related common helper methods
@@ -2144,8 +2579,20 @@ UnownedStringSlice getBuiltinFuncName(IRInst* callee)
         return UnownedStringSlice::fromLiteral("IDifferentiable");
     case KnownBuiltinDeclName::IDifferentiablePtr:
         return UnownedStringSlice::fromLiteral("IDifferentiablePtr");
+    case KnownBuiltinDeclName::IForwardDifferentiable:
+        return UnownedStringSlice::fromLiteral("IForwardDifferentiable");
+    case KnownBuiltinDeclName::IBackwardDifferentiable:
+        return UnownedStringSlice::fromLiteral("IBackwardDifferentiable");
+    case KnownBuiltinDeclName::IBwdCallable:
+        return UnownedStringSlice::fromLiteral("IBwdCallable");
     case KnownBuiltinDeclName::NullDifferential:
         return UnownedStringSlice::fromLiteral("NullDifferential");
+    case KnownBuiltinDeclName::OperatorAddressOf:
+        return UnownedStringSlice::fromLiteral("OperatorAddressOf");
+    case KnownBuiltinDeclName::WaveIsFirstLane:
+        return UnownedStringSlice::fromLiteral("WaveIsFirstLane");
+    case KnownBuiltinDeclName::WaveReadLaneFirst:
+        return UnownedStringSlice::fromLiteral("WaveReadLaneFirst");
     default:
         return UnownedStringSlice();
     }
@@ -2395,6 +2842,39 @@ IRType* dropNormAttributes(IRType* const t)
     return t;
 }
 
+DerivativeGroupMode inferDerivativeGroupMode(IRFunc* entryPoint)
+{
+    if (auto decoration = entryPoint->findDecoration<IRDerivativeGroupDecoration>())
+        return decoration->getMode();
+
+    if (auto numThreads = entryPoint->findDecoration<IRNumThreadsDecoration>())
+    {
+        // Y selects the default grouping; the full thread-group shape is validated separately.
+        // Only inspect a literal Y; a specialization constant's default can be overridden.
+        if (auto y = numThreads->getY())
+            return y->getValue() == 1 ? DerivativeGroupMode::Linear : DerivativeGroupMode::Quad;
+    }
+    return DerivativeGroupMode::Quad;
+}
+
+/// Gets a literal thread count, unwrapping a specialization constant's default when needed.
+static IRIntLit* _getDefaultThreadCount(IRInst* threadCount)
+{
+    if (auto intLit = as<IRIntLit>(threadCount))
+        return intLit;
+
+    auto globalParam = as<IRGlobalParam>(threadCount);
+    auto defaultValueDecor =
+        globalParam ? globalParam->findDecoration<IRDefaultValueDecoration>() : nullptr;
+    if (defaultValueDecor)
+        if (auto defaultIntLit = as<IRIntLit>(defaultValueDecor->getOperand(0)))
+            return defaultIntLit;
+
+    IRBuilder builder(globalParam ? (IRInst*)globalParam : threadCount);
+    return cast<IRIntLit>(
+        builder.getIntValue(globalParam ? globalParam->getDataType() : builder.getIntType(), 1));
+}
+
 void verifyComputeDerivativeGroupModifiers(
     DiagnosticSink* sink,
     SourceLoc errorLoc,
@@ -2411,15 +2891,9 @@ void verifyComputeDerivativeGroupModifiers(
             Diagnostics::OnlyOneOfDerivativeGroupLinearOrQuadCanBeSet{.location = errorLoc});
     }
 
-    IRIntegerValue x = 1;
-    IRIntegerValue y = 1;
-    IRIntegerValue z = 1;
-    if (numThreadsDecor->getX())
-        x = numThreadsDecor->getX()->getValue();
-    if (numThreadsDecor->getY())
-        y = numThreadsDecor->getY()->getValue();
-    if (numThreadsDecor->getZ())
-        z = numThreadsDecor->getZ()->getValue();
+    IRIntegerValue x = _getDefaultThreadCount(numThreadsDecor->getOperand(0))->getValue();
+    IRIntegerValue y = _getDefaultThreadCount(numThreadsDecor->getOperand(1))->getValue();
+    IRIntegerValue z = _getDefaultThreadCount(numThreadsDecor->getOperand(2))->getValue();
 
     if (quadAttr)
     {
@@ -2458,6 +2932,10 @@ IRType* getElementType(IRBuilder& builder, IRType* valueType)
     else if (auto vectorType = as<IRVectorType>(valueType))
     {
         return vectorType->getElementType();
+    }
+    else if (auto packedVectorType = as<IRMetalPackedVectorType>(valueType))
+    {
+        return packedVectorType->getElementType();
     }
     else if (auto basicType = as<IRBasicType>(valueType))
     {
@@ -2557,8 +3035,8 @@ bool canInstBeStored(IRInst* inst)
     // stored into variables or context structs as normal values.
     //
     if (as<IRTypeType>(inst->getDataType()) || as<IRWitnessTableType>(inst->getDataType()) ||
-        as<IRTypeKind>(inst->getDataType()) || as<IRFuncType>(inst->getDataType()) ||
-        !inst->getDataType())
+        as<IRTypeKind>(inst->getDataType()) || as<IRGenericKind>(inst->getDataType()) ||
+        as<IRFuncType>(inst->getDataType()) || !inst->getDataType())
         return false;
 
     return true;
@@ -2667,7 +3145,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                 // instead of before the `if`. This situation can occur in the IR if
                 // the original code is lowered from a `do-while` loop.
                 //
-                bool shouldInitializeVar = false;
                 if (loopHeaderBlockMap.containsKey(commonDominator))
                 {
                     bool shouldMoveToHeader = false;
@@ -2688,7 +3165,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                     if (shouldMoveToHeader)
                     {
                         commonDominator = loopHeaderBlockMap[commonDominator];
-                        shouldInitializeVar = true;
                     }
                 }
 
@@ -2699,16 +3175,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                     // common dominator.
                     if (var->getParent() != commonDominator)
                         var->insertBefore(commonDominator->getTerminator());
-
-                    if (shouldInitializeVar)
-                    {
-                        IRBuilder builder(func);
-                        builder.setInsertAfter(var);
-                        builder.emitStore(
-                            var,
-                            builder.emitDefaultConstruct(
-                                as<IRPtrTypeBase>(var->getDataType())->getValueType()));
-                    }
                 }
                 else if (shouldDuplicateInstAtUseSite(inst, target))
                 {
@@ -2754,8 +3220,6 @@ void legalizeDefUse(IRGlobalValueWithCode* func, TargetProgram* target)
                     IRBuilder builder(func);
                     builder.setInsertBefore(commonDominator->getTerminator());
                     IRVar* tempVar = builder.emitVar(inst->getFullType());
-                    auto defaultVal = builder.emitDefaultConstruct(inst->getFullType());
-                    builder.emitStore(tempVar, defaultVal);
 
                     traverseUses(
                         inst,
@@ -2828,6 +3292,27 @@ IRType* maybeAddRateType(IRBuilder* builder, IRType* rateQulifiedType, IRType* o
     return oldType;
 }
 
+// Ensures `type` carries a SpecConst rate.
+// If the type already has a different rate (e.g. ConstExpr from a `static const`
+// expression whose operands are specialization constants), the existing rate is
+// replaced, as a value that depends on a spec-const is only known at pipeline
+// creation time, so `ConstExpr` (compile-time) would be incorrect.
+//
+IRType* ensureSpecConstRate(IRBuilder* builder, IRType* type)
+{
+    if (isSpecConstRateType(type))
+        return type;
+
+    // Strip any existing rate (e.g. ConstExpr) to avoid double-wrapping,
+    // since getRateQualifiedType does not unwrap for us.
+    if (auto rateQualified = as<IRRateQualifiedType>(type))
+        return builder->getRateQualifiedType(
+            builder->getSpecConstRate(),
+            rateQualified->getValueType());
+
+    return builder->getRateQualifiedType(builder->getSpecConstRate(), type);
+}
+
 bool canOperationBeSpecConst(IROp op, IRType* resultType, IRInst* const* fixedArgs, IRUse* operands)
 {
     // Returns true for ops that can be declared as an operation under `OpSpecConstantOp`.
@@ -2888,18 +3373,44 @@ bool canOperationBeSpecConst(IROp op, IRType* resultType, IRInst* const* fixedAr
     }
 }
 
-bool isSpecConstOpHoistable(IROp op, IRType* type, IRInst* const* fixedArgs)
+bool shouldHaveSpecConstRate(
+    IROp op,
+    IRType* resultType,
+    UInt operandCount,
+    IRInst* const* operands)
 {
-    auto rateType = as<IRRateQualifiedType>(type);
-    return rateType && as<IRSpecConstRate>(rateType->getRate()) &&
-           canOperationBeSpecConst(op, rateType->getValueType(), fixedArgs, nullptr);
+    if (operandCount == 0)
+        return false;
+
+    // Unwrap any rate qualification so canOperationBeSpecConst sees the bare
+    // value type. isFloatingType checks as<IRBasicType> which doesn't match
+    // rate-qualified types like @ConstExpr float, so without unwrapping we
+    // would incorrectly allow float arithmetic as `OpSpecConstantOp`.
+    IRType* valueType = resultType;
+    if (auto rateQualifiedType = as<IRRateQualifiedType>(resultType))
+        valueType = rateQualifiedType->getValueType();
+
+    if (!canOperationBeSpecConst(op, valueType, operands, nullptr))
+        return false;
+
+    // An instruction whose result carries a spec-const rate is hoisted and
+    // emitted as OpSpecConstantOp for SPIR-V. That is only valid when
+    // every operand is itself a specialization constant or a plain
+    // constant. Mixing in a runtime value would produce invalid SPIR-V.
+    bool hasSpecConstOperand = false;
+    for (UInt ii = 0; ii < operandCount; ++ii)
+    {
+        if (isSpecConstRateType(operands[ii]->getFullType()))
+            hasSpecConstOperand = true;
+        else if (!as<IRConstant>(operands[ii]))
+            return false;
+    }
+    return hasSpecConstOperand;
 }
 
-
-bool isInstHoistable(IROp op, IRType* type, IRInst* const* fixedArgs)
+bool isInstHoistable(IROp op)
 {
-    return (getIROpInfo(op).flags & kIROpFlag_Hoistable) ||
-           isSpecConstOpHoistable(op, type, fixedArgs);
+    return (getIROpInfo(op).flags & kIROpFlag_Hoistable);
 }
 
 IRType* getUnsignedTypeFromSignedType(IRBuilder* builder, IRType* type)
@@ -2983,8 +3494,112 @@ bool isIROpaqueType(IRType* type)
     }
 }
 
+IRInst* peelAddressForwardingOps(IRInst* addr)
+{
+    for (;;)
+    {
+        switch (addr->getOp())
+        {
+        case kIROp_FieldAddress:
+        case kIROp_GetElementPtr:
+        case kIROp_GetOffsetPtr:
+        case kIROp_BitCast:
+        case kIROp_Reinterpret:
+        case kIROp_PtrCast:
+            addr = addr->getOperand(0);
+            continue;
+        default:
+            return addr;
+        }
+    }
+}
+
+bool isDebugInfoInst(IRInst* inst)
+{
+    // Debug instructions describe source locations, variables, and scopes rather than executing at
+    // runtime. This classification lets an analysis ignore them when they do not affect the
+    // question it answers. An optimization must still preserve required debug information.
+    switch (inst->getOp())
+    {
+    case kIROp_DebugValue:
+    case kIROp_DebugVar:
+    case kIROp_DebugLine:
+    case kIROp_DebugLocationDecoration:
+    case kIROp_DebugFuncDecoration:
+    case kIROp_DebugSource:
+    case kIROp_DebugInlinedAt:
+    case kIROp_DebugInlinedVariable:
+    case kIROp_DebugScope:
+    case kIROp_DebugNoScope:
+    case kIROp_DebugFunction:
+    case kIROp_DebugLexicalBlock:
+    case kIROp_DebugBuildIdentifier:
+    case kIROp_DebugCompilationUnit:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool doesOpReadResourceContents(IROp op)
+{
+    // These dedicated operations produce results that depend on resource contents. A resource
+    // method represented as an `IRCall` is classified through its callee instead. Operations that
+    // only query resource dimensions or other metadata do not read the contents.
+    switch (op)
+    {
+    case kIROp_ImageGatherOffset:
+    case kIROp_ImageLoad:
+    case kIROp_Sample:
+    case kIROp_SampleGrad:
+    case kIROp_StructuredBufferLoad:
+    case kIROp_ByteAddressBufferLoad:
+    case kIROp_StructuredBufferLoadStatus:
+    case kIROp_RWStructuredBufferLoad:
+    case kIROp_RWStructuredBufferLoadStatus:
+    case kIROp_StructuredBufferConsume:
+    case kIROp_SubpassLoad:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool doesOpProduceResourceContentAddress(IROp op)
+{
+    // These operations create an address whose storage belongs to a resource. Analyses should
+    // classify them as resource-content roots before applying the general rule that follows operand
+    // zero through other address projections and pointer casts.
+    switch (op)
+    {
+    case kIROp_GetStructuredBufferPtr:
+    case kIROp_GetUntypedBufferPtr:
+    case kIROp_RWStructuredBufferGetElementPtr:
+    case kIROp_ImageSubscript:
+    case kIROp_ImageTexelPointer:
+    case kIROp_SPIRVLoadTexelPointerFromHeap:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// True if `addr`'s chain bottoms out at `GetOptiXSbtDataPtr` (the OptiX SBT), peeling every
+// forwarding op, including the `BitCast`/`GetOffsetPtr` that `getRootAddr` does not peel.
+static bool isAddressIntoOptiXShaderBindingTable(IRInst* addr)
+{
+    return peelAddressForwardingOps(addr)->getOp() == kIROp_GetOptiXSbtDataPtr;
+}
+
 bool isPointerToImmutableLocation(IRInst* loc)
 {
+    // The OptiX SBT (`GetOptiXSbtDataPtr`) is typed as a `ConstantBuffer<>` but is mutated
+    // in place by the host between dispatches, so it is not immutable; otherwise CUDA emit
+    // would route its loads through the read-only cache (`__ldg`) and read stale data.
+    // Genuine `ConstantBuffer<>` (not SBT-rooted) is unaffected. See shader-slang/slang#10188.
+    if (isAddressIntoOptiXShaderBindingTable(loc))
+        return false;
+
     switch (loc->getOp())
     {
     case kIROp_GetStructuredBufferPtr:
@@ -3095,6 +3710,287 @@ IRType* getSamplerTypeFromCombinedTextureSampler(IRType* type)
         return builder.getType(kIROp_SamplerComparisonStateType);
     else
         return builder.getType(kIROp_SamplerStateType);
+}
+
+IRInst* getInnerMostGenericReturnVal(IRGeneric* generic)
+{
+    auto returnVal = findGenericReturnVal(generic);
+    if (auto innerGeneric = as<IRGeneric>(returnVal))
+        return getInnerMostGenericReturnVal(innerGeneric);
+    return returnVal;
+}
+
+bool isReadNoneCallee(IRInst* callee)
+{
+    if (auto func = as<IRFunc>(callee))
+    {
+        if (func->findDecoration<IRReadNoneDecoration>())
+            return true;
+    }
+
+    if (as<IRSpecialize>(callee))
+    {
+        if (auto specialize = as<IRSpecialize>(callee->getOperand(0)))
+        {
+            return isReadNoneCallee(specialize);
+        }
+        else if (auto generic = as<IRGeneric>(callee->getOperand(0)))
+        {
+            auto genericReturnVal = getInnerMostGenericReturnVal(generic);
+
+            if (genericReturnVal)
+                return isReadNoneCallee(genericReturnVal);
+            else
+                return false;
+        }
+    }
+
+    if (as<IRTranslateBase>(callee))
+    {
+        switch (callee->getOp())
+        {
+        // Translations that have the same readNone property as the original function.
+        case kIROp_BackwardDifferentiatePrimal:
+        case kIROp_BackwardPrimalFromLegacyBwdDiffFunc:
+        case kIROp_ForwardDifferentiate:
+        case kIROp_TrivialForwardDifferentiate:
+        case kIROp_TrivialBackwardDifferentiatePrimal:
+        case kIROp_FunctionCopy:
+            return isReadNoneCallee(callee->getOperand(0));
+
+        case kIROp_BackwardPropagateFromLegacyBwdDiffFunc:
+            return isReadNoneCallee(callee->getOperand(1));
+
+        // Translations that produce a readNone function even if the original function
+        // is not readNone.
+        case kIROp_BackwardRemat:
+        case kIROp_BackwardRematFromLegacyBwdDiffFunc:
+        case kIROp_TrivialBackwardDifferentiatePropagate:
+        case kIROp_TrivialBackwardRemat:
+            return true;
+        }
+    }
+
+    // Default: cannot assume that unknown op-codes are read-none
+    return false;
+}
+
+bool isReadNoneCalleeAndAllDerivatives(IRInst* callee)
+{
+    // The primary callee must be read-none first; the carry-set gate cannot
+    // weaken its existing guarantee.
+    if (!isReadNoneCallee(callee))
+        return false;
+
+    // Look annotations up on the resolved inner function rather than on the
+    // unresolved callee. This is intentionally conservative: stdlib generics
+    // (e.g. `sqrt`) attach `[ForwardDerivativeOf]` / `[BackwardDerivativeOf]`
+    // annotations on the `IRSpecialize` wrapper, and those derivatives are
+    // genuinely pure but typically NOT marked `[__readNone]` (the stdlib
+    // doesn't bother). Looking them up on the unresolved callee would find
+    // them and force a non-readNone verdict on every call site to a stdlib
+    // math function, regressing the false-positive fixes from #11286.
+    //
+    // The trade-off is that user-defined generic primaries (whose
+    // `[ForwardDerivative]` / `[BackwardDerivative]` annotations also live
+    // on the `IRSpecialize`) bypass this gate. That's an under-approximation
+    // — a generic `[__readNone]` primary with a side-effecting user-supplied
+    // derivative is not currently caught. A more accurate fix would
+    // distinguish "stdlib-style pure derivative not explicitly annotated"
+    // from "user-supplied derivative with possible side effects" without
+    // requiring stdlib annotation churn; see follow-up tracking.
+    IRInst* annotated = getResolvedInstForDecorations(callee);
+    if (!annotated)
+        return true;
+
+    IRBuilder builder(annotated->getModule());
+
+    auto isAssociatedDerivativeReadNone = [&](AnnotationKind kind) -> bool
+    {
+        IRInst* derivativeFunc = builder.tryLookupAnnotation(annotated, kind);
+        if (!derivativeFunc)
+            return true;
+        return isReadNoneCallee(derivativeFunc);
+    };
+
+    // ForwardDerivative points directly at the user's fwd-diff function.
+    if (!isAssociatedDerivativeReadNone(AnnotationKind::ForwardDerivative))
+        return false;
+
+    // BackwardDerivativePropagate points at the synthesized propagate-phase
+    // wrapper. `isReadNoneCallee`'s `IRTranslateBase` switch above unwraps
+    // that wrapper via `kIROp_BackwardPropagateFromLegacyBwdDiffFunc`
+    // (operand 1 = user's bwd-diff function copy), so the wrapper's
+    // readNone-ness correctly inherits from the user-supplied backward
+    // function.
+    //
+    // `AnnotationKind::BackwardDerivativeApply` is intentionally NOT
+    // consulted: its wrapper is `BackwardPrimalFromLegacyBwdDiffFunc(primary,
+    // bwd_diff)`, which the same switch unwraps via
+    // `kIROp_BackwardPrimalFromLegacyBwdDiffFunc` -> operand 0 = primary.
+    // Apply therefore inherits its readNone-ness from the already-checked
+    // primary callee and adds no information beyond the first
+    // `isReadNoneCallee(callee)` gate above.
+    if (!isAssociatedDerivativeReadNone(AnnotationKind::BackwardDerivativePropagate))
+        return false;
+
+    return true;
+}
+
+
+bool isNoSideEffectCallee(IRInst* callee)
+{
+    if (auto func = as<IRFunc>(callee))
+    {
+        if (func->findDecoration<IRNoSideEffectDecoration>() ||
+            func->findDecoration<IRReadNoneDecoration>())
+            return true;
+    }
+
+    if (as<IRSpecialize>(callee))
+    {
+        if (auto specialize = as<IRSpecialize>(callee->getOperand(0)))
+        {
+            return isNoSideEffectCallee(specialize);
+        }
+        else if (auto generic = as<IRGeneric>(callee->getOperand(0)))
+        {
+            auto genericReturnVal = getInnerMostGenericReturnVal(generic);
+
+            if (genericReturnVal)
+                return isNoSideEffectCallee(genericReturnVal);
+            else
+                return false;
+        }
+    }
+
+    if (as<IRTranslateBase>(callee))
+    {
+        switch (callee->getOp())
+        {
+        // Translations that have the same noSideEffect property as the original function.
+        case kIROp_BackwardDifferentiatePrimal:
+        case kIROp_BackwardPrimalFromLegacyBwdDiffFunc:
+        case kIROp_ForwardDifferentiate:
+        case kIROp_TrivialForwardDifferentiate:
+        case kIROp_TrivialBackwardDifferentiatePrimal:
+        case kIROp_FunctionCopy:
+            return isNoSideEffectCallee(callee->getOperand(0));
+
+        case kIROp_BackwardPropagateFromLegacyBwdDiffFunc:
+            return isNoSideEffectCallee(callee->getOperand(1));
+
+        // Translations that produce a noSideEffect function even if the original function
+        // is not noSideEffect.
+        case kIROp_BackwardRemat:
+        case kIROp_BackwardRematFromLegacyBwdDiffFunc:
+        case kIROp_TrivialBackwardDifferentiatePropagate:
+        case kIROp_TrivialBackwardRemat:
+            return true;
+        }
+    }
+
+    // Default: cannot assume that unknown op-codes are read-none
+    return false;
+}
+
+bool tryGetConstantIntLit(IRInst* inst, Int64& outValue)
+{
+    if (auto intLit = as<IRIntLit>(inst))
+    {
+        outValue = intLit->getValue();
+        return true;
+    }
+    return false;
+}
+
+bool areKnownEqualShapeElements(IRInst* left, IRInst* right)
+{
+    if (left == right)
+        return true;
+
+    auto leftInt = as<IRIntLit>(left);
+    auto rightInt = as<IRIntLit>(right);
+    return leftInt && rightInt && leftInt->getValue() == rightInt->getValue();
+}
+
+IRInst* emitPackLike(IRModule* module, IRInst* oldInst, ArrayView<IRInst*> elements)
+{
+    auto resultType = as<IRType>(oldInst->getDataType());
+    if (!resultType)
+        return nullptr;
+
+    IRBuilder builder(module);
+    IRBuilderSourceLocRAII srcLocRAII(&builder, oldInst->sourceLoc);
+    builder.setInsertBefore(oldInst);
+
+    if (resultType->getOp() == kIROp_TupleType)
+        return builder.emitMakeTuple(resultType, elements.getCount(), elements.getBuffer());
+
+    return builder.emitMakeValuePack(resultType, elements.getCount(), elements.getBuffer());
+}
+
+bool isWorkGraphRecordType(IRType* type)
+{
+    SLANG_ASSERT(type);
+    switch (type->getOp())
+    {
+    case kIROp_DispatchNodeInputRecordType:
+    case kIROp_ThreadNodeInputRecordType:
+    case kIROp_GroupNodeInputRecordsType:
+    case kIROp_EmptyNodeInputType:
+    case kIROp_ThreadNodeOutputRecordsType:
+    case kIROp_GroupNodeOutputRecordsType:
+    case kIROp_NodeOutputType:
+    case kIROp_NodeOutputArrayType:
+    case kIROp_EmptyNodeOutputType:
+    case kIROp_EmptyNodeOutputArrayType:
+        return true;
+    default:
+        return false;
+    }
+}
+
+IRType* getWorkGraphRecordElementType(IRType* type)
+{
+    SLANG_ASSERT(type);
+
+    switch (type->getOp())
+    {
+    case kIROp_DispatchNodeInputRecordType:
+    case kIROp_ThreadNodeInputRecordType:
+    case kIROp_GroupNodeInputRecordsType:
+    case kIROp_ThreadNodeOutputRecordsType:
+    case kIROp_GroupNodeOutputRecordsType:
+    case kIROp_NodeOutputType:
+    case kIROp_NodeOutputArrayType:
+        return as<IRType>(type->getOperand(0));
+    default:
+        break;
+    }
+
+    return nullptr;
+}
+
+// True when a resource `type`'s `DescriptorHandle` is a native `uint64` bindless handle under
+// `spvBindlessTextureNV` (rather than a `uint2` heap index) — exactly the texture and sampler
+// types. This is the source of truth: the core-module query `__isBindlessTextureNVEncodable<T>()`
+// folds through this classifier (peephole over `kIROp_IsBindlessTextureNVEncodable`), and the AST
+// twin `_isBindlessTextureNVUInt64ElementType` (`slang-type-layout.cpp`) must stay in agreement.
+bool isBindlessTextureNVEncodableResourceType(IRType* type)
+{
+    auto unwrapped = unwrapAttributedType(type);
+    return as<IRTextureType>(unwrapped) || as<IRSamplerStateTypeBase>(unwrapped);
+}
+
+bool isDescriptorHandleRepresentedAsUInt64(IRInst* descriptorHandleType, bool hasBindlessTextureNV)
+{
+    if (!hasBindlessTextureNV)
+        return false;
+    auto handleType = as<IRDescriptorHandleType>(descriptorHandleType);
+    if (!handleType)
+        return false;
+    return isBindlessTextureNVEncodableResourceType(handleType->getResourceType());
 }
 
 } // namespace Slang

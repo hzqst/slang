@@ -27,6 +27,8 @@ void legalizeEntryPointVaryingParamsForCPU(
 
 void legalizeEntryPointVaryingParamsForCUDA(IRModule* module, DiagnosticSink* sink);
 
+void legalizeOptiXReportIntersectionsForCUDA(IRModule* module, DiagnosticSink* sink);
+
 void legalizeEntryPointVaryingParamsForMetal(
     IRModule* module,
     DiagnosticSink* sink,
@@ -75,6 +77,7 @@ void depointerizeInputParams(IRFunc* entryPoint);
     M(StartInstanceLocation, SV_StartInstanceLocation)   \
     M(WaveLaneCount, SV_WaveLaneCount)                   \
     M(WaveLaneIndex, SV_WaveLaneIndex)                   \
+    M(WaveIndex, SV_WaveIndex)                           \
     M(QuadLaneIndex, SV_QuadLaneIndex)                   \
     M(VulkanVertexID, SV_VulkanVertexID)                 \
     M(VulkanInstanceID, SV_VulkanInstanceID)             \

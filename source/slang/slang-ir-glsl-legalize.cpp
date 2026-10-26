@@ -222,6 +222,12 @@ enum GLSLSystemValueKind
     General,
     PositionOutput,
     PositionInput,
+    // The `FragDepth*` kinds are categorically different from `Position*`: their special
+    // treatment decorates the fragment *entry point* (a conservative-depth execution mode),
+    // not the `gl_FragDepth` global var. See the switch in
+    // `createVarLayoutForLegalizedGlobalParam`.
+    FragDepthGreater,
+    FragDepthLess,
 };
 
 struct GLSLSystemValueInfo
@@ -283,6 +289,23 @@ List<IRInst*> ScalarizedVal::leafAddresses()
     List<IRInst*> ret;
     leafAddressesImpl(ret, *this);
     return ret;
+}
+
+static void addPatchDecorationToNonSystemValueLeaves(IRBuilder* builder, ScalarizedVal& value)
+{
+    for (auto leafAddr : value.leafAddresses())
+    {
+        auto leafLayout = findVarLayout(leafAddr);
+        // Every leaf of a legalized varying has a layout attached in
+        // `createVarLayoutForLegalizedGlobalParam`.
+        SLANG_ASSERT(leafLayout);
+        // System values are skipped: the SPIR-V emitter already adds Patch to the
+        // gl_TessLevel* globals standing in for the SV_TessFactor/SV_InsideTessFactor
+        // semantics, while others such as gl_TessCoord must not be patch at all.
+        if (leafLayout->findAttr<IRSystemValueSemanticAttr>())
+            continue;
+        builder->addGLSLPatchDecoration(leafAddr);
+    }
 }
 
 struct GLSLLegalizationContext
@@ -378,6 +401,11 @@ GLSLSystemValueInfo* getMeshOutputIndicesSystemValueInfo(
 
     auto vectorCount = composeGetters<IRIntLit>(type, &IRVectorType::getElementCount);
     auto elemType = composeGetters<IRType>(type, &IRVectorType::getElementType);
+
+    // Defence in depth: the front-end rejects invalid OutputIndices element
+    // types, but serialized IR modules can bypass AST validation entirely.
+    if (!vectorCount || !elemType)
+        SLANG_UNEXPECTED("invalid OutputIndices element type reached GLSL legalization");
 
     // Lines
     if (vectorCount->getValue() == 2 && isIntegralType(elemType))
@@ -571,19 +599,34 @@ GLSLSystemValueInfo* getGLSLSystemValueInfo(
     }
     else if (semanticName == "sv_depthgreaterequal")
     {
-        // TODO: layout(depth_greater) out float gl_FragDepth;
+        // Same `gl_FragDepth` builtin as `SV_Depth`, but the depth value is constrained
+        // to only ever increase. We record this via `FragDepthGreater` so the GLSL
+        // emitter redeclares `layout(depth_greater) out float gl_FragDepth;` (glslang
+        // maps that to the DepthGreater SPIR-V execution mode).
 
         // Type is 'unknown' in hlsl
         name = "gl_FragDepth";
         requiredType = builder->getBasicType(BaseType::Float);
+        // The conservative-depth constraint applies to the depth *output* only. The
+        // front-end already rejects a depth semantic used as input (E30702), so this
+        // branch only legalizes the output varying; gating the kind on `VaryingOutput`
+        // (as `sv_position` does for `PositionOutput`) makes that output-only intent
+        // explicit and keeps the kind off any future non-output varying.
+        if (kind == LayoutResourceKind::VaryingOutput)
+            systemValueKind = GLSLSystemValueKind::FragDepthGreater;
     }
     else if (semanticName == "sv_depthlessequal")
     {
-        // TODO: layout(depth_greater) out float gl_FragDepth;
+        // Same `gl_FragDepth` builtin as `SV_Depth`, but constrained to only ever
+        // decrease; recorded via `FragDepthLess` so the GLSL emitter redeclares
+        // `layout(depth_less) out float gl_FragDepth;` (DepthLess execution mode).
 
         // 'unknown' in hlsl, float in glsl
         name = "gl_FragDepth";
         requiredType = builder->getBasicType(BaseType::Float);
+        // Output-only, gated as in the `sv_depthgreaterequal` branch above.
+        if (kind == LayoutResourceKind::VaryingOutput)
+            systemValueKind = GLSLSystemValueKind::FragDepthLess;
     }
     else if (semanticName == "sv_dispatchthreadid")
     {
@@ -1018,22 +1061,35 @@ void createVarLayoutForLegalizedGlobalParam(
     IRVarLayout* varLayout = varLayoutBuilder.build();
     builder->addLayoutDecoration(globalParam, varLayout);
 
-    // Traverse the entire access chain for the current leaf var and see if
-    // there are interpolation mode decorations along the way.
-    // Make sure we respect the decoration on the inner most node.
-    // So that the decoration on a struct field overrides the outer decoration
-    // on a parameter of the struct type.
+    // Use the innermost interpolation mode, but scan the entire declaration
+    // chain for precise. A field may specify nointerpolation while its enclosing
+    // output parameter specifies precise; both qualifiers apply to the field.
+    bool foundInterpolationMode = false;
     for (; outerParamInfo; outerParamInfo = outerParamInfo->next)
     {
         auto paramInfo = outerParamInfo->outerParam;
         auto decorParent = paramInfo;
         if (auto field = as<IRStructField>(decorParent))
             decorParent = field->getKey();
-        if (auto interpolationModeDecor =
-                decorParent->findDecoration<IRInterpolationModeDecoration>())
+        // A precise output field or parameter remains precise after scalarization.
+        // Keep that qualifier on the resulting output address so the SPIR-V backend
+        // can trace the values stored into it after the original declaration is gone.
+        if (kind == LayoutResourceKind::VaryingOutput &&
+            decorParent->findDecoration<IRPreciseDecoration>() &&
+            !globalParam->findDecoration<IRPreciseDecoration>())
         {
-            builder->addInterpolationModeDecoration(globalParam, interpolationModeDecor->getMode());
-            break;
+            builder->addSimpleDecoration<IRPreciseDecoration>(globalParam);
+        }
+        if (!foundInterpolationMode)
+        {
+            if (auto interpolationModeDecor =
+                    decorParent->findDecoration<IRInterpolationModeDecoration>())
+            {
+                builder->addInterpolationModeDecoration(
+                    globalParam,
+                    interpolationModeDecor->getMode());
+                foundInterpolationMode = true;
+            }
         }
     }
 
@@ -1062,6 +1118,23 @@ void createVarLayoutForLegalizedGlobalParam(
             break;
         case GLSLSystemValueKind::PositionInput:
             builder->addGLPositionInputDecoration(globalParam);
+            break;
+        case GLSLSystemValueKind::FragDepthGreater:
+            // The depth-test condition is an execution-mode property of the fragment
+            // entry point (like `early_fragment_tests`), so we mark the entry point
+            // rather than the `gl_FragDepth` builtin var. Unlike the other cases here,
+            // this decorates the entry point, not `globalParam`. The decoration is
+            // idempotent by construction: the depth output is unique per entry point, the
+            // front-end rejects depth-as-input (E30702), and these ops are in
+            // `isSimpleDecoration` so `addDecoration` deduplicates a repeat attach
+            // (mirroring the `early_fragment_tests` precedent) — at most one qualifier
+            // reaches emit. The decoration is consumed only by the GLSL emitter; this
+            // legalization pass also runs for the direct-SPIR-V path, where the decoration
+            // is inert (the SPIR-V emitter derives the mode independently).
+            builder->addDecoration(context->entryPointFunc, kIROp_GLSLFragDepthGreaterDecoration);
+            break;
+        case GLSLSystemValueKind::FragDepthLess:
+            builder->addDecoration(context->entryPointFunc, kIROp_GLSLFragDepthLessDecoration);
             break;
         default:
             break;
@@ -1121,40 +1194,61 @@ IRInst* getOrCreateBuiltinParamForHullShader(
     return outputControlPointIdParam;
 }
 
+/// Builds the `IRTypeLayout` for a patch constant function's result type.
+///
+/// Field offsets are relative to the enclosing struct, not absolute locations, and no locations
+/// are reserved here. The caller (`invokePatchConstantFuncInHullShader`) captures the first free
+/// slot before calling, stores it as the result offset, and reserves `[base, base + span)` from
+/// the layout's `VaryingOutput` size afterwards.
+///
+/// TODO: there is a more general issue with nested arrayed structs in (#13330);
+/// take this case into account when fixing it as well.
 IRTypeLayout* createPatchConstantFuncResultTypeLayout(
-    GLSLLegalizationContext* context,
+    CodeGenContext* codeGenContext,
     IRBuilder& irBuilder,
     IRType* type)
 {
     if (auto structType = as<IRStructType>(type))
     {
+        UInt reservedCount = 0;
         IRStructTypeLayout::Builder builder(&irBuilder);
         for (auto field : structType->getFields())
         {
             auto fieldType = field->getFieldType();
             IRTypeLayout* fieldTypeLayout =
-                createPatchConstantFuncResultTypeLayout(context, irBuilder, fieldType);
+                createPatchConstantFuncResultTypeLayout(codeGenContext, irBuilder, fieldType);
             IRVarLayout::Builder fieldVarLayoutBuilder(&irBuilder, fieldTypeLayout);
             auto decoration = field->getKey()->findDecoration<IRSemanticDecoration>();
-            if (decoration)
+            if (decoration &&
+                decoration->getSemanticName().startsWithCaseInsensitive(toSlice("sv_")))
             {
-                if (decoration->getSemanticName().startsWithCaseInsensitive(toSlice("sv_")))
-                    fieldVarLayoutBuilder.setSystemValueSemantic(decoration->getSemanticName(), 0);
+                fieldVarLayoutBuilder.setSystemValueSemantic(decoration->getSemanticName(), 0);
             }
             else
             {
+                // A field with a user semantic (non-sv_) or no semantic is an ordinary varying
+                // output: give it a real location instead of leaving it at the default (location
+                // 0), which would collide with per-control-point outputs (see #12726).
                 auto varLayoutForKind =
                     fieldVarLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::VaryingOutput);
 
                 UInt space = 0;
                 varLayoutForKind->space = space;
 
-                auto unusedBinding =
-                    context->usedBindingIndex[LayoutResourceKind::VaryingOutput].getLSBZero();
-                varLayoutForKind->offset = (UInt)unusedBinding;
-                context->usedBindingIndex[LayoutResourceKind::VaryingOutput].add(unusedBinding);
+                IRTypeSizeAttr* sizeAttr =
+                    fieldTypeLayout->findSizeAttr(LayoutResourceKind::VaryingOutput);
+                UInt varyingCount = sizeAttr ? sizeAttr->getFiniteSize() : 0;
+
+                varLayoutForKind->offset = reservedCount;
+                reservedCount += varyingCount;
             }
             builder.addField(field->getKey(), fieldVarLayoutBuilder.build());
+        }
+        if (reservedCount != 0)
+        {
+            builder.addResourceUsage(
+                LayoutResourceKind::VaryingOutput,
+                LayoutSize::fromRaw(reservedCount));
         }
         auto typeLayout = builder.build();
         return typeLayout;
@@ -1162,10 +1256,41 @@ IRTypeLayout* createPatchConstantFuncResultTypeLayout(
     else if (auto arrayType = as<IRArrayTypeBase>(type))
     {
         auto elementTypeLayout = createPatchConstantFuncResultTypeLayout(
-            context,
+            codeGenContext,
             irBuilder,
             arrayType->getElementType());
         IRArrayTypeLayout::Builder builder(&irBuilder, elementTypeLayout);
+        if (auto sizeAttr = elementTypeLayout->findSizeAttr(LayoutResourceKind::VaryingOutput))
+        {
+            auto elementCount = as<IRIntLit>(arrayType->getElementCount());
+            SLANG_RELEASE_ASSERT(elementCount && "patch constant array size must be fixed.");
+            builder.addResourceUsage(
+                LayoutResourceKind::VaryingOutput,
+                sizeAttr->getSize() * elementCount->getValue());
+        }
+        return builder.build();
+    }
+    else if (auto matrixType = as<IRMatrixType>(type))
+    {
+        // A matrix patch output must reserve the same location count the
+        // domain-side varying input layout gives it (the storage-major axis,
+        // see `getSimpleVaryingParameterTypeLayout`).
+        auto rowCount = as<IRIntLit>(matrixType->getRowCount());
+        auto columnCount = as<IRIntLit>(matrixType->getColumnCount());
+        SLANG_RELEASE_ASSERT(
+            rowCount && columnCount && "patch constant matrix dimensions must be fixed.");
+        size_t locationCount = 0;
+        size_t unusedMinorCount = 0;
+        getMatrixLayoutAxisCounts(
+            (size_t)rowCount->getValue(),
+            (size_t)columnCount->getValue(),
+            codeGenContext->getTargetReq()->getOptionSet().getMatrixLayoutMode(),
+            locationCount,
+            unusedMinorCount);
+        IRTypeLayout::Builder builder(&irBuilder);
+        builder.addResourceUsage(
+            LayoutResourceKind::VaryingOutput,
+            LayoutSize::fromRaw(locationCount));
         return builder.build();
     }
     else
@@ -1183,7 +1308,7 @@ ScalarizedVal legalizeEntryPointReturnValueForGLSL(
     IRFunc* func,
     IRVarLayout* resultLayout);
 
-void invokePathConstantFuncInHullShader(
+void invokePatchConstantFuncInHullShader(
     GLSLLegalizationContext* context,
     CodeGenContext* codeGenContext,
     ScalarizedVal outputPatchVal)
@@ -1306,15 +1431,30 @@ void invokePathConstantFuncInHullShader(
     builder.setInsertBefore(constantFunc->getFirstBlock()->getFirstOrdinaryInst());
 
     auto constantOutputType = constantFunc->getResultType();
+    // Struct field offsets are relative to this base (see createPatchConstantFuncResultTypeLayout).
+    auto constantOutputBase =
+        context->usedBindingIndex[LayoutResourceKind::VaryingOutput].getLSBZero();
     IRTypeLayout* constantOutputLayout =
-        createPatchConstantFuncResultTypeLayout(context, builder, constantOutputType);
+        createPatchConstantFuncResultTypeLayout(codeGenContext, builder, constantOutputType);
     IRVarLayout::Builder resultVarLayoutBuilder(&builder, constantOutputLayout);
     if (auto semanticDecor = constantFunc->findDecoration<IRSemanticDecoration>())
         resultVarLayoutBuilder.setSystemValueSemantic(semanticDecor->getSemanticName(), 0);
+    if (auto sizeAttr = constantOutputLayout->findSizeAttr(LayoutResourceKind::VaryingOutput))
+    {
+        auto resultVarInfo =
+            resultVarLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::VaryingOutput);
+        resultVarInfo->offset = (UInt)constantOutputBase;
+        resultVarInfo->space = 0;
+        for (UInt i = 0; i < sizeAttr->getFiniteSize(); ++i)
+        {
+            context->usedBindingIndex[LayoutResourceKind::VaryingOutput].add(
+                constantOutputBase + (Index)i);
+        }
+    }
 
     context->entryPointFunc = constantFunc;
     context->stage = Stage::Unknown;
-    legalizeEntryPointReturnValueForGLSL(
+    auto patchConstantFuncOutputVal = legalizeEntryPointReturnValueForGLSL(
         context,
         codeGenContext,
         builder,
@@ -1322,6 +1462,8 @@ void invokePathConstantFuncInHullShader(
         resultVarLayoutBuilder.build());
     context->entryPointFunc = entryPoint;
     context->stage = Stage::Hull;
+
+    addPatchDecorationToNonSystemValueLeaves(&builder, patchConstantFuncOutputVal);
 
     fixUpFuncType(constantFunc);
 }
@@ -3144,7 +3286,8 @@ static void legalizeMeshPayloadInputParam(
         builder->createGlobalVar(ptrType->getValueType(), AddressSpace::TaskPayloadWorkgroup);
     g->setFullType(builder->getRateQualifiedType(builder->getGroupSharedRate(), g->getFullType()));
     // moveValueBefore(g, builder->getFunc());
-    builder->addNameHintDecoration(g, pp->findDecoration<IRNameHintDecoration>()->getName());
+    if (auto nameDecor = pp->findDecoration<IRNameHintDecoration>())
+        builder->addNameHintDecoration(g, nameDecor->getName());
     pp->replaceUsesWith(g);
     struct MeshPayloadInputSpecializationCondition : FunctionCallSpecializeCondition
     {
@@ -3360,7 +3503,7 @@ static void replaceAllUsesOfMeshOutputValWithLegalizedVal(
                 auto replacementSrcVal = dereferenceVal(builder, replacement);
                 replaceAllUsesOfMeshOutputValWithLegalizedVal(context, load, replacementSrcVal);
             }
-            else if (const auto swiz = as<IRSwizzledStore>(user))
+            else if (const auto swiz = as<IRSwizzledStore>(user); swiz)
             {
                 SLANG_UNEXPECTED("Swizzled store to a non-address ScalarizedVal");
             }
@@ -3523,9 +3666,8 @@ static void legalizeMeshOutputParam(
     //
     auto placeholderGlobalParam = addGlobalParam(builder->getModule(), pp->getFullType());
     moveValueBefore(placeholderGlobalParam, builder->getFunc());
-    builder->addNameHintDecoration(
-        placeholderGlobalParam,
-        pp->findDecoration<IRNameHintDecoration>()->getName());
+    if (auto nameDecor = pp->findDecoration<IRNameHintDecoration>())
+        builder->addNameHintDecoration(placeholderGlobalParam, nameDecor->getName());
     pp->replaceUsesWith(placeholderGlobalParam);
     // pp is only removed later on, so sadly we have to keep it around for now
     struct MeshOutputSpecializationCondition : FunctionCallSpecializeCondition
@@ -4000,24 +4142,17 @@ void legalizeEntryPointParameterForGLSL(
     // which is what current emit code assumes, but may not be more generally applicable.
     if (auto geomDecor = pp->findDecoration<IRGeometryInputPrimitiveTypeDecoration>())
     {
-        if (!func->findDecoration<IRGeometryInputPrimitiveTypeDecoration>())
+        // The topology is normally on the function already (recorded at lowering); a parameter
+        // that still carries it must agree. Linked or deserialized IR may carry it only on the
+        // parameter, so lift it in that case. Mirrors the IRStreamOutputTypeDecoration handling
+        // below.
+        if (auto existing = func->findDecoration<IRGeometryInputPrimitiveTypeDecoration>())
         {
-            builder->addDecoration(func, geomDecor->getOp());
+            SLANG_ASSERT(existing->getOp() == geomDecor->getOp());
         }
         else
         {
-            SLANG_UNEXPECTED("Only expected a single parameter to have "
-                             "IRGeometryInputPrimitiveTypeDecoration decoration");
-        }
-    }
-
-    if (stage == Stage::Geometry)
-    {
-        // If the user provided no parameters with a input primitive type qualifier, we
-        // default to `triangle`.
-        if (!func->findDecoration<IRGeometryInputPrimitiveTypeDecoration>())
-        {
-            builder->addDecoration(func, kIROp_TriangleInputPrimitiveTypeDecoration);
+            builder->addDecoration(func, geomDecor->getOp());
         }
     }
 
@@ -4082,7 +4217,7 @@ void legalizeEntryPointParameterForGLSL(
     {
         valueType = paramPtrType->getValueType();
     }
-    if (const auto gsStreamType = as<IRHLSLStreamOutputType>(valueType))
+    if (const auto gsStreamType = as<IRHLSLStreamOutputType>(valueType); gsStreamType)
     {
         // An output stream type like `TriangleStream<Foo>` should
         // more or less translate into `out Foo` (plus scalarization).
@@ -4164,7 +4299,7 @@ void legalizeEntryPointParameterForGLSL(
         // operations like `TraceRay` are handled.
         //
         builder->setInsertBefore(func->getFirstBlock()->getFirstOrdinaryInst());
-        auto undefinedVal = builder->emitPoison(pp->getFullType());
+        auto undefinedVal = builder->getPoison(pp->getFullType());
         pp->replaceUsesWith(undefinedVal);
 
         return;
@@ -4231,7 +4366,7 @@ void legalizeEntryPointParameterForGLSL(
         auto localVariable = builder->emitVar(valueType);
         auto localVal = ScalarizedVal::address(localVariable);
 
-        if (const auto inOutType = as<IRBorrowInOutParamType>(paramType))
+        if (const auto inOutType = as<IRBorrowInOutParamType>(paramType); inOutType)
         {
             // In the `in out` case we need to declare two
             // sets of global variables: one for the `in`
@@ -4316,54 +4451,47 @@ void legalizeEntryPointParameterForGLSL(
             stage,
             pp);
         tryReplaceUsesOfStageInput(context, globalValue, pp);
+
+        // Domain shader patch constant inputs: a varying input that isn't
+        // InputPatch/OutputPatch (handled by legalizePatchParam above).
+        // Patch constants are always passed by const reference
+        // (translateEntryPointInParamToBorrow).
+        if (stage == Stage::Domain)
+        {
+            SLANG_ASSERT(!as<IRHLSLPatchType>(valueType));
+            addPatchDecorationToNonSystemValueLeaves(builder, globalValue);
+        }
+
         for (auto dec : pp->getDecorations())
         {
             if (dec->getOp() != kIROp_GlobalVariableShadowingGlobalParameterDecoration)
                 continue;
             auto globalVar = dec->getOperand(0);
-            auto globalVarType = cast<IRPtrTypeBase>(globalVar->getDataType())->getValueType();
-            if (as<IRStructType>(globalVarType))
+            // Route by the scalarized shape, not by the proxy var's syntactic type.
+            // A struct scalarizes to a `tuple` whether standalone or array-nested
+            // (`in triangle S arr[3];`); the array-nested proxy var has array type even
+            // though its scalarized value is a tuple, so a syntactic type test does not
+            // identify the tuple case. `tryReplaceUsesOfStageInput` rewrites the reads of
+            // a tuple structurally (by array element, then by field); it leaves the proxy
+            // var and the stores that initialize it in place (they persist to the emitted
+            // output). The `address` branch below instead splices in the real input and
+            // deallocates the proxy here.
+            if (globalValue.flavor == ScalarizedVal::Flavor::tuple)
             {
                 tryReplaceUsesOfStageInput(context, globalValue, globalVar);
             }
             else
             {
-
-                auto key = dec->getOperand(1);
                 IRInst* realGlobalVar = nullptr;
-
-                // When we relate a "global variable" to a "global parameter" using
-                // kIROp_GlobalVariableShadowingGlobalParameterDecoration, the globalValue flavor
-                // is dependent on the global parameter's type. Struct types for example will relate
-                // to the tuple flavor, while vector types will be related to the address flavor.
-                if (globalValue.flavor == ScalarizedVal::Flavor::tuple)
-                {
-                    if (auto tupleVal = as<ScalarizedTupleValImpl>(globalValue.impl))
-                    {
-                        for (auto elem : tupleVal->elements)
-                        {
-                            if (elem.key == key)
-                            {
-                                realGlobalVar = elem.val.irValue;
-                                if (!realGlobalVar &&
-                                    ScalarizedVal::Flavor::typeAdapter == elem.val.flavor)
-                                {
-                                    if (auto typeAdapterVal =
-                                            as<ScalarizedTypeAdapterValImpl>(elem.val.impl))
-                                    {
-                                        realGlobalVar = typeAdapterVal->val.irValue;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                else if (globalValue.flavor == ScalarizedVal::Flavor::address)
+                if (globalValue.flavor == ScalarizedVal::Flavor::address)
                 {
                     realGlobalVar = globalValue.irValue;
                 }
                 else
+                    // Other flavors (e.g. a top-level `typeAdapter` for a
+                    // type-adapted system value) had their uses rewritten by the
+                    // `tryReplaceUsesOfStageInput(context, globalValue, pp)` call above,
+                    // so there is nothing to splice here.
                     continue;
                 SLANG_ASSERT(realGlobalVar);
 
@@ -4385,9 +4513,6 @@ void legalizeEntryPointParameterForGLSL(
                             }
                         }
                     });
-                // we will be replacing uses of `globalVarToReplace`. We need
-                // globalVarToReplaceNextUse to catch the next use before it is removed from the
-                // list of uses.
                 globalVar->replaceUsesWith(realGlobalVar);
                 globalVar->removeAndDeallocate();
             }
@@ -4410,7 +4535,6 @@ void legalizeEntryPointParameterForGLSL(
             LayoutResourceKind::VaryingInput,
             stage,
             pp);
-
         tryReplaceUsesOfStageInput(context, globalValue, pp);
 
         // we have a simple struct which represents all materialized GlobalParams, this
@@ -4901,7 +5025,7 @@ void legalizeEntryPointForGLSL(
     // at the end of the entrypoint now.
     if (stage == Stage::Hull)
     {
-        invokePathConstantFuncInHullShader(&context, codeGenContext, scalarizedGlobalOutput);
+        invokePatchConstantFuncInHullShader(&context, codeGenContext, scalarizedGlobalOutput);
     }
 
     // Special handling for ray tracing shaders
@@ -4939,6 +5063,18 @@ void legalizeEntryPointForGLSL(
             SLANG_ASSERT(paramLayout);
 
             legalizeEntryPointParameterForGLSL(&context, codeGenContext, func, pp, paramLayout);
+        }
+
+        // For geometry shaders, if none of the parameters carried an input
+        // primitive type qualifier (`triangle`, `point`, `line`, etc.), default
+        // to `triangle`. This must happen after all parameters have been
+        // processed; otherwise, if the input primitive parameter appears after
+        // another parameter, the default would be applied first and then clash
+        // with the real qualifier.
+        if (stage == Stage::Geometry &&
+            !func->findDecoration<IRGeometryInputPrimitiveTypeDecoration>())
+        {
+            builder.addDecoration(func, kIROp_TriangleInputPrimitiveTypeDecoration);
         }
 
         // At this point we should have eliminated all uses of the
@@ -5068,6 +5204,49 @@ void legalizeEntryPointsForGLSL(
     assignRayPayloadHitObjectAttributeLocations(module);
 
     decorateModuleWithSPIRVVersion(module, glslExtensionTracker->getSPIRVVersion());
+}
+
+// Rewrite a single `switch` on a `bool` condition into the equivalent integer switch:
+// cast the condition bool->int (Khronos emitters lower this to an OpSelect) and replace
+// each case value with the matching `IRIntLit` (`true`->1, `false`->0).
+//
+// A case value on a bool-conditioned switch is a canonical `IRBoolLit`, whether written
+// literally (`case true:`/`case false:`) or produced by a `switch` on an `enum : bool` (whose
+// labels `lowerEnumType` canonicalizes from the enum type to `IRBoolLit`).
+static void legalizeBoolSwitch(IRSwitch* switchInst)
+{
+    if (!as<IRBoolType>(switchInst->getCondition()->getDataType()))
+        return;
+
+    IRBuilder builder(switchInst);
+    auto intType = builder.getIntType();
+
+    builder.setInsertBefore(switchInst);
+    auto intCondition = builder.emitCast(intType, switchInst->getCondition());
+    switchInst->condition.set(intCondition);
+
+    for (UInt i = 0; i < switchInst->getCaseCount(); i++)
+    {
+        auto caseConstant = as<IRBoolLit>(switchInst->getCaseValue(i));
+        SLANG_RELEASE_ASSERT(caseConstant);
+        auto intLit = builder.getIntValue(intType, caseConstant->value.intVal != 0 ? 1 : 0);
+        switchInst->getCaseValueUse(i)->set(intLit);
+    }
+}
+
+void legalizeBoolSwitchForTargetsRequiringIntSwitch(IRModule* module)
+{
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        auto func = as<IRGlobalValueWithCode>(globalInst);
+        if (!func)
+            continue;
+        for (auto block : func->getBlocks())
+        {
+            if (auto switchInst = as<IRSwitch>(block->getTerminator()))
+                legalizeBoolSwitch(switchInst);
+        }
+    }
 }
 
 void legalizeConstantBufferLoadForGLSL(IRModule* module)

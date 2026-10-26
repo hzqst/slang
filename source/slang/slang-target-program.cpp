@@ -16,8 +16,21 @@ TargetProgram::TargetProgram(ComponentType* componentType, TargetRequest* target
     : m_program(componentType), m_targetReq(targetReq)
 {
     m_entryPointResults.setCount(componentType->getEntryPointCount());
+    composeDownstreamArgs();
     m_optionSet.overrideWith(m_program->getOptionSet());
     m_optionSet.inheritFrom(targetReq->getOptionSet());
+}
+
+void TargetProgram::composeDownstreamArgs()
+{
+    CompilerOptionSet* lowerLevels[] = {
+        &m_targetReq->getLinkage()->m_optionSet,
+        &m_targetReq->getOptionSet()};
+    for (auto level : lowerLevels)
+    {
+        if (auto args = level->options.tryGetValue(CompilerOptionName::DownstreamArgs))
+            m_optionSet.appendLevelLocal(CompilerOptionName::DownstreamArgs, *args);
+    }
 }
 
 IArtifact* TargetProgram::_createWholeProgramResult(
@@ -30,7 +43,6 @@ IArtifact* TargetProgram::_createWholeProgramResult(
     // emit code for, so we construct such a list first.
     List<Int> entryPointIndices;
 
-    m_entryPointResults.setCount(m_program->getEntryPointCount());
     entryPointIndices.setCount(m_program->getEntryPointCount());
     for (Index i = 0; i < entryPointIndices.getCount(); i++)
         entryPointIndices[i] = i;
@@ -38,12 +50,21 @@ IArtifact* TargetProgram::_createWholeProgramResult(
     CodeGenContext::Shared sharedCodeGenContext(this, entryPointIndices, sink, endToEndReq);
     CodeGenContext codeGenContext(&sharedCodeGenContext);
 
-    if (SLANG_FAILED(codeGenContext.emitEntryPoints(m_wholeProgramResult)))
+    ComPtr<IArtifact> artifact;
+    if (SLANG_FAILED(codeGenContext.emitEntryPoints(artifact)))
     {
         return nullptr;
     }
 
-    return m_wholeProgramResult;
+    {
+        // Two threads may finish the same whole-program compile concurrently; publish only one
+        // cached result.
+        std::lock_guard<std::mutex> lock(m_resultCacheMutex);
+        if (m_wholeProgramResult)
+            return m_wholeProgramResult;
+        m_wholeProgramResult = artifact;
+        return m_wholeProgramResult;
+    }
 }
 
 IArtifact* TargetProgram::_createEntryPointResult(
@@ -51,6 +72,9 @@ IArtifact* TargetProgram::_createEntryPointResult(
     DiagnosticSink* sink,
     EndToEndCompileRequest* endToEndReq)
 {
+    if (entryPointIndex < 0)
+        return nullptr;
+
     // It is possible that entry points got added to the `Program`
     // *after* we created this `TargetProgram`, so there might be
     // a request for an entry point that we didn't allocate space for.
@@ -59,29 +83,39 @@ IArtifact* TargetProgram::_createEntryPointResult(
     // constructed all at once rather than incrementally, to avoid
     // this problem.
     //
-    if (entryPointIndex >= m_entryPointResults.getCount())
-        m_entryPointResults.setCount(entryPointIndex + 1);
-
-
     CodeGenContext::EntryPointIndices entryPointIndices;
     entryPointIndices.add(entryPointIndex);
 
     CodeGenContext::Shared sharedCodeGenContext(this, entryPointIndices, sink, endToEndReq);
     CodeGenContext codeGenContext(&sharedCodeGenContext);
 
-    if (SLANG_FAILED(codeGenContext.emitEntryPoints(m_entryPointResults[entryPointIndex])))
+    ComPtr<IArtifact> artifact;
+    if (SLANG_FAILED(codeGenContext.emitEntryPoints(artifact)))
     {
-        m_entryPointResults[entryPointIndex].setNull();
         return nullptr;
     }
 
-    return m_entryPointResults[entryPointIndex];
+    {
+        // Parallel entry-point compiles can finish in either order, so guard the resize and
+        // cache publish together.
+        std::lock_guard<std::mutex> lock(m_resultCacheMutex);
+        if (entryPointIndex >= m_entryPointResults.getCount())
+            m_entryPointResults.setCount(entryPointIndex + 1);
+        if (m_entryPointResults[entryPointIndex])
+            return m_entryPointResults[entryPointIndex];
+        m_entryPointResults[entryPointIndex] = artifact;
+        return m_entryPointResults[entryPointIndex];
+    }
 }
 
 IArtifact* TargetProgram::getOrCreateWholeProgramResult(DiagnosticSink* sink)
 {
-    if (m_wholeProgramResult)
-        return m_wholeProgramResult;
+    {
+        // Fast-path the whole-program cache without racing a concurrent publisher.
+        std::lock_guard<std::mutex> lock(m_resultCacheMutex);
+        if (m_wholeProgramResult)
+            return m_wholeProgramResult;
+    }
 
     // If we haven't yet computed a layout for this target
     // program, we need to make sure that is done before
@@ -97,13 +131,21 @@ IArtifact* TargetProgram::getOrCreateWholeProgramResult(DiagnosticSink* sink)
 
 IArtifact* TargetProgram::getOrCreateEntryPointResult(Int entryPointIndex, DiagnosticSink* sink)
 {
-    if (entryPointIndex >= m_entryPointResults.getCount())
-        m_entryPointResults.setCount(entryPointIndex + 1);
+    if (entryPointIndex < 0)
+        return nullptr;
 
-    if (IArtifact* artifact = m_entryPointResults[entryPointIndex])
-        return artifact;
+    {
+        // Guard the cache probe and lazy result-array resize against concurrent entry-point
+        // compiles for this target program.
+        std::lock_guard<std::mutex> lock(m_resultCacheMutex);
+        if (entryPointIndex >= m_entryPointResults.getCount())
+            m_entryPointResults.setCount(entryPointIndex + 1);
 
-    try
+        if (IArtifact* artifact = m_entryPointResults[entryPointIndex])
+            return artifact;
+    }
+
+    SLANG_EXCEPTION_TRY
     {
         // If we haven't yet computed a layout for this target
         // program, we need to make sure that is done before
@@ -116,6 +158,7 @@ IArtifact* TargetProgram::getOrCreateEntryPointResult(Int entryPointIndex, Diagn
 
         return _createEntryPointResult(entryPointIndex, sink);
     }
+#if SLANG_HAS_EXCEPTIONS
     catch (const Exception& e)
     {
         sink->diagnose(Diagnostics::CompilationAbortedDueToException{
@@ -123,6 +166,7 @@ IArtifact* TargetProgram::getOrCreateEntryPointResult(Int entryPointIndex, Diagn
             .exceptionMessage = e.Message});
         return nullptr;
     }
+#endif
 }
 
 } // namespace Slang

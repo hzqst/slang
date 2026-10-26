@@ -341,6 +341,39 @@ class VarDecl : public VarDeclBase
     FIDDLE(...)
 };
 
+// A variable introduced by the parser to implement uniform parameter temporaries in legacy HLSL.
+//
+// Consider `uint x; void setX() { x = 1; }`. With HLSL compatibility enabled, the parser renames
+// the parameter and introduces a shadow under the name `x`. Semantic checking allows writes
+// to a mutable shadow. The compiler initializes its storage from the parameter for each
+// shader entry-point invocation.
+// The parameter's binding and layout modifiers remain on the parameter declaration.
+//
+// Header checking sets the shadow's type from the parameter; for a legacy `cbuffer`, it uses
+// the buffer's element struct. The same type restriction as for mutable `static` globals applies.
+// For a type or memory qualifier that a mutable copy cannot preserve, the compiler uses an
+// immutable alias instead of allocating mutable storage. The alias preserves the accesses allowed
+// by the original parameter but cannot be assigned or rebound through the shadow. The shadow
+// retains its computed type on both the mutable and immutable paths. Specialization constants also
+// require immutable aliases so checking can retain their identity.
+//
+// A shadow has no written type or initializer expression. Checking reads the parameter's type,
+// and lowering constructs initialization from its value. Both phases dispatch separately
+// from ordinary `VarDecl` handling.
+FIDDLE()
+class UniformParameterShadowVarDecl : public VarDecl
+{
+    FIDDLE(...)
+
+    // The parameter from which lowering initializes the shadow. The parser assigns this
+    // non-null pointer before checking. It creates both declarations at non-generic file or
+    // namespace scope, so no substitutions are needed.
+    FIDDLE() VarDecl* uniformParameter = nullptr;
+
+    // Whether header checking requires an immutable alias instead of mutable global storage.
+    FIDDLE() bool shouldBeImmutableAlias = false;
+};
+
 // A variable declaration that is always immutable (whether local, global, or member variable)
 FIDDLE()
 class LetDecl : public VarDecl
@@ -370,13 +403,23 @@ class ExtensionDecl : public AggTypeDeclBase
     FIDDLE() TypeExp targetType;
 };
 
+
+// Properties of a checked type used to validate storage and parameter declarations.
+//
+// `SemanticsVisitor::getTypeTags` combines these flags for instantiated fields and base types.
 enum class TypeTag
 {
+    // No property has been established. This is not a proof that every specialization is valid.
     None = 0,
+    // The type includes an array whose element count is absent or explicitly unbounded.
     Unsized = 1,
+    // The definition or recursive inspection of the type is incomplete.
     Incomplete = 2,
+    // An array count must be resolved by linking or specialization before layout is fixed.
     LinkTimeSized = 4,
+    // The type includes a resource value whose representation depends on the target.
     Opaque = 8,
+    // The type cannot be represented as an ordinary addressable value.
     NonAddressable = 16,
 };
 
@@ -399,7 +442,6 @@ class AggTypeDecl : public AggTypeDeclBase
 
     bool hasBody = true;
 
-    void unionTagsWith(TypeTag other);
     void addTag(TypeTag tag);
     bool hasTag(TypeTag tag);
 
@@ -413,6 +455,24 @@ class StructDecl : public AggTypeDecl
 
     // We will use these auxiliary to help in synthesizing the member initialize constructor.
     Slang::HashSet<VarDeclBase*> m_membersVisibleInCtor;
+};
+
+// A `class` declaration in the HLSL dialect.
+//
+// HLSL classes denote value types, much like classes in C++. Slang classes denote
+// reference types and are represented by the distinct `ClassDecl` node.
+FIDDLE()
+class HLSLClassDecl : public StructDecl
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
+class SynthesizedStructDecl : public AggTypeDecl
+{
+    FIDDLE(...)
+    FIDDLE() List<Val*> operands;
+    FIDDLE() uint32_t irOp;
 };
 
 FIDDLE()
@@ -610,6 +670,11 @@ class CallableDecl : public ContainerDecl
     // If this callable throws an error code, `errorType` is the type of the error code.
     FIDDLE() TypeExp errorType;
 
+    // Optional function expression type, which, if present, will be used to determine
+    // the return type and parameter types of the callable.
+    //
+    FIDDLE() TypeExp funcType;
+
     // Fields related to redeclaration, so that we
     // can support multiple specialized variations
     // of the "same" logical function.
@@ -634,6 +699,14 @@ class FunctionDeclBase : public CallableDecl
     FIDDLE(...)
     Stmt* body = nullptr;
 };
+
+FIDDLE()
+class FuncAliasDecl : public CallableDecl
+{
+    FIDDLE(...)
+    FIDDLE() DeclRef<CallableDecl> targetDeclRef;
+};
+
 
 // A constructor/initializer to create instances of a type
 FIDDLE()
@@ -734,10 +807,35 @@ class FuncDecl : public FunctionDeclBase
     FIDDLE(...)
 };
 
+FIDDLE()
+class SynthesizedFuncDecl : public FunctionDeclBase
+{
+    FIDDLE(...)
+    FIDDLE() List<Val*> operands;
+    FIDDLE() uint32_t irOp;
+};
+
 FIDDLE(abstract)
 class NamespaceDeclBase : public ContainerDecl
 {
     FIDDLE(...)
+};
+
+// A shorthand for defining a function extension (e.g. custom derivative)
+// that desugars into an ExtensionDecl during semantic checking.
+// Example:
+// __func_extension fwd_diff(foo)(DifferentialPair<float> x) -> DifferentialPair<float> { ... }
+FIDDLE()
+class FuncExtensionDecl : public Decl
+{
+    FIDDLE(...)
+
+    // The higher-order expression targeting the function
+    // (e.g. ForwardDifferentiateExpr wrapping foo<T>)
+    FIDDLE() Expr* targetExpr = nullptr;
+
+    // The user-written function body with parameters, return type, and body.
+    FIDDLE() FuncDecl* innerFunc = nullptr;
 };
 
 // A `namespace` declaration inside some module, that provides
@@ -752,6 +850,13 @@ FIDDLE()
 class NamespaceDecl : public NamespaceDeclBase
 {
     FIDDLE(...)
+
+    // Every scope that the parser creates for this namespace (see `Parser::pushLookupScope`).
+    // `ownedScope` is the most recent of them that `PushScope` created, so for a reopened
+    // namespace it belongs to one body only. The semantic checker attaches the imported
+    // namespaces of the same name to every scope in this list, so code in each body finds
+    // the imported members.
+    List<Scope*> lexicalScopes;
 };
 
 // A "module" of code (essentially, a single translation unit)
@@ -783,7 +888,7 @@ class ModuleDecl : public NamespaceDeclBase
     /// whether a module is written in the legacy language. We detect this by checking whether the
     /// module has any visibility modifiers, or if the module uses new language constructs, e.g.
     /// `module`, `__include`, `__implementing` etc.
-    FIDDLE() SlangLanguageVersion languageVersion = SLANG_LANGAUGE_VERSION_DEFAULT;
+    FIDDLE() SlangLanguageVersion languageVersion = SLANG_LANGUAGE_VERSION_DEFAULT;
 
     FIDDLE() DeclVisibility defaultVisibility = DeclVisibility::Internal;
 
@@ -791,7 +896,7 @@ class ModuleDecl : public NamespaceDeclBase
     ///
     /// This mapping is filled in during semantic checking, as `ExtensionDecl`s get checked.
     ///
-    FIDDLE() Dictionary<AggTypeDecl*, RefPtr<CandidateExtensionList>> mapTypeToCandidateExtensions;
+    FIDDLE() Dictionary<Decl*, RefPtr<CandidateExtensionList>> mapDeclToCandidateExtensions;
 
     /// Is this module using on-demand deserialization for its exports?
     ///
@@ -944,8 +1049,53 @@ class GenericTypeConstraintDecl : public TypeConstraintDecl
 
     FIDDLE() bool isEqualityConstraint = false;
 
+    // After checking, this dictionary will map members required by the
+    // super-type interface to their witnesses. This is used to store
+    // canonical inheritance paths, but does not store any concrete
+    // requirements (e.g. functions/assoc-types/etc..), only references
+    // to lookup paths (represented as LookupDeclRefs)
+    //
+    FIDDLE() RefPtr<WitnessTable> pathResolutionTable;
+
     // Overrides should be public so base classes can access
     const TypeExp& _getSupOverride() const { return sup; }
+};
+
+// A synthesized interface requirement that constrains a callable requirement as a type.
+//
+// Consider this example:
+//
+//     interface IFoo
+//     {
+//         [Differentiable]
+//         void f<T>(T value);
+//     }
+//
+// Header checking keeps the callable requirement as
+// `GenericDecl { inner = CallableDecl f }` and synthesizes a sibling requirement:
+//
+//     GenericDecl
+//     {
+//         inner = FuncConstraintDecl(
+//             callableRequirementDeclRef = This.f<T>,
+//             sub = This.f<T>,
+//             sup = IForward/BackwardDifferentiableFunc<This.f<T>>)
+//     }
+//
+// If `f` is generic, this decl is wrapped in a cloned standalone generic signature, and
+// `callableRequirementDeclRef` stores the `This.f<T>` decl-ref after substituting the callable's
+// generic parameters/proofs with that cloned signature.
+//
+// This intentionally remains a subtype of `GenericTypeConstraintDecl`: conformance checking and
+// witness-table lowering consume it through the same sibling subtype-constraint path used by
+// associated-type constraints. The extra checked decl-ref records the callable-as-type endpoint
+// being constrained, so later consumers can target that callable without structural rediscovery
+// through overloaded members.
+FIDDLE()
+class FuncConstraintDecl : public GenericTypeConstraintDecl
+{
+    FIDDLE(...)
+    FIDDLE() DeclRef<CallableDecl> callableRequirementDeclRef;
 };
 
 FIDDLE()
@@ -958,12 +1108,89 @@ class TypeCoercionConstraintDecl : public Decl
 };
 
 FIDDLE()
+class NonEmptyPackConstraintDecl : public Decl
+{
+    FIDDLE(...)
+    SourceLoc whereTokenLoc = SourceLoc();
+    FIDDLE() Expr* packExpr = nullptr;
+};
+
+FIDDLE()
+class GenericVariadicPackCountConstraintDecl : public Decl
+{
+    FIDDLE(...)
+    SourceLoc whereTokenLoc = SourceLoc();
+    FIDDLE() Expr* packExpr = nullptr;
+    FIDDLE() DeclRef<Decl> packDeclRef;
+    FIDDLE() IntVal* actualCountVal = nullptr;
+    FIDDLE() Expr* expectedCountExpr = nullptr;
+    FIDDLE() IntVal* expectedCountVal = nullptr;
+};
+
+FIDDLE()
+class HasDiffTypeInfoConstraintDecl : public Decl
+{
+    FIDDLE(...)
+    SourceLoc whereTokenLoc = SourceLoc();
+    FIDDLE() TypeExp type;
+};
+
+FIDDLE()
 class GenericValueParamDecl : public VarDeclBase
 {
     FIDDLE(...)
     // The index of the generic parameter.
     int parameterIndex = 0;
 };
+
+FIDDLE()
+class GenericValuePackParamDecl : public VarDeclBase
+{
+    FIDDLE(...)
+    int parameterIndex = 0;
+};
+
+inline bool isGenericValueParam(Decl* decl)
+{
+    return as<GenericValueParamDecl>(decl) || as<GenericValuePackParamDecl>(decl);
+}
+
+template<typename T>
+inline bool isGenericValueParam(DeclRef<T> declRef)
+{
+    return isGenericValueParam(declRef.getDecl());
+}
+
+inline bool isGenericParam(Decl* decl)
+{
+    return as<GenericTypeParamDeclBase>(decl) || isGenericValueParam(decl);
+}
+
+template<typename T>
+inline bool isGenericParam(DeclRef<T> declRef)
+{
+    return isGenericParam(declRef.getDecl());
+}
+
+// Returns true for declarations that encode generic `where`-clause constraints.
+//
+// This is the broad syntactic set of constraint declarations. Use
+// `isGenericConstraintParameterDecl` instead when walking a generic's hidden substitution slots,
+// because a standalone generic interface requirement can have a constraint as its `GenericDecl`
+// inner decl without that constraint occupying an argument slot.
+inline bool isConstraintDecl(Decl* decl)
+{
+    return as<GenericTypeConstraintDecl>(decl) || as<TypeCoercionConstraintDecl>(decl) ||
+           as<NonEmptyPackConstraintDecl>(decl) ||
+           as<GenericVariadicPackCountConstraintDecl>(decl) ||
+           as<HasDiffTypeInfoConstraintDecl>(decl);
+}
+
+template<typename T>
+inline bool isConstraintDecl(DeclRef<T> declRef)
+{
+    return isConstraintDecl(declRef.getDecl());
+}
 
 // An empty declaration (which might still have modifiers attached).
 //
@@ -1006,53 +1233,19 @@ class AttributeDecl : public ContainerDecl
     FIDDLE() SyntaxClass<NodeBase> syntaxClass;
 };
 
-// A synthesized decl used as a placeholder for a differentiable function requirement. This decl
-// will be a child of interface decl. This allows us to form an interface requirement key for the
-// derivative of an interface function. The synthesized `DerivativeRequirementDecl` will be a child
-// of the original function requirement decl after an interface type is checked.
-FIDDLE()
-class DerivativeRequirementDecl : public FunctionDeclBase
-{
-    FIDDLE(...)
-    // The original requirement decl.
-    FIDDLE() Decl* originalRequirementDecl = nullptr;
-
-    // Type to use for 'ThisType'
-    FIDDLE() Type* diffThisType = nullptr;
-};
-
-// A reference to a synthesized decl representing a differentiable function requirement, this decl
-// will be a child in the orignal function.
-FIDDLE()
-class DerivativeRequirementReferenceDecl : public Decl
-{
-    FIDDLE(...)
-    FIDDLE() DerivativeRequirementDecl* referencedDecl;
-};
-
-FIDDLE()
-class ForwardDerivativeRequirementDecl : public DerivativeRequirementDecl
-{
-    FIDDLE(...)
-};
-
-FIDDLE()
-class BackwardDerivativeRequirementDecl : public DerivativeRequirementDecl
-{
-    FIDDLE(...)
-};
-
 bool isInterfaceRequirement(Decl* decl);
 InterfaceDecl* findParentInterfaceDecl(Decl* decl);
+
+/// Return true for a generic constraint declaration that contributes a hidden
+/// argument to a generic application.
+///
+/// The generic's `inner` declaration is its result, not one of its signature
+/// operands, even if that inner declaration is itself a constraint.
+bool isGenericConstraintParameterDecl(Decl* decl);
 
 bool isLocalVar(const Decl* decl);
 
 
-// Add a sibling lookup scope for `dest` to refer to `source`.
-void addSiblingScopeForContainerDecl(
-    ASTBuilder* builder,
-    ContainerDecl* dest,
-    ContainerDecl* source);
 void addSiblingScopeForContainerDecl(ASTBuilder* builder, Scope* destScope, ContainerDecl* source);
 
 // Cast `decl` to a valid `ContainerDecl*` if its members will become global scope symbols after

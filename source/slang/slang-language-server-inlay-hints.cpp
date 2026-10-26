@@ -1,6 +1,6 @@
 #include "slang-language-server-inlay-hints.h"
 
-#include "../core/slang-char-util.h"
+#include "core/slang-char-util.h"
 #include "slang-ast-iterator.h"
 #include "slang-ast-support-types.h"
 #include "slang-language-server.h"
@@ -70,14 +70,7 @@ List<LanguageServerProtocol::InlayHint> getInlayHints(
                         hint.paddingLeft = false;
                         hint.kind = LanguageServerProtocol::kInlayHintKindParameter;
                         StringBuilder lblSb;
-                        if (param->hasModifier<OutModifier>())
-                            lblSb << "out ";
-                        else if (param->hasModifier<InOutModifier>())
-                            lblSb << "inout ";
-                        else if (param->hasModifier<RefModifier>())
-                            lblSb << "ref ";
-                        else if (param->hasModifier<BorrowModifier>())
-                            lblSb << "constref ";
+                        printParamPassingModePrefix(lblSb, getParamPassingMode(param));
                         lblSb << name->text;
                         lblSb << ":";
                         hint.label = lblSb.produceString();

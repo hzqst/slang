@@ -425,7 +425,8 @@ char* String::prepareForAppend(Index count)
     auto oldLength = getLength();
     auto newLength = oldLength + count;
     ensureUniqueStorageWithCapacity(newLength);
-    return getData() + oldLength;
+
+    return getMutableData() + oldLength;
 }
 void String::appendInPlace(const char* chars, Index count)
 {
@@ -515,8 +516,8 @@ void String::append(const char* textBegin, char const* textEnd)
 
     ensureUniqueStorageWithCapacity(newLength);
 
-    memcpy(getData() + oldLength, textBegin, textLength);
-    getData()[newLength] = 0;
+    memcpy(getMutableData() + oldLength, textBegin, textLength);
+    getMutableData()[newLength] = 0;
     m_buffer->length = newLength;
 }
 
@@ -586,7 +587,10 @@ void String::append(int32_t value, int radix)
 {
     enum
     {
-        kCount = 33
+        // Worst case: sign + 32 digits + terminator
+        //
+        // INT32_MIN = "-10000000000000000000000000000000"
+        kCount = 34
     };
     char* data = prepareForAppend(kCount);
     const auto count = intToAscii(data, value, radix);
@@ -597,6 +601,7 @@ void String::append(uint32_t value, int radix)
 {
     enum
     {
+        // Worst case: 32 digits + terminator
         kCount = 33
     };
     char* data = prepareForAppend(kCount);
@@ -608,7 +613,12 @@ void String::append(int64_t value, int radix)
 {
     enum
     {
-        kCount = 65
+        // Worst case: sign + 64 digits + terminator
+        //
+        //               +- 64 digits -+
+        //               |             |
+        // INT64_MIN = "-100000...000000"
+        kCount = 66
     };
     char* data = prepareForAppend(kCount);
     auto count = intToAscii(data, value, radix);
@@ -619,6 +629,7 @@ void String::append(uint64_t value, int radix)
 {
     enum
     {
+        // Worst case: 64 digits + terminator
         kCount = 65
     };
     char* data = prepareForAppend(kCount);

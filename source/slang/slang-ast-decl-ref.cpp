@@ -3,7 +3,9 @@
 #include "slang-ast-builder.h"
 #include "slang-ast-dispatch.h"
 #include "slang-ast-forward-declarations.h"
+#include "slang-ast-substitution.h"
 #include "slang-check-impl.h"
+#include "slang-syntax.h"
 
 namespace Slang
 {
@@ -57,6 +59,68 @@ DeclRefBase* _resolveAsDeclRef(DeclRefBase* declRefToResolve)
     return declRefToResolve;
 }
 
+static AccessorDecl* _tryGetCorrespondingAccessorDecl(Decl* memberDecl, Decl* substParentDecl)
+{
+    // Once substitution has resolved the parent requirement to a satisfying declaration, the child
+    // must be selected from that same parent. Accessors are anonymous role declarations (`get` or
+    // `set`) nested under a storage declaration, so a requirement getter can be mapped to the
+    // getter under the selected override/default subscript while preserving the selected parent's
+    // generic substitutions.
+    //
+    // Conceptually this is not quite an ordinary static `MemberDeclRef`; it is projecting an
+    // accessor role from the resolved storage declaration. Consider this example:
+    //
+    //     interface ITensor<T, int D>
+    //     {
+    //         __subscript<each TIndex>(TIndex indices)
+    //             where TIndex == int
+    //             where countof(TIndex) == D
+    //         {
+    //             [Differentiable]
+    //             get { return load(indices); }
+    //         }
+    //     }
+    //
+    // During conformance checking, the requirement getter is represented as:
+    //
+    //     MemberDeclRef(GenericAppDeclRef(Lookup(This, operator[]), TIndex), get)
+    //
+    // After `Lookup(This, operator[])` resolves through the witness table to the selected concrete
+    // or default subscript, the `get` accessor must be re-selected under that same resolved
+    // storage declaration while preserving the subscript's generic arguments. That behavior is
+    // closer to a possible future
+    // `AccessorProjectionDeclRef(parentStorageDeclRef, AccessorKind::Get)`. We encode that
+    // projection here to avoid adding a new decl-ref kind and the corresponding lookup/cache
+    // machinery on storage declarations. If this pattern grows beyond accessors, consider making
+    // that projection explicit instead of extending this remap.
+    auto accessorDecl = as<AccessorDecl>(memberDecl);
+    if (!accessorDecl)
+        return nullptr;
+
+    if (accessorDecl->parentDecl == substParentDecl)
+        return accessorDecl;
+
+    auto originalParentDecl = accessorDecl->parentDecl;
+    if (!originalParentDecl || originalParentDecl->astNodeType != substParentDecl->astNodeType)
+        return nullptr;
+
+    auto substParentContainer = as<ContainerDecl>(substParentDecl);
+    if (!substParentContainer)
+        return nullptr;
+
+    AccessorDecl* result = nullptr;
+    for (auto candidateDecl : substParentContainer->getDirectMemberDeclsOfType<AccessorDecl>())
+    {
+        if (candidateDecl->astNodeType != accessorDecl->astNodeType)
+            continue;
+        if (result)
+            return nullptr;
+        result = candidateDecl;
+    }
+
+    return result;
+}
+
 DeclRefBase* MemberDeclRef::_substituteImplOverride(
     ASTBuilder* astBuilder,
     SubstitutionSet subst,
@@ -67,6 +131,18 @@ DeclRefBase* MemberDeclRef::_substituteImplOverride(
     if (diff)
     {
         (*ioDiff)++;
+
+        if (!getDecl()->isChildOf(substParent->getDecl()))
+        {
+            if (auto correspondingAccessor =
+                    _tryGetCorrespondingAccessorDecl(getDecl(), substParent->getDecl()))
+            {
+                return astBuilder
+                    ->getMemberDeclRef(DeclRef<Decl>(substParent), correspondingAccessor)
+                    .declRefBase;
+            }
+        }
+
         return astBuilder->getMemberDeclRef(substParent, getDecl());
     }
     return this;
@@ -88,7 +164,18 @@ Val* MemberDeclRef::_resolveImplOverride()
     auto resolvedParent = _resolveAsDeclRef(getParentOperand());
     if (resolvedParent != getParentOperand())
     {
-        return getCurrentASTBuilder()->getMemberDeclRef(resolvedParent, getDecl());
+        auto newChild = getDecl();
+
+        if (newChild->parentDecl != resolvedParent->getDecl())
+        {
+            if (auto correspondingAccessor =
+                    _tryGetCorrespondingAccessorDecl(newChild, resolvedParent->getDecl()))
+            {
+                newChild = correspondingAccessor;
+            }
+        }
+
+        return getCurrentASTBuilder()->getMemberDeclRef(resolvedParent, newChild);
     }
     return this;
 }
@@ -171,40 +258,592 @@ DeclRefBase* LookupDeclRef::_getBaseOverride()
     return nullptr;
 }
 
+// Requirement projections are represented by a requirement declaration plus a subtype witness.
+// Witness tables store answers in the declaration context of the conformance that owns the table;
+// the subtype-witness path supplies the substitutions needed by a particular projection. Lookup
+// consequently has two phases: select an unspecialized table entry without copying intermediate
+// tables, and then apply the substitutions from the traversed witness path to the selected leaf.
+//
+// Consider this example:
+//
+//     interface ISidekick { associatedtype Hero; }
+//     struct Sidekick<H> : ISidekick { typealias Hero = H; }
+//
+// The `Sidekick<H> : ISidekick` table stores `Hero = Sidekick<H>.Hero` in declaration context. A
+// projection through `Sidekick<Batman> : ISidekick` must select that same entry and only then apply
+// `H -> Batman`. An inherited-interface projection may cross several such tables, so the forceful
+// semantic path reports the first missing table or entry and restarts after publishing it. Ordinary
+// `Val::resolve()` cannot publish entries and therefore uses a separate allocation-free traversal.
+
+/// Stores a passive lookup result and the declaration-context substitutions not yet applied to it.
+struct UnspecializedRequirementWitnessLookupFrontier
+{
+    RequirementWitnessLookupFrontier frontier;
+
+    /// The inner-to-outer conformance decl-refs whose substitutions specialize a found leaf.
+    List<DeclRef<Decl>> specializationDeclRefs;
+};
+
+/// Applies the declaration contexts accumulated while locating one table entry.
+static RequirementWitness _specializeRequirementWitnessAlongLookupPath(
+    ASTBuilder* astBuilder,
+    RequirementWitness witness,
+    List<DeclRef<Decl>> const& specializationDeclRefs)
+{
+    for (auto specializationDeclRef : specializationDeclRefs)
+    {
+        witness = witness.specialize(astBuilder, SubstitutionSet(specializationDeclRef));
+    }
+    return witness;
+}
+
+/// Identifies the declaration used as a key in one witness table and the generic result shape that
+/// must be reconstructed after retrieving the stored witness.
+struct RequirementWitnessTableLookupKey
+{
+    RequirementWitnessTableLookupKey(InterfaceRequirementKey key, UCount genericWrapperCount)
+        : key(key), genericWrapperCount(genericWrapperCount)
+    {
+    }
+
+    InterfaceRequirementKey key;
+    UCount genericWrapperCount;
+};
+
+static RequirementWitnessTableLookupKey _getRequirementWitnessTableLookupKey(
+    DeclRef<Decl> requirementDeclRef)
+{
+    UCount genericWrapperCount = 0;
+    auto key = InterfaceRequirementKey::createWithGenericWrapperCount(
+        requirementDeclRef.getDecl(),
+        genericWrapperCount);
+    return RequirementWitnessTableLookupKey(key, genericWrapperCount);
+}
+
+/// Resolves a stored table entry and restores the outer generic declaration requested by lookup.
+///
+/// A generic interface requirement is keyed by its innermost non-generic declaration. Its
+/// satisfying witness likewise names the corresponding inner declaration, with the same consecutive
+/// chain of `GenericDecl` parents. Lookup climbs exactly the number of wrappers removed from the
+/// requested key and returns the decl-ref for the outermost corresponding satisfying wrapper.
+/// Substitutions from the conformance path remain unapplied here; the caller applies them after
+/// selecting the final leaf entry.
+static RequirementWitness _resolveRequirementWitnessForTableLookup(
+    RequirementWitness requirementWitness,
+    UCount genericWrapperCount)
+{
+    switch (requirementWitness.getFlavor())
+    {
+    default:
+        SLANG_UNEXPECTED("unknown requirement witness flavor");
+    case RequirementWitness::Flavor::none:
+    case RequirementWitness::Flavor::witnessTable:
+        return requirementWitness;
+    case RequirementWitness::Flavor::declRef:
+        {
+            auto satisfyingDeclRef =
+                as<DeclRefBase>(requirementWitness.getDeclRef().declRefBase->resolve());
+            while (genericWrapperCount > 0)
+            {
+                SLANG_RELEASE_ASSERT(satisfyingDeclRef);
+                auto parent = satisfyingDeclRef->getParent();
+                SLANG_RELEASE_ASSERT(parent && as<GenericDecl>(parent->getDecl()));
+                satisfyingDeclRef = parent;
+                genericWrapperCount--;
+            }
+            SLANG_RELEASE_ASSERT(satisfyingDeclRef);
+            return RequirementWitness(satisfyingDeclRef);
+        }
+    case RequirementWitness::Flavor::val:
+        {
+            SLANG_RELEASE_ASSERT(genericWrapperCount == 0);
+            return RequirementWitness(requirementWitness.getVal()->resolve());
+        }
+    }
+}
+
+/// Looks up one declaration-context entry without performing semantic checking.
+///
+/// Generic wrappers are removed only to form the table-local key. The returned witness is still
+/// unspecialized with respect to the subtype-witness path that led to this table.
+static bool _tryLookUpRequirementEntryInTable(
+    WitnessTable* witnessTable,
+    DeclRef<Decl> requirementDeclRef,
+    RequirementWitness* outRequirementWitness)
+{
+    auto lookupKey = _getRequirementWitnessTableLookupKey(requirementDeclRef);
+    RequirementWitness requirementWitness;
+    if (!witnessTable->tryGetRequirementWitness(lookupKey.key, requirementWitness))
+    {
+        return false;
+    }
+    *outRequirementWitness =
+        _resolveRequirementWitnessForTableLookup(requirementWitness, lookupKey.genericWrapperCount);
+    return true;
+}
+
+/// Selects the branch of `packBranchWitness` whose cardinality is structurally known.
+///
+/// Returning null means that the pack cardinality remains indeterminate. Keeping this dispatch in
+/// one helper prevents passive selection, passive specialization, and forceful frontier lookup from
+/// choosing different branches as the variadic witness representation evolves.
+static SubtypeWitness* _tryGetKnownPackBranchWitness(PackBranchSubtypeWitness* packBranchWitness)
+{
+    switch (getKnownPackCardinality(packBranchWitness->getPackOperand()))
+    {
+    case VariadicPackCardinality::Empty:
+        return packBranchWitness->getEmptyWitness();
+    case VariadicPackCardinality::NonEmpty:
+        return packBranchWitness->getNonEmptyWitness();
+    default:
+        return nullptr;
+    }
+}
+
+/// Follows existing witness tables and returns the unspecialized leaf entry.
+///
+/// This is the allocation-free passive path used by ordinary `Val::resolve()`. It intentionally
+/// does not construct missing-frontier metadata, because a passive caller cannot act on it.
+static RequirementWitness _tryLookUpExistingRequirementWitnessRec(
+    ASTBuilder* astBuilder,
+    SubtypeWitness* subtypeWitness,
+    DeclRef<Decl> requirementDeclRef)
+{
+    if (auto packBranchWitness = as<PackBranchSubtypeWitness>(subtypeWitness))
+    {
+        auto selectedWitness = _tryGetKnownPackBranchWitness(packBranchWitness);
+        if (!selectedWitness)
+            return RequirementWitness();
+        return _tryLookUpExistingRequirementWitnessRec(
+            astBuilder,
+            selectedWitness,
+            requirementDeclRef);
+    }
+
+    if (auto declaredSubtypeWitness = as<DeclaredSubtypeWitness>(subtypeWitness))
+    {
+        RefPtr<WitnessTable> witnessTable;
+        auto conformanceDeclRef = declaredSubtypeWitness->getDeclRef();
+        if (auto nestedLookupDeclRef = as<LookupDeclRef>(conformanceDeclRef.declRefBase))
+        {
+            auto nestedWitness = _tryLookUpExistingRequirementWitnessRec(
+                astBuilder,
+                nestedLookupDeclRef->getWitness(),
+                DeclRef<Decl>(nestedLookupDeclRef));
+            if (nestedWitness.getFlavor() != RequirementWitness::Flavor::witnessTable)
+            {
+                // A conformance requirement is stored as a `SubtypeWitness` value. Continuing
+                // through it may require resolving its projected subtype after semantic checking
+                // publishes another entry. This passive path cannot cause that progress; the
+                // forceful frontier path reports `NeedsConcreteConformance` instead.
+                return RequirementWitness();
+            }
+            witnessTable = nestedWitness.getWitnessTable();
+        }
+        else if (auto inheritanceDeclRef = conformanceDeclRef.as<InheritanceDecl>())
+        {
+            witnessTable = inheritanceDeclRef.getDecl()->witnessTable;
+        }
+        else if (auto constraintDeclRef = conformanceDeclRef.as<GenericTypeConstraintDecl>())
+        {
+            witnessTable = constraintDeclRef.getDecl()->pathResolutionTable;
+        }
+
+        if (!witnessTable)
+            return RequirementWitness();
+
+        RequirementWitness requirementWitness;
+        if (!_tryLookUpRequirementEntryInTable(
+                witnessTable,
+                requirementDeclRef,
+                &requirementWitness))
+        {
+            return RequirementWitness();
+        }
+        return requirementWitness;
+    }
+
+    if (auto transitiveWitness = as<TransitiveSubtypeWitness>(subtypeWitness))
+    {
+        if (auto midToSupWitness = as<DeclaredSubtypeWitness>(transitiveWitness->getMidToSup()))
+        {
+            auto midRequirementDeclRef = midToSupWitness->getDeclRef();
+            auto midWitness = _tryLookUpExistingRequirementWitnessRec(
+                astBuilder,
+                as<SubtypeWitness>(transitiveWitness->getSubToMid()),
+                midRequirementDeclRef);
+            if (midWitness.getFlavor() != RequirementWitness::Flavor::witnessTable)
+                return RequirementWitness();
+
+            RequirementWitness requirementWitness;
+            if (!_tryLookUpRequirementEntryInTable(
+                    midWitness.getWitnessTable(),
+                    requirementDeclRef,
+                    &requirementWitness))
+            {
+                return RequirementWitness();
+            }
+            return requirementWitness;
+        }
+    }
+
+    return RequirementWitness();
+}
+
+/// Replays an existing lookup path and applies its substitutions to the selected leaf.
+///
+/// A second traversal keeps the structural lookup allocation-free and avoids specializing an
+/// intermediate witness table, which would copy every entry before selecting the next one.
+/// This traversal is deliberately paired with `_tryLookUpExistingRequirementWitnessRec`: every
+/// witness shape accepted by the selection pass must visit the same conformance declarations here,
+/// in the same inner-to-outer order. The forceful frontier traversal below must recognize that same
+/// structural vocabulary, although it stops at the first missing step instead of reaching a leaf.
+/// The shared shapes are a known `PackBranchSubtypeWitness`, a `DeclaredSubtypeWitness` backed by a
+/// nested lookup, inheritance declaration, or generic constraint, and a `TransitiveSubtypeWitness`
+/// whose mid-to-super witness is declared. Selection distinguishes the three declared-witness
+/// sources to find their table; specialization intentionally treats them uniformly because only
+/// the substitutions on their conformance decl-ref matter at that stage.
+static RequirementWitness _specializeExistingRequirementWitnessRec(
+    ASTBuilder* astBuilder,
+    SubtypeWitness* subtypeWitness,
+    RequirementWitness requirementWitness)
+{
+    if (auto packBranchWitness = as<PackBranchSubtypeWitness>(subtypeWitness))
+    {
+        auto selectedWitness = _tryGetKnownPackBranchWitness(packBranchWitness);
+        if (!selectedWitness)
+            return RequirementWitness();
+        return _specializeExistingRequirementWitnessRec(
+            astBuilder,
+            selectedWitness,
+            requirementWitness);
+    }
+
+    if (auto declaredSubtypeWitness = as<DeclaredSubtypeWitness>(subtypeWitness))
+    {
+        auto conformanceDeclRef = declaredSubtypeWitness->getDeclRef();
+        if (auto nestedLookupDeclRef = as<LookupDeclRef>(conformanceDeclRef.declRefBase))
+        {
+            requirementWitness = _specializeExistingRequirementWitnessRec(
+                astBuilder,
+                nestedLookupDeclRef->getWitness(),
+                requirementWitness);
+        }
+        return requirementWitness.specialize(astBuilder, SubstitutionSet(conformanceDeclRef));
+    }
+
+    if (auto transitiveWitness = as<TransitiveSubtypeWitness>(subtypeWitness))
+    {
+        if (auto midToSupWitness = as<DeclaredSubtypeWitness>(transitiveWitness->getMidToSup()))
+        {
+            requirementWitness = _specializeExistingRequirementWitnessRec(
+                astBuilder,
+                as<SubtypeWitness>(transitiveWitness->getSubToMid()),
+                requirementWitness);
+            return requirementWitness.specialize(
+                astBuilder,
+                SubstitutionSet(midToSupWitness->getDeclRef()));
+        }
+    }
+
+    return RequirementWitness();
+}
+
+/// Passively looks up an existing requirement witness for ordinary value resolution.
+///
+/// Forceful semantic clients use `locateNextRequirementWitnessLookupFrontier` instead. Keeping the
+/// operations separate lets this hot path avoid allocating a specialization list or producing
+/// missing-frontier state that its callers cannot consume.
+RequirementWitness tryLookUpRequirementWitness(
+    ASTBuilder* astBuilder,
+    SubtypeWitness* subtypeWitness,
+    Decl* requirementKey)
+{
+    auto requirementDeclRef = makeDeclRef(requirementKey);
+    auto requirementWitness =
+        _tryLookUpExistingRequirementWitnessRec(astBuilder, subtypeWitness, requirementDeclRef);
+
+    if (requirementWitness.getFlavor() == RequirementWitness::Flavor::none)
+    {
+        if (as<ThisTypeDecl>(requirementKey))
+            return RequirementWitness(subtypeWitness->getSub());
+        if (as<ThisTypeConstraintDecl>(requirementKey))
+            return RequirementWitness(subtypeWitness);
+        return RequirementWitness();
+    }
+
+    // These clients consume values and declaration references. Keep an intermediate table in its
+    // declaration-context form so looking through inherited conformances does not specialize an
+    // entire table only to select one entry from it.
+    if (requirementWitness.getFlavor() == RequirementWitness::Flavor::witnessTable)
+        return requirementWitness;
+    auto specializedWitness =
+        _specializeExistingRequirementWitnessRec(astBuilder, subtypeWitness, requirementWitness);
+    // The passive selection pass already proved that this witness shape has a determinate path to
+    // the leaf. A fallthrough here means the paired structural traversals have drifted apart.
+    SLANG_RELEASE_ASSERT(specializedWitness.getFlavor() != RequirementWitness::Flavor::none);
+    return specializedWitness;
+}
+
+static UnspecializedRequirementWitnessLookupFrontier _locateRequirementEntryInTable(
+    RefPtr<WitnessTable> witnessTable,
+    DeclRef<Decl> requirementDeclRef)
+{
+    UnspecializedRequirementWitnessLookupFrontier result;
+    RequirementWitness requirementWitness;
+    if (!_tryLookUpRequirementEntryInTable(witnessTable, requirementDeclRef, &requirementWitness))
+    {
+        // Preserve the caller's full decl-ref, including generic wrappers and substitutions. The
+        // bare declaration above is only the table-local key; semantic checking may need the outer
+        // generic requirement in order to synthesize the entry stored under its inner declaration.
+        result.frontier =
+            RequirementWitnessLookupFrontier::makeMissingEntry(witnessTable, requirementDeclRef);
+        return result;
+    }
+
+    result.frontier = RequirementWitnessLookupFrontier::makeFound(requirementWitness);
+    return result;
+}
+
+static UnspecializedRequirementWitnessLookupFrontier _locateNextRequirementWitnessLookupFrontierRec(
+    ASTBuilder* astBuilder,
+    SubtypeWitness* subtypeWitness,
+    DeclRef<Decl> requirementDeclRef)
+{
+    UnspecializedRequirementWitnessLookupFrontier result;
+
+    if (auto packBranchWitness = as<PackBranchSubtypeWitness>(subtypeWitness))
+    {
+        auto selectedWitness = _tryGetKnownPackBranchWitness(packBranchWitness);
+        if (!selectedWitness)
+            return result;
+        return _locateNextRequirementWitnessLookupFrontierRec(
+            astBuilder,
+            selectedWitness,
+            requirementDeclRef);
+    }
+
+    if (auto declaredSubtypeWitness = as<DeclaredSubtypeWitness>(subtypeWitness))
+    {
+        RefPtr<WitnessTable> witnessTable;
+        List<DeclRef<Decl>> prefixSpecializations;
+        auto declaredConformanceDeclRef = declaredSubtypeWitness->getDeclRef();
+
+        if (auto nestedLookupDeclRef = as<LookupDeclRef>(declaredConformanceDeclRef.declRefBase))
+        {
+            auto nestedResult = _locateNextRequirementWitnessLookupFrontierRec(
+                astBuilder,
+                nestedLookupDeclRef->getWitness(),
+                DeclRef<Decl>(nestedLookupDeclRef));
+            if (nestedResult.frontier.getStatus() != RequirementWitnessLookupFrontierStatus::Found)
+                return nestedResult;
+
+            auto nestedWitness = nestedResult.frontier.getWitness();
+            if (nestedWitness.getFlavor() == RequirementWitness::Flavor::witnessTable)
+            {
+                witnessTable = nestedWitness.getWitnessTable();
+                prefixSpecializations = _Move(nestedResult.specializationDeclRefs);
+            }
+            else if (nestedWitness.getFlavor() == RequirementWitness::Flavor::val)
+            {
+                // A lookup-backed conformance requirement is stored as its `SubtypeWitness`
+                // value, not as the table selected by that witness. Consider this example:
+                //
+                //     interface IInner { associatedtype Value; }
+                //     interface IOuter { associatedtype Element : IInner; }
+                //
+                // The conformance witness used by `T.Element.Value` first projects the sibling
+                // `Element : IInner` requirement from `T : IOuter`. Specialize that projected
+                // witness into the concrete outer conformance, then continue the original `Value`
+                // lookup through the resulting `T.Element : IInner` witness.
+                auto specializedNestedWitness = _specializeRequirementWitnessAlongLookupPath(
+                    astBuilder,
+                    nestedWitness,
+                    nestedResult.specializationDeclRefs);
+                auto nestedSubtypeWitness = as<SubtypeWitness>(specializedNestedWitness.getVal());
+                SLANG_RELEASE_ASSERT(nestedSubtypeWitness);
+                result.frontier = RequirementWitnessLookupFrontier::makeNeedsConcreteConformance(
+                    nestedSubtypeWitness);
+                return result;
+            }
+            else if (nestedWitness.getFlavor() == RequirementWitness::Flavor::none)
+            {
+                // An absent optional conformance does not provide a concrete path to continue.
+                return result;
+            }
+            else
+            {
+                SLANG_UNEXPECTED("conformance requirement did not produce a subtype witness");
+            }
+        }
+        else if (auto inheritanceDeclRef = declaredConformanceDeclRef.as<InheritanceDecl>())
+        {
+            witnessTable = inheritanceDeclRef.getDecl()->witnessTable;
+            if (!witnessTable)
+            {
+                auto parentDecl = as<ContainerDecl>(inheritanceDeclRef.getDecl()->parentDecl);
+                if (parentDecl && !as<InterfaceDecl>(parentDecl) && !as<AssocTypeDecl>(parentDecl))
+                {
+                    result.frontier = RequirementWitnessLookupFrontier::makeMissingConcreteTable(
+                        inheritanceDeclRef);
+                }
+                return result;
+            }
+        }
+        else if (
+            auto constraintDeclRef = declaredConformanceDeclRef.as<GenericTypeConstraintDecl>())
+        {
+            // Generic type constraints use a table that stores canonical paths through diamond
+            // conformances. This passive operation cannot create that table if it is absent.
+            witnessTable = constraintDeclRef.getDecl()->pathResolutionTable;
+        }
+
+        if (witnessTable)
+        {
+            result = _locateRequirementEntryInTable(witnessTable, requirementDeclRef);
+            if (result.frontier.getStatus() == RequirementWitnessLookupFrontierStatus::Found)
+            {
+                result.specializationDeclRefs = _Move(prefixSpecializations);
+                result.specializationDeclRefs.add(declaredConformanceDeclRef);
+            }
+        }
+    }
+    else if (auto transitiveWitness = as<TransitiveSubtypeWitness>(subtypeWitness))
+    {
+        if (auto midToSupWitness = as<DeclaredSubtypeWitness>(transitiveWitness->getMidToSup()))
+        {
+            auto midRequirementDeclRef = midToSupWitness->getDeclRef();
+            auto midResult = _locateNextRequirementWitnessLookupFrontierRec(
+                astBuilder,
+                as<SubtypeWitness>(transitiveWitness->getSubToMid()),
+                midRequirementDeclRef);
+            if (midResult.frontier.getStatus() != RequirementWitnessLookupFrontierStatus::Found)
+                return midResult;
+
+            auto midWitness = midResult.frontier.getWitness();
+            if (midWitness.getFlavor() == RequirementWitness::Flavor::witnessTable)
+            {
+                result = _locateRequirementEntryInTable(
+                    midWitness.getWitnessTable(),
+                    requirementDeclRef);
+                if (result.frontier.getStatus() == RequirementWitnessLookupFrontierStatus::Found)
+                {
+                    result.specializationDeclRefs = _Move(midResult.specializationDeclRefs);
+                    result.specializationDeclRefs.add(midRequirementDeclRef);
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+RequirementWitnessLookupFrontier locateNextRequirementWitnessLookupFrontier(
+    ASTBuilder* astBuilder,
+    SubtypeWitness* subtypeWitness,
+    DeclRef<Decl> requirementDeclRef)
+{
+    if (!subtypeWitness || !requirementDeclRef)
+        return RequirementWitnessLookupFrontier();
+
+    auto result = _locateNextRequirementWitnessLookupFrontierRec(
+        astBuilder,
+        subtypeWitness,
+        requirementDeclRef);
+
+    // These two entries are structural properties of the original subtype witness. Preserve the
+    // historical lookup precedence by using a table entry when present and synthesizing the value
+    // only after traversal fails. This fallback belongs at the public boundary: an intermediate
+    // missing table on a nested witness path must not hide the original witness's `ThisType`.
+    if (result.frontier.getStatus() != RequirementWitnessLookupFrontierStatus::Found)
+    {
+        if (as<ThisTypeDecl>(requirementDeclRef.getDecl()))
+        {
+            result = UnspecializedRequirementWitnessLookupFrontier();
+            result.frontier = RequirementWitnessLookupFrontier::makeFound(
+                RequirementWitness(subtypeWitness->getSub()));
+        }
+        else if (as<ThisTypeConstraintDecl>(requirementDeclRef.getDecl()))
+        {
+            result = UnspecializedRequirementWitnessLookupFrontier();
+            result.frontier =
+                RequirementWitnessLookupFrontier::makeFound(RequirementWitness(subtypeWitness));
+        }
+    }
+
+    if (result.frontier.getStatus() == RequirementWitnessLookupFrontierStatus::Found)
+    {
+        // The recursive traversal records each declaration context on the way back out: first the
+        // context that owns the selected table, then each context whose projected conformance led
+        // to it. Replay that same inner-to-outer order so every subsequent substitution sees the
+        // declaration-context result produced by the preceding step.
+        auto specializedWitness = _specializeRequirementWitnessAlongLookupPath(
+            astBuilder,
+            result.frontier.getWitness(),
+            result.specializationDeclRefs);
+        result.frontier.setFoundWitness(specializedWitness);
+    }
+    return result.frontier;
+}
+
+
 Val* LookupDeclRef::tryResolve(SubtypeWitness* newWitness, Type* newLookupSource)
 {
     auto astBuilder = getCurrentASTBuilder();
     Decl* requirementKey = getDecl();
-    RequirementWitness requirementWitness =
+
+    RequirementWitness lookedUpVal =
         tryLookUpRequirementWitness(astBuilder, newWitness, requirementKey);
-    switch (requirementWitness.getFlavor())
+    switch (lookedUpVal.getFlavor())
     {
     default:
-        // No usable value was found, so there is nothing we can do.
         break;
-
-    case RequirementWitness::Flavor::val:
+    case RequirementWitness::Flavor::declRef:
         {
-            auto satisfyingVal = requirementWitness.getVal()->resolve();
-            return satisfyingVal;
+            return lookedUpVal.getDeclRef().declRefBase;
         }
-        break;
+    case RequirementWitness::Flavor::val:
+        return lookedUpVal.getVal();
     }
+
+    // If we didn't find anything using a simple lookup, we might need to handle some special-case
+    // rules.
 
     // Hard code implementation of T.Differential.Differential == T.Differential rule.
     auto builtinReq = requirementKey->findModifier<BuiltinRequirementModifier>();
     bool isConstraint = false;
     if (!builtinReq)
     {
-        if (auto parentAssocType = as<AssocTypeDecl>(requirementKey->parentDecl))
+        // The requirement key is a constraint, not the associated type itself.
+        // Determine which associated type the constraint constrains. This must
+        // be answered from the constraint's endpoints, not from where the
+        // sibling constraint happens to be declared.
+        if (auto constraintDecl = as<GenericTypeConstraintDecl>(requirementKey))
         {
-            builtinReq = parentAssocType->findModifier<BuiltinRequirementModifier>();
-            isConstraint = true;
+            // Look for the built-in requirement modifier on *either* endpoint of the
+            // constraint. We search both sides for the modifier itself rather than
+            // committing to the first side that happens to be an associated type: a
+            // constraint such as `A == Differential` pairs a (non-built-in) assoc on
+            // one side with the built-in `Differential` assoc on the other, and `==`
+            // is symmetric, so `A == Differential` and `Differential == A` must
+            // resolve identically.
+            auto builtinReqFromExp = [](TypeExp const& exp) -> BuiltinRequirementModifier*
+            {
+                if (auto assoc = isDeclRefTypeOf<AssocTypeDecl>(exp.type))
+                    return assoc.getDecl()->findModifier<BuiltinRequirementModifier>();
+                return nullptr;
+            };
+            builtinReq = builtinReqFromExp(constraintDecl->sub);
+            if (!builtinReq)
+                builtinReq = builtinReqFromExp(constraintDecl->sup);
+            if (builtinReq)
+                isConstraint = true;
         }
         if (!builtinReq)
             return nullptr;
     }
-    if (builtinReq->kind != BuiltinRequirementKind::DifferentialType)
+    if (builtinReq->kind != BuiltinRequirementKind::DifferentialType &&
+        builtinReq->kind != BuiltinRequirementKind::DifferentialPtrType)
         return nullptr;
     // Is the concrete type a Differential associated type?
     auto innerDeclRefType = as<DeclRefType>(newLookupSource);
@@ -214,7 +853,8 @@ Val* LookupDeclRef::tryResolve(SubtypeWitness* newWitness, Type* newLookupSource
         innerDeclRefType->getDeclRef().getDecl()->findModifier<BuiltinRequirementModifier>();
     if (!innerBuiltinReq)
         return nullptr;
-    if (innerBuiltinReq->kind != BuiltinRequirementKind::DifferentialType)
+    if (innerBuiltinReq->kind != BuiltinRequirementKind::DifferentialType &&
+        innerBuiltinReq->kind != BuiltinRequirementKind::DifferentialPtrType)
         return nullptr;
     if (isConstraint)
         return newWitness;
@@ -242,10 +882,41 @@ DeclRefBase* GenericAppDeclRef::_substituteImplOverride(
     if (diff == 0)
         return this;
     (*ioDiff)++;
-    return astBuilder->getGenericAppDeclRef(
-        substGenericDeclRef,
-        substArgs.getArrayView(),
-        getDecl());
+
+    if (getDecl()->isChildOf(substGenericDeclRef->getDecl()))
+        return astBuilder->getGenericAppDeclRef(
+            substGenericDeclRef,
+            substArgs.getArrayView(),
+            getDecl());
+    else
+    {
+        // If decl is no longer the child of the new parent, it's most likely due to
+        // the base lookup resolving to a different decl.
+        //
+        if (auto baseLookup = as<LookupDeclRef>(getGenericDeclRef()))
+        {
+            // Otherwise, we need to get the effective inner decl-ref for the generic app.
+            auto resolvedTargetDecl = astBuilder
+                                          ->getLookupDeclRef(
+                                              baseLookup->getLookupSource(),
+                                              baseLookup->getWitness(),
+                                              getDecl())
+                                          .substituteImpl(astBuilder, subst, &diff)
+                                          .declRefBase->resolve();
+
+            if (as<DeclRefBase>(resolvedTargetDecl))
+            {
+                return astBuilder->getGenericAppDeclRef(
+                    substGenericDeclRef,
+                    substArgs.getArrayView(),
+                    as<DeclRefBase>(resolvedTargetDecl)->getDecl());
+            }
+        }
+
+        SLANG_UNEXPECTED(
+            "GenericAppDeclRef::substituteImpl: generic decl ref is not a child of the new parent "
+            "& base is not a lookup");
+    }
 }
 
 GenericDecl* GenericAppDeclRef::getGenericDecl()
@@ -259,7 +930,7 @@ void GenericAppDeclRef::_toTextOverride(StringBuilder& out)
     auto genericDecl = as<GenericDecl>(getGenericDeclRef()->getDecl());
     Index paramCount = 0;
     for (auto member : genericDecl->getDirectMemberDecls())
-        if (as<GenericTypeParamDeclBase>(member) || as<GenericValueParamDecl>(member))
+        if (isGenericParam(member))
             paramCount++;
     getGenericDeclRef()->toText(out);
     out << "<";
@@ -291,10 +962,35 @@ Val* GenericAppDeclRef::_resolveImplOverride()
             diff = true;
     }
     if (diff)
-        resolvedVal = astBuilder->getGenericAppDeclRef(
-            resolvedGenericDeclRef,
-            resolvedArgs.getArrayView(),
-            getDecl());
+    {
+        if (getDecl()->isChildOf(resolvedGenericDeclRef->getDecl()))
+        {
+            resolvedVal = astBuilder->getGenericAppDeclRef(
+                resolvedGenericDeclRef,
+                resolvedArgs.getArrayView(),
+                getDecl());
+        }
+        else if (getDecl() == getGenericDecl()->inner)
+        {
+            // Use the inner of the resolved generic decl ref.
+            resolvedVal = astBuilder->getGenericAppDeclRef(
+                resolvedGenericDeclRef,
+                resolvedArgs.getArrayView());
+        }
+        else
+        {
+            // If we hit this case, we're referencing something that isn't
+            // the direct child (->inner) of the generic decl.
+            // There's no easy way to figure out which child of the new generic
+            // we should be referencing, so we'll assert out here instead of
+            // trying to continue with an ill-formed decl ref.
+            //
+            SLANG_ASSERT(
+                "Cannot resolve generic app decl ref to a non-direct child of the resolved generic "
+                "decl "
+                "ref");
+        }
+    }
     return resolvedVal;
 }
 
@@ -307,7 +1003,18 @@ DeclRefBase* GenericAppDeclRef::_getBaseOverride()
 
 DeclRefBase* DeclRefBase::substituteImpl(ASTBuilder* astBuilder, SubstitutionSet subst, int* ioDiff)
 {
-    SLANG_AST_NODE_VIRTUAL_CALL(DeclRefBase, substituteImpl, (astBuilder, subst, ioDiff));
+    return static_cast<DeclRefBase*>(substituteValWithCache(
+        this,
+        astBuilder,
+        subst,
+        ioDiff,
+        [&](SubstitutionSet cachedSubst, int* cachedDiff) -> Val*
+        {
+            return ASTNodeDispatcher<DeclRefBase, DeclRefBase*>::dispatch(
+                this,
+                [&](auto declRef) -> DeclRefBase*
+                { return declRef->_substituteImplOverride(astBuilder, cachedSubst, cachedDiff); });
+        }));
 }
 
 DeclRefBase* DeclRefBase::getBase()
@@ -328,7 +1035,7 @@ void DeclRefBase::toText(StringBuilder& out)
         out << this->getDecl()->getName()->text;
         return;
     }
-    else if (as<GenericValueParamDecl>(this->getDecl()))
+    else if (isGenericValueParam(this->getDecl()))
     {
         SLANG_ASSERT(as<DirectDeclRef>(this));
         out << this->getDecl()->getName()->text;
@@ -385,8 +1092,7 @@ void DeclRefBase::toText(StringBuilder& out)
                 {
                     Index paramCount = 0;
                     for (auto member : genericDecl->getDirectMemberDecls())
-                        if (as<GenericTypeParamDeclBase>(member) ||
-                            as<GenericValueParamDecl>(member))
+                        if (isGenericParam(member))
                             paramCount++;
                     out << "<";
                     auto args = genericAppDeclRef->getArgs();
@@ -405,7 +1111,8 @@ void DeclRefBase::toText(StringBuilder& out)
         {
             if (extDecl->targetType)
             {
-                getTargetType(getCurrentASTBuilder(), getParent())->toText(out);
+                getTargetType(getCurrentASTBuilder(), DeclRef(declRef).as<ExtensionDecl>())
+                    ->toText(out);
             }
         }
     }
@@ -439,6 +1146,33 @@ DeclRefBase* DeclRefBase::getParent()
     auto astBuilder = getCurrentASTBuilder();
     if (!getDecl()->parentDecl)
         return nullptr;
+
+    if (auto genericAppDeclRef = as<GenericAppDeclRef>(this))
+    {
+        auto parentDecl = getDecl()->parentDecl;
+        auto genericDeclRef = genericAppDeclRef->getGenericDeclRef();
+        auto genericDecl = genericDeclRef->getDecl();
+
+        if (parentDecl != genericDecl && parentDecl->isChildOf(genericDecl))
+        {
+            // A generic application can name a declaration nested under the generic's inner
+            // declaration, not only the inner declaration itself:
+            //
+            //     GenericAppDeclRef(Generic<T>, ..., inner = InnerNestedDecl)
+            //
+            // In that case, `getParent()` should preserve the same generic arguments while moving
+            // to the lexical parent of `InnerNestedDecl`. This is not a replacement for the normal
+            // `MemberDeclRef(GenericAppDeclRef(...), member)` projection form; that form is still
+            // what represents an ordinary member selected from a specialized parent. This branch
+            // only handles a decl-ref that is already a generic application to a nested `inner`
+            // decl, so parent traversal remains consistent with the decl-ref's existing shape.
+            return astBuilder->getGenericAppDeclRef(
+                genericDeclRef,
+                genericAppDeclRef->getArgs(),
+                parentDecl);
+        }
+    }
+
     auto parentDecl = getDecl()->parentDecl;
     for (auto base = getBase(); base; base = base->getBase())
     {
@@ -567,12 +1301,9 @@ DeclRef<Decl> createDefaultSubstitutionsIfNeeded(
     SemanticsVisitor* semantics,
     DeclRef<Decl> declRef)
 {
-    if (declRef.as<GenericTypeParamDeclBase>())
+    if (isGenericParam(declRef))
         return declRef;
-    if (declRef.as<GenericValueParamDecl>())
-        return declRef;
-    if (declRef.as<GenericTypeConstraintDecl>())
-        return declRef;
+
     ShortList<GenericDecl*> genericParentDecls;
     auto lastSubstNode = SubstitutionSet(declRef).getInnerMostNodeWithSubstInfo();
     auto lastGenApp = as<GenericAppDeclRef>(lastSubstNode);
@@ -583,6 +1314,17 @@ DeclRef<Decl> createDefaultSubstitutionsIfNeeded(
             break;
         if (lastLookup && lastLookup->getDecl()->isChildOf(dd))
             break;
+        if (isGenericConstraintParameterDecl(declRef.getDecl()) &&
+            dd == declRef.getDecl()->parentDecl)
+        {
+            // A generic signature constraint is already represented as a witness argument of the
+            // surrounding generic app, so do not add the immediate generic parent as another
+            // default-substitution layer for the constraint decl itself. A standalone generic
+            // interface requirement has shape `GenericDecl { inner = ConstraintDecl }` and is not a
+            // generic constraint parameter; it must keep the generic parent so callers can form
+            // `constraint<T, proofs...>` through this helper.
+            continue;
+        }
         if (auto gen = as<GenericDecl>(dd))
             genericParentDecls.add(gen);
     }
@@ -593,12 +1335,15 @@ DeclRef<Decl> createDefaultSubstitutionsIfNeeded(
         auto args = getDefaultSubstitutionArgs(astBuilder, semantics, current);
         if (parentDeclRef)
         {
-            parentDeclRef = astBuilder->getMemberDeclRef(parentDeclRef, current);
+            // If the parent is a generic, we can skip directly to creating a generic app decl-ref.
+            if (!parentDeclRef.as<GenericDecl>())
+                parentDeclRef = astBuilder->getMemberDeclRef(parentDeclRef, current);
         }
         else
         {
             parentDeclRef = astBuilder->getDirectDeclRef(current);
         }
+
         parentDeclRef =
             astBuilder->getGenericAppDeclRef(parentDeclRef.as<GenericDecl>(), args.getArrayView());
     }
